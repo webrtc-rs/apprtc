@@ -1,13 +1,13 @@
 [package]
-name = "signaling"
-version = "0.0.0"
+name = "apprtc"
+version = "0.0.2"
 authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
-description = "Signaling in Rust"
+description = "AppRTC in Rust"
 license = "MIT/Apache-2.0"
-documentation = "https://docs.rs/signaling"
+documentation = "https://docs.rs/apprtc"
 homepage = "https://webrtc.rs"
-repository = "https://github.com/webrtc-rs/signaling"
+repository = "https://github.com/webrtc-rs/apprtc"
 keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
