@@ -1,1 +1,1 @@
-# AppRTC Signaling in Rust
+# AppRTC P2P Signaling Server

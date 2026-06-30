@@ -22,7 +22,8 @@ target
 
 
 # Added by cargo
-
+**/.DS_Store
 /target
 .idea
 Cargo.lock
+**/bin/
