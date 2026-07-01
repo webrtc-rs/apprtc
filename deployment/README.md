@@ -91,3 +91,53 @@ To run the server continuously in the background on port `443` (HTTPS/WSS):
    ```bash
    systemctl status apprtc
    ```
+
+---
+
+## 7. Certificate Auto-Renewal
+
+On Fedora, installing Certbot automatically registers a background systemd timer to perform automated certificate renewals twice a day. Since your AppRTC service runs on port `443`, port `80` is left open for Certbot to spin up its temporary standalone validation server.
+
+### Systemd Renewal Files
+* **Timer Configuration:** `/usr/lib/systemd/system/certbot-renew.timer`
+* **Renewal Service:** `/usr/lib/systemd/system/certbot-renew.service` (Runs `certbot renew --quiet --no-self-upgrade`)
+
+---
+
+### Step 7.1: Configure Post-Renewal Reload (Required)
+The running `apprtc` service must be restarted to load new certificates once they are renewed. Create a Certbot deploy hook:
+
+1. Create the hook script:
+   ```bash
+   echo -e '#!/bin/sh\nsystemctl restart apprtc' > /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
+   ```
+2. Make it executable:
+   ```bash
+   chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
+   ```
+
+---
+
+### Step 7.2: Verify and Start the Renewal Timer
+
+1. **Verify the timer is running**:
+   Check the timer status:
+   ```bash
+   systemctl status certbot-renew.timer
+   ```
+   * **Note**: If the status says `inactive (dead)`, start and enable the timer manually:
+     ```bash
+     systemctl enable --now certbot-renew.timer
+     ```
+     Once started, the status should show `active (waiting)`.
+
+2. **View the next scheduled run**:
+   ```bash
+   systemctl list-timers --all | grep certbot
+   ```
+
+3. **Simulate a renewal (Dry Run)**:
+   Run this command to test the domain validation and verify the reload script runs successfully:
+   ```bash
+   certbot renew --dry-run
+   ```
