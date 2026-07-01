@@ -8,7 +8,7 @@ A websocket-based signaling server in Go.
 
 2. Checkout the `apprtc` repository
 
-        git clone https://github.com/webrtc/apprtc.git
+        git clone https://github.com/webrtc-rs/apprtc.git
 
 3. Make sure to set the $GOPATH according to the Go instructions in step 1
 
@@ -40,7 +40,7 @@ A websocket-based signaling server in Go.
 ## Deployment
 These instructions assume you are using Debian 7/8 and Go 1.6.3.
 
-1. Change [roomSrv](https://github.com/webrtc/apprtc/blob/master/src/collider/collidermain/main.go#L16) to your AppRTC server instance e.g.
+1. Change [roomSrv](https://github.com/webrtc-rs/apprtc/blob/master/collider/collidermain/main.go#L16) to your AppRTC server instance e.g.
 
 ```go
 var roomSrv = flag.String("room-server", "https://your.apprtc.server", "The origin of the room server")
