@@ -1,5 +1,5 @@
+pub mod config;
 pub mod http;
-pub mod proto;
-pub mod room_table;
+pub mod params;
 pub mod webapp;
-pub mod ws;
+pub mod ws_client;
