@@ -29,7 +29,7 @@
  </a>
 </p>
 <p align="center">
- <strong>AppRTC Signaling Server</strong>
+ <strong>AppRTC in Rust</strong>
 </p>
 
 [AppRTC](https://appr.tc) is a WebRTC reference application designed for peer-to-peer calling and signaling.
