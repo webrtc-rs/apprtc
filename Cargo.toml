@@ -1,6 +1,6 @@
 [package]
 name = "apprtc"
-version = "0.20.0-rc.1"
+version = "0.20.0-rc.2"
 authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
 description = "AppRTC in Rust"
