@@ -80,17 +80,18 @@ describe('Room selection Test', function() {
   it('input filter', function() {
     var validInputs = [
       '123123',
-      'asdfs3',
-      'room1',
-      '3254234523452345234523452345asdfasfdasdf'
+      '0',
+      '12345',
+      '18446744073709551615'
     ];
     var invalidInputs = [
       '',
       ' ',
       'abcd',
-      '123',
+      '123a',
       '[5afasdf',
-      'ñsaer3'
+      '18446744073709551616',
+      '-5'
     ];
 
     var testInput = function(input, expectedResult) {
@@ -126,14 +127,14 @@ describe('Room selection Test', function() {
   });
 
   it('test join button', function() {
-    this.inputBox_.value = 'targetRoom';
+    this.inputBox_.value = '12345';
     var joinedRoom = null;
     this.roomSelection_.onRoomSelected = function(room) {
       joinedRoom = room;
     };
     this.joinButton_.click();
 
-    expect(joinedRoom).toEqual('targetRoom');
+    expect(joinedRoom).toEqual('12345');
   });
 
   it('make click handler', function(done) {
@@ -183,7 +184,7 @@ describe('Room selection Test', function() {
     }
 
     // Hitting ENTER when the room name is invalid should do nothing.
-    this.inputBox_.value = '1';
+    this.inputBox_.value = '-5';
     this.inputBox_.dispatchEvent(createUIEvent('input'));
     this.inputBox_.dispatchEvent(createEnterKeyUpEvent());
     expect(joinedRoom).toBeNull();

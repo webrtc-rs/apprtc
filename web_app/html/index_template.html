@@ -24,11 +24,17 @@
 
   <link rel="icon" sizes="192x192" href="/images/webrtc-icon-192x192.png">
   <link rel="canonical" href="{{ room_link }}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/css/main.css">
 
 </head>
 
 <body>
+  <div class="bg-glow"></div>
+  <div class="bg-glow-right"></div>
+
   {% if header_message %}
   <header>
     {{ header_message }}
@@ -46,20 +52,37 @@
 
   <div id="room-selection" class="hidden">
     <h1>AppRTC</h1>
-    <p id="instructions">Please enter a room name.</p>
-    <div>
-      <div id="room-id-input-div">
-        <input type="text" id="room-id-input" autofocus/>
-        <label class="error-label hidden" for="room-id-input" id="room-id-input-label">Room name must be 5 or more characters and include only letters, numbers, underscore and hyphen.</label>
+    <p class="subtitle">P2P/SFU Signaling Server</p>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span class="card-icon waiting"></span>
+          <span id="instructions">Please enter a room id:</span>
+        </div>
       </div>
-      <div id="room-id-input-buttons">
-        <button id="join-button">JOIN</button>
-        <button id="random-button">RANDOM</button>
+      <div class="controls-row">
+        <div id="room-id-input-div">
+          <input type="text" id="room-id-input" autofocus/>
+          <label class="error-label hidden" for="room-id-input" id="room-id-input-label">Room id must be a valid number (up to 18446744073709551615).</label>
+        </div>
+        <div id="room-id-input-buttons">
+          <button id="join-button">JOIN</button>
+          <button id="random-button">RANDOM</button>
+        </div>
       </div>
     </div>
-    <div id="recent-rooms">
-      <p>Recently used rooms:</p>
-      <ul id="recent-rooms-list"></ul>
+
+    <div id="recent-rooms" class="card">
+      <div class="card-header">
+        <div class="card-title states">
+          <span class="card-icon"></span>
+          <span>Recently used rooms</span>
+        </div>
+      </div>
+      <div class="log-container">
+        <ul id="recent-rooms-list"></ul>
+      </div>
     </div>
   </div>
 

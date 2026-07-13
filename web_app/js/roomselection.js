@@ -30,7 +30,7 @@ var RoomSelection = function(roomSelectionDiv,
   this.roomRecentList_ = this.roomSelectionDiv_.querySelector(
       uiConstants.roomSelectionRecentList);
 
-  this.roomIdInput_.value = randomString(9);
+  this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
   // Call onRoomIdInput_ now to validate initial state of input box.
   this.onRoomIdInput_();
 
@@ -104,12 +104,19 @@ RoomSelection.prototype.buildRecentRoomList_ = function(recentRooms) {
 
 RoomSelection.prototype.onRoomIdInput_ = function() {
   // Validate room id, enable/disable join button.
-  // The server currently accepts only the \w character class and
-  // hyphen+underscor.
+  // Limit to only numbers, and value must be valid uint64 (0 to 18446744073709551615).
   var room = this.roomIdInput_.value;
-  var valid = room.length >= 5;
-  var re = /^([a-zA-Z0-9-_]+)+$/;
-  valid = valid && re.exec(room);
+  var re = /^\d+$/;
+  var valid = re.test(room);
+  if (valid) {
+    try {
+      var val = BigInt(room);
+      valid = val >= 0n && val <= 18446744073709551615n;
+    } catch (e) {
+      valid = false;
+    }
+  }
+
   if (valid) {
     this.roomJoinButton_.disabled = false;
     this.roomIdInput_.classList.remove('invalid');
@@ -129,7 +136,7 @@ RoomSelection.prototype.onRoomIdKeyPress_ = function(event) {
 };
 
 RoomSelection.prototype.onRandomButton_ = function() {
-  this.roomIdInput_.value = randomString(9);
+  this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
   this.onRoomIdInput_();
 };
 
