@@ -1,0 +1,3 @@
+[submodule "sfu"]
+	path = sfu
+	url = https://github.com/webrtc-rs/sfu

@@ -29,10 +29,10 @@
  </a>
 </p>
 <p align="center">
- <strong>AppRTC in Rust</strong>
+ <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
 </p>
 
-[AppRTC](https://appr.tc) is a WebRTC reference application designed for peer-to-peer calling and signaling.
+[AppRTC](https://appr.tc) is a WebRTC-rs reference application designed for peer-to-peer (P2P) and selective forwarding unit (SFU) calling and signaling.
 
 The public instance is online at **[https://appr.tc](https://appr.tc)**.
 
@@ -51,7 +51,7 @@ the `webrtc-rs` ecosystem.
 
 ---
 
-## AppRTC P2P Signaling Protocol
+## AppRTC P2P/SFU Signaling Protocol
 
 The AppRTC signaling process consists of an initial HTTP room handshaking API and a WebSocket-based messaging protocol.
 
@@ -182,3 +182,29 @@ Sent when a peer disconnects or leaves the call.
 
 For details on compiling, running, and deploying this server to Fedora or other Linux environments using Let's Encrypt
 certificates, see [deployment/README.md](./deployment/README.md).
+
+
+## Building
+
+### Toolchain
+
+Use a Rust toolchain with Edition 2024 support.
+
+### Build & test
+
+```bash
+# Fetch the submodules first
+git submodule update --init --recursive
+cargo clippy
+cargo fmt
+cargo build
+cargo test
+```
+
+## Open Source License
+
+This project uses dual licensing under MIT or Apache-2.0.
+
+## Contributing
+
+Contributors and pull requests are welcome.
