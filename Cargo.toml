@@ -1,14 +1,22 @@
-[package]
-name = "apprtc"
+[workspace]
+members = [
+    "apprtc",
+    "appweb",
+    "signaling",
+]
+resolver = "2"
+
+[profile.dev]
+opt-level = 0
+
+[workspace.package]
 version = "0.20.0-rc.3"
 authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
-description = "AppRTC P2P/SFU Signaling Server in Rust"
 license = "MIT/Apache-2.0"
-documentation = "https://docs.rs/apprtc"
 homepage = "https://webrtc.rs"
 repository = "https://github.com/webrtc-rs/apprtc"
 keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
-[dependencies]
+[workspace.dependencies]
