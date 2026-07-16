@@ -1,5 +1,5 @@
 pub mod config;
-pub mod http;
 pub mod params;
-pub mod webapp;
-pub mod ws_client;
+pub mod templates;
+pub mod webserver;
+pub mod wsclient;
