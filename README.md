@@ -40,8 +40,8 @@ Currently, this signaling server is implemented in **Go (Golang)**, but it will 
 the `webrtc-rs` ecosystem.
 
 > [!NOTE]
-> The majority of the Go code in the [collider](./collider) directory and the client-side assets in
-> the [web_app](./web_app) directory are based on the deprecated Google AppRTC reference project located
+> The majority of the Go code in the [collider](go/collider) directory and the client-side assets in
+> the [web_app](go/web_app) directory are based on the deprecated Google AppRTC reference project located
 > at [https://github.com/webrtc/apprtc](https://github.com/webrtc/apprtc).
 >
 > **Key Modifications:**

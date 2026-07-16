@@ -49,9 +49,9 @@ rsync -avz --exclude 'target' --exclude '.git' --exclude '.idea' ./ root@173.249
 ## 5. Build the Server on Remote
 On the **remote server**, compile the server binary and grant it execution permissions:
 ```bash
-cd /opt/apprtc/collider
-go build -o /opt/apprtc/collider_bin collidermain/main.go
-chmod +x /opt/apprtc/collider_bin
+cd /opt/apprtc/go/collider
+go build -o /opt/apprtc/bin/collider collidermain/main.go
+chmod +x /opt/apprtc/bin/collider
 ```
 
 ---
@@ -73,7 +73,7 @@ To run the server continuously in the background on port `443` (HTTPS/WSS):
    [Service]
    Type=simple
    WorkingDirectory=/opt/apprtc
-   ExecStart=/opt/apprtc/collider_bin -port=443 -tls=true -web-root=/opt/apprtc/web_app
+   ExecStart=/opt/apprtc/bin/collider -port=443 -tls=true -web-root=/opt/apprtc/go/web_app
    Restart=always
    RestartSec=5
 
