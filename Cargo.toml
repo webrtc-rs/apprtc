@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "apprtc",
-    "appweb",
-    "signaling",
+    "apprtc",       # apprtc binary
+    "appweb",       # app/web server
+    "signaling",    # signaling hub
 ]
 resolver = "2"
 

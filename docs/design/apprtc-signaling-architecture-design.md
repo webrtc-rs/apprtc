@@ -10,19 +10,20 @@ Browser and service roles use long-lived, full-duplex signaling channels, while 
 
 The implementation is organized as three Rust crates:
 
-| Component | Network role | Owns |
-|---|---|---|
-| `apprtc` | HTTP server; WebSocket **client** of `signaling` | web app/static assets, HTTP room API, ICE config, templates, client-id minting |
-| `signaling` | WebSocket **server** | authoritative room model, browser sockets, queue/reconnect grace, P2P relay, SFU worker registry and room assignment |
-| `sfu` | WebSocket **client** of `signaling`; WebRTC media server | current `Sfu` engine, its driver, per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding |
+| Component   | Network role                                             | Owns                                                                                                                 |
+|-------------|----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `apprtc`    | n/a                                                      | apprtc binary                                                                                                        |
+| `appweb`    | HTTP server; WebSocket **client** of `signaling`         | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
+| `signaling` | WebSocket **server**                                     | authoritative room model, browser sockets, queue/reconnect grace, P2P relay, SFU worker registry and room assignment |
+| `sfu`       | WebSocket **client** of `signaling`; WebRTC media server | current `Sfu` engine, its driver, per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding                  |
 
-The three components are **modules first, binaries second**. `apprtc` and `signaling` are separate crates with a defined interface — the `RoomAuthority` boundary bound as a wire protocol in §8.4 — and a deployment may link them into one process or run them as separate binaries (both binding are the §8.4 control WebSocket). The same holds for the worker boundary (§8.5): the `Sfu` engine boundary never changes across deployments — how signaling reaches it (localhost WebSocket, or cross-host WebSocket) is a *driver* detail. Every §8 service protocol is therefore the cross-process binding of an internal interface, not the only binding, and an all-in-one binary (`apprtc` + `signaling` + `sfu` in one process) is a supported deployment for demos, integration tests, and small installations. Only the browser protocols (§8.2, §8.3) are unconditionally wire protocols. WebSocket is the default cross-process transport because browsers already use it and an SFU worker can initiate one long-lived outbound connection to the hub.
+The three components are **modules first, binaries second**. `appweb` and `signaling` are separate crates with a defined interface — the `RoomAuthority` boundary bound as a wire protocol in §8.4 — and a deployment may link them into one process or run them as separate binaries (both binding are the §8.4 control WebSocket). The same holds for the worker boundary (§8.5): the `Sfu` engine boundary never changes across deployments — how signaling reaches it (localhost WebSocket, or cross-host WebSocket) is a *driver* detail. Every §8 service protocol is therefore the cross-process binding of an internal interface, not the only binding, and an all-in-one binary (`appweb` + `signaling` + `sfu` in one process) is a supported deployment for demos, integration tests, and small installations. Only the browser protocols (§8.2, §8.3) are unconditionally wire protocols. WebSocket is the default cross-process transport because browsers already use it and an SFU worker can initiate one long-lived outbound connection to the hub.
 
 ## 1. Topology and authority
 
 ```mermaid
 flowchart LR
-    B[Browser] <-- HTTP --> A[apprtc]
+    B[Browser] <-- HTTP --> A[appweb]
     B <-- WebSocket register/send --> S[signaling hub]
     A <-- control WebSocket --> S
     F1[SFU worker 1] <-- worker WebSocket --> S
@@ -30,7 +31,7 @@ flowchart LR
     B <-- ICE DTLS SRTP --> F1
 ```
 
-`apprtc` may serve the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns exactly one `Room` record for every room:
+`appweb` may serve the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns exactly one `Room` record for every room:
 
 ```text
 RoomKey   = V1(String) | V2(u64)
@@ -70,7 +71,7 @@ ICE candidates are first-class application-signaling messages in both P2P and SF
 
 ## 3. One WebSocket hub, three authenticated roles
 
-Every connection reaches `wss://signaling/ws`; its first frame chooses an authenticated role. V2 browser credentials are admission tokens created by `apprtc`; the v1 browser path deliberately retains its current tokenless framing. Service roles use mTLS or a rotated worker/app token and should normally be reachable only on a private listener.
+Every connection reaches `wss://signaling/ws`; its first frame chooses an authenticated role. V2 browser credentials are admission tokens created by `appweb`; the v1 browser path deliberately retains its current tokenless framing. Service roles use mTLS or a rotated worker/app token and should normally be reachable only on a private listener.
 
 | Role | First frame | Direction after registration |
 |---|---|---|
@@ -108,7 +109,7 @@ When a V2 P2P room changes from two members to one, `signaling` promotes the sur
 
 ### 3.1.1 V1/V2 compatibility contract
 
-Protocol version is selected by the first successful `/join` and is immutable for the room lifetime. `apprtc` sends `ver:1` for the stock web app and `ver:2` for the new client. A join using the other version is rejected as `VERSION_MISMATCH` rather than silently changing an active room's semantics. The v1 HTTP compatibility layer maps this to its existing browser-safe room-not-available result; the v2 API returns the explicit error code.
+Protocol version is selected by the first successful `/join` and is immutable for the room lifetime. `appweb` sends `ver:1` for the stock web app and `ver:2` for the new client. A join using the other version is rejected as `VERSION_MISMATCH` rather than silently changing an active room's semantics. The v1 HTTP compatibility layer maps this to its existing browser-safe room-not-available result; the v2 API returns the explicit error code.
 
 | Surface | V1 — compatibility protocol | V2 — SFU-capable protocol |
 |---|---|---|
@@ -119,7 +120,7 @@ Protocol version is selected by the first successful `/join` and is immutable fo
 | Room and client ID wire form | Existing strings, unchanged | Canonical decimal strings representing `u64` |
 | SFU routing | Never | Only after an explicit P2P→SFU transition |
 
-The Rust `apprtc` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`, `/v1alpha/iceconfig`, `/r/{room}`, and `wss_post_url` behavior. They translate V1 HTTP injection/fallback calls into an internal app→hub `inject` control frame while preserving the V1 HTTP response and WebSocket payloads. The Rust `signaling` hub preserves the V1 queue and reconnect-grace behavior.
+The Rust `appweb` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`, `/v1alpha/iceconfig`, `/r/{room}`, and `wss_post_url` behavior. They translate V1 HTTP injection/fallback calls into an internal app→hub `inject` control frame while preserving the V1 HTTP response and WebSocket payloads. The Rust `signaling` hub preserves the V1 queue and reconnect-grace behavior.
 
 `sfu-upgrade`, `sfu-downgrade`, worker frames, `Upgrading`, `Downgrading`, and all SFU assignment are v2-only. A stock v1 browser never receives a control it cannot process.
 
@@ -181,8 +182,8 @@ The hub does not mint or inspect a `requestid` because browser `msg` remains opa
 
 ### 4.1 P2P, one or two members
 
-1. Browser calls `POST /join/{room}` on `apprtc`.
-2. `apprtc` sends `admit(req, roomid, clientid, ver)` over its control WebSocket.
+1. Browser calls `POST /join/{room}` on `appweb`.
+2. `appweb` sends `admit(req, roomid, clientid, ver)` over its control WebSocket.
 3. `signaling` creates the member, elects the first member as initiator, and replies.
 4. Browser registers its own WebSocket with `signaling`.
 5. Every browser `{cmd:"send"}` is relayed to the other member; early messages queue and flush when that member registers.
@@ -196,7 +197,7 @@ No SFU worker sees this room or its signaling. For a **v1** room this flow remai
 ```mermaid
 sequenceDiagram
     participant C as Third browser C
-    participant AR as apprtc
+    participant AR as appweb
     participant S as signaling
     participant F as assigned SFU worker
     C->>AR: POST join(room)
@@ -299,7 +300,7 @@ The same transport scoping applies during V2 WebSocket (re)registration. The bro
 - During that reconciliation, queue inbound SDP/ICE until the snapshot-selected PC is ready; never apply a queued message to a retired PC.
 - On `room-failed` (or an `UNAUTHORIZED` re-register that reveals a missed one), tear down all transports, surface the failure state, and rejoin through `POST /v2/join` without reloading the page or reacquiring devices.
 
-`apprtc` continues to expose `/join`, `/leave`, `/params`, `/v1alpha/iceconfig`, room pages, and static assets. It becomes a thin HTTP/control-WS adapter: all room mutations round-trip to `signaling`; it has no second occupancy or initiator model.
+`appweb` continues to expose `/join`, `/leave`, `/params`, `/v1alpha/iceconfig`, room pages, and static assets. It becomes a thin HTTP/control-WS adapter: all room mutations round-trip to `signaling`; it has no second occupancy or initiator model.
 
 ## 7. Security and acceptance criteria
 
@@ -399,7 +400,7 @@ V2 uses a separate route namespace so that a V1 client cannot accidentally opt i
 | `POST /v2/leave/{roomid}/{clientid}` | empty; both IDs must be `U64Decimal` | `{result:"SUCCESS"}` or an ID/authorization error |
 | `GET /v2/params`, `GET /v2/r/{roomid}` | v2 validation | v2 configuration and room-page response; `/v2/params` carries the ICE/TURN server list — v2 has no separate iceconfig route |
 
-There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `apprtc` as a random `u64`, returned as `ClientIdV2`, and is not supplied by the browser at join time. `apprtc` holds no room state, so uniqueness is enforced by the hub: an `admit` that collides with a live member returns `DUPLICATE_CLIENT` and `apprtc` retries with a fresh id. A v2 join returns `FULL` only when the room is at the hub's configured maximum room size; a third join with no eligible worker returns `NO_SFU_AVAILABLE`, not `FULL`. `is_initiator` in the join params is present only when `mode` is `"p2p"` and omitted otherwise, mirroring the `registered` rule.
+There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `appweb` as a random `u64`, returned as `ClientIdV2`, and is not supplied by the browser at join time. `appweb` holds no room state, so uniqueness is enforced by the hub: an `admit` that collides with a live member returns `DUPLICATE_CLIENT` and `appweb` retries with a fresh id. A v2 join returns `FULL` only when the room is at the hub's configured maximum room size; a third join with no eligible worker returns `NO_SFU_AVAILABLE`, not `FULL`. `is_initiator` in the join params is present only when `mode` is `"p2p"` and omitted otherwise, mirroring the `registered` rule.
 
 #### WebSocket
 
@@ -434,9 +435,9 @@ The hub validates canonical `u64` IDs, token binding, and that the admitted memb
 
 ### 8.4 AppRTC control WebSocket
 
-`apprtc` keeps HTTP request/response compatibility but delegates every room mutation to the hub. These frames are private service protocol, not browser API. One connection has the state `Connecting → Registered → Closed`; its first frame must be `app`.
+`appweb` keeps HTTP request/response compatibility but delegates every room mutation to the hub. These frames are private service protocol, not browser API. One connection has the state `Connecting → Registered → Closed`; its first frame must be `app`.
 
-This protocol is the WebSocket binding of the internal `RoomAuthority` interface (`admit`, `remove`, `occupancy`, `inject`, plus the `client-disconnected` push). A merged `apprtc`+`signaling` binary implements `RoomAuthority` as direct in-process calls; the `req` correlation, cached terminal replies, and reconnect/replay rules below are properties of this socket binding only and must not be reimplemented in-process. In every deployment mode, browser `send`/`msg` relay traffic terminates at the `signaling` module's own listener and never routes through `apprtc` — merging the processes merges listeners, not message paths.
+This protocol is the WebSocket binding of the internal `RoomAuthority` interface (`admit`, `remove`, `occupancy`, `inject`, plus the `client-disconnected` push). A merged `appweb`+`signaling` binary implements `RoomAuthority` as direct in-process calls; the `req` correlation, cached terminal replies, and reconnect/replay rules below are properties of this socket binding only and must not be reimplemented in-process. In every deployment mode, browser `send`/`msg` relay traffic terminates at the `signaling` module's own listener and never routes through `appweb` — merging the processes merges listeners, not message paths.
 
 ```text
 AppId          = random non-empty process-instance string; stable across socket reconnects, regenerated on process restart
@@ -481,15 +482,15 @@ Every command with `req` receives exactly one terminal reply. Repeating a comman
 { "reply":"error", "req":"502", "code":"INVALID_ROOM_ID", "reason":"..." }
 
 // unsolicited hub event: the hub already removed the membership on grace expiry and,
-// in SFU mode, already issued the worker `leave` — apprtc is informed, not consulted
+// in SFU mode, already issued the worker `leave` — appweb is informed, not consulted
 { "event":"client-disconnected", "roomid":"42", "clientid":"101", "ver":2, "reason":"register_timeout" }
 ```
 
-For v2, `admit` and `occupancy` replies carry the room's current signal `epoch` as a decimal string — this is how `apprtc` populates the `/v2/join` response's `epoch` without holding room state. The `admit` reply also carries `is_initiator`: always for `ver:1`, and for `ver:2` only when `mode` is `"p2p"` (omitted for `"sfu"`, mirroring the browser-facing rule) — this is likewise how the stateless `apprtc` populates the join response's `is_initiator`.
+For v2, `admit` and `occupancy` replies carry the room's current signal `epoch` as a decimal string — this is how `appweb` populates the `/v2/join` response's `epoch` without holding room state. The `admit` reply also carries `is_initiator`: always for `ver:1`, and for `ver:2` only when `mode` is `"p2p"` (omitted for `"sfu"`, mirroring the browser-facing rule) — this is likewise how the stateless `appweb` populates the join response's `is_initiator`.
 
 `result` is one of `SUCCESS`, `FULL`, `DUPLICATE_CLIENT`, or `ERROR`; `code` refines `ERROR` (`UNAUTHORIZED`, `INVALID_ROOM_ID`, `INVALID_CLIENT_ID`, `VERSION_MISMATCH`, `NO_SFU_AVAILABLE`, `ROOM_TRANSITION`, `NOT_FOUND`, or `INTERNAL`). `inject` with `ver:2`, or a version change for an existing room, returns `VERSION_MISMATCH`. For `ver:1`, identifiers are opaque strings. For `ver:2`, they must be canonical decimal `u64` strings.
 
-If the control socket disconnects, `apprtc` fails unresolved HTTP requests with a retryable error; it does not invent occupancy or initiator state locally. On reconnect it re-registers the same process-instance `appid` and may resend only requests whose `req` has not received a terminal reply. A process restart creates a new `appid` before opening its first control socket. Because `req` values are never reused for one live `appid`, the `(appid, req)` reply cache — retained for a bounded window — stays unambiguous; a per-connection `req` namespace would let a new session's request collide with a previous session's cached reply.
+If the control socket disconnects, `appweb` fails unresolved HTTP requests with a retryable error; it does not invent occupancy or initiator state locally. On reconnect it re-registers the same process-instance `appid` and may resend only requests whose `req` has not received a terminal reply. A process restart creates a new `appid` before opening its first control socket. Because `req` values are never reused for one live `appid`, the `(appid, req)` reply cache — retained for a bounded window — stays unambiguous; a per-connection `req` namespace would let a new session's request collide with a previous session's cached reply.
 
 ### 8.5 SFU worker WebSocket
 
@@ -587,7 +588,7 @@ sequenceDiagram
     participant A as Browser A
     participant B as Browser B
     participant C as Browser C
-    participant AR as apprtc HTTP edge
+    participant AR as appweb HTTP
     participant S as signaling hub
     participant F as SFU worker
 
@@ -688,7 +689,7 @@ sequenceDiagram
     Note over C,F: Leave and SFU room maintenance
     C->>AR: POST v2 leave
     AR->>S: remove C from room
-    Note over S: A WS disconnect past grace triggers the same removal in the hub, which informs apprtc via client-disconnected
+    Note over S: A WS disconnect past grace triggers the same removal in the hub, which informs appweb via client-disconnected
     S->>F: C leaves room with lifecycle ID
     F->>F: apply SFUEvent Leave
     F-->>S: C left room with lifecycle ID

@@ -13,3 +13,5 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
+appweb = { version = "0.20.0-rc.3", path = "../appweb" }
+signaling = { version = "0.20.0-rc.3", path = "../signaling" }
