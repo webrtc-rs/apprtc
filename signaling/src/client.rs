@@ -117,7 +117,7 @@ impl Client {
 
     /// Drain and return this client's pending-flush queue (was `other.msgs; other.msgs = nil`).
     /// Used by `Room::add_client` to hand a joiner the peer's queued offer/ICE.
-    pub fn take_msgs(&mut self) -> Vec<String> {
+    pub fn drain_msgs(&mut self) -> Vec<String> {
         self.msgs.drain(..).collect()
     }
 

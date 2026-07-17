@@ -158,7 +158,7 @@ impl Room {
         if !is_initiator {
             // Hand the joiner the initiator's queued offer/ICE and clear the queue.
             for other in self.clients.values_mut() {
-                messages.extend(other.take_msgs());
+                messages.extend(other.drain_msgs());
             }
         }
 
@@ -272,5 +272,108 @@ impl Protocol<Addressed, Addressed, Infallible> for Room {
         }
         self.clients.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sansio::Protocol;
+
+    fn new_room(id: &str) -> Room {
+        Room::new(id.to_string(), Duration::from_secs(1), Instant::now())
+    }
+
+    #[test]
+    fn new_room_is_empty() {
+        let r = new_room("abc");
+        assert_eq!(r.id(), "abc");
+        assert_eq!(r.occupancy(), 0);
+    }
+
+    #[test]
+    fn get_or_create_client() {
+        let now = Instant::now();
+        let mut r = new_room("ab");
+        let (id1, id2, id3) = ("1".to_string(), "2".to_string(), "3".to_string());
+
+        // Create, then mutate and re-read to prove the second call returns the same
+        // client rather than recreating it (Go compared pointers).
+        r.client(now, &id1)
+            .expect("first client")
+            .set_initiator(true);
+        assert!(r.client(now, &id1).expect("same client").is_initiator());
+        assert_eq!(
+            r.occupancy(),
+            1,
+            "client() must not recreate an existing client"
+        );
+
+        r.client(now, &id2).expect("second client");
+        assert_eq!(r.occupancy(), 2);
+
+        // The third client exceeds capacity.
+        assert!(r.client(now, &id3).is_err());
+    }
+
+    #[test]
+    fn register_delivers_queued_message() {
+        let now = Instant::now();
+        let mut r = new_room("a");
+        let (id1, id2) = ("1".to_string(), "2".to_string());
+
+        r.client(now, &id1)
+            .unwrap()
+            .enqueue("hello".to_string())
+            .unwrap();
+        r.register(now, &id2).unwrap();
+
+        assert_eq!(r.occupancy(), 2);
+        assert!(r.client(now, &id2).unwrap().registered());
+        // The first client's queued message is flushed to the newly-registered one
+        // (was delivered to `c2.rwc.Msg`).
+        assert_eq!(r.poll_write(), Some(("2".to_string(), "hello".to_string())));
+    }
+
+    #[test]
+    fn send_queues_when_alone() {
+        let now = Instant::now();
+        let mut r = new_room("a");
+        let id = "1".to_string();
+
+        r.send(now, &id, "hi".to_string()).unwrap();
+        // Only one client: the message is queued on it, not delivered.
+        assert!(r.poll_write().is_none());
+        assert_eq!(
+            r.client(now, &id).unwrap().drain_msgs(),
+            vec!["hi".to_string()]
+        );
+    }
+
+    #[test]
+    fn send_delivers_when_paired() {
+        let now = Instant::now();
+        let mut r = new_room("a");
+        let (id1, id2) = ("1".to_string(), "2".to_string());
+
+        r.register(now, &id2).unwrap();
+        r.send(now, &id1, "hi".to_string()).unwrap();
+
+        // Delivered to the peer, not queued on the sender.
+        assert!(r.client(now, &id1).unwrap().drain_msgs().is_empty());
+        assert_eq!(r.poll_write(), Some(("2".to_string(), "hi".to_string())));
+    }
+
+    #[test]
+    fn remove_deletes_client() {
+        let now = Instant::now();
+        let mut r = new_room("a");
+        let id = "1".to_string();
+
+        r.register(now, &id).unwrap();
+        r.remove(&id);
+        // Go asserted `rwc.Closed`; the socket close is driver-side here, so the
+        // observable is that the client is gone.
+        assert!(r.empty());
     }
 }
