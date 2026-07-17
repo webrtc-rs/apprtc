@@ -31,31 +31,19 @@ pub struct Room {
     /// Client id -> client.
     clients: HashMap<ClientId, Client>,
     register_timeout: Duration,
-    /// Updated on every access so the room table sweeper can reap idle rooms
-    /// (replaces the memcache TTL). Managed by the room table.
-    last_active: Instant,
 }
 
 impl Room {
-    pub fn new(id: RoomId, register_timeout: Duration, now: Instant) -> Self {
+    pub fn new(id: RoomId, register_timeout: Duration) -> Self {
         Self {
             id,
             clients: HashMap::new(),
             register_timeout,
-            last_active: now,
         }
     }
 
     pub fn id(&self) -> &RoomId {
         &self.id
-    }
-
-    pub fn last_active(&self) -> Instant {
-        self.last_active
-    }
-
-    pub fn set_last_active(&mut self, now: Instant) {
-        self.last_active = now;
     }
 
     /// Return the client, creating it (with a fresh register-timeout deadline) if it
@@ -309,7 +297,7 @@ mod tests {
     use sansio::Protocol;
 
     fn new_room(id: &str) -> Room {
-        Room::new(id.to_string(), Duration::from_secs(1), Instant::now())
+        Room::new(id.to_string(), Duration::from_secs(1))
     }
 
     fn assert_message(actual: Option<Message>, room_id: &str, client_id: &str, msg: &str) {

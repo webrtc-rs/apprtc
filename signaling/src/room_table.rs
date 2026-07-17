@@ -30,14 +30,10 @@ impl RoomTable {
     }
 
     /// Return the room specified by `id`, creating it when it does not exist.
-    /// Every access refreshes the room's idle-room timestamp.
-    pub fn room(&mut self, now: Instant, id: &RoomId) -> &mut Room {
-        let room = self
-            .rooms
+    pub fn room(&mut self, id: &RoomId) -> &mut Room {
+        self.rooms
             .entry(id.clone())
-            .or_insert_with(|| Room::new(id.clone(), self.register_timeout, now));
-        room.set_last_active(now);
-        room
+            .or_insert_with(|| Room::new(id.clone(), self.register_timeout))
     }
 
     /// Remove a client and remove its room as well when it becomes empty.
@@ -62,7 +58,7 @@ impl RoomTable {
         source_id: &ClientId,
         msg: String,
     ) -> Result<(), String> {
-        self.room(now, room_id).send(now, source_id, msg)
+        self.room(room_id).send(now, source_id, msg)
     }
 
     /// Store or relay an outbound client message.
@@ -89,8 +85,7 @@ impl RoomTable {
         client_id: &ClientId,
         is_loopback: bool,
     ) -> Result<(bool, Vec<String>), String> {
-        self.room(now, room_id)
-            .add_client(now, client_id, is_loopback)
+        self.room(room_id).add_client(now, client_id, is_loopback)
     }
 
     /// Remove a client for a browser `/leave` or an internal removal.
@@ -110,7 +105,7 @@ impl RoomTable {
         room_id: &RoomId,
         client_id: &ClientId,
     ) -> Result<(), String> {
-        self.room(now, room_id).register(now, client_id)
+        self.room(room_id).register(now, client_id)
     }
 
     /// Clear a client's connection registration and arm its reconnect timeout.
@@ -140,14 +135,6 @@ impl RoomTable {
     /// Return the number of currently registered client connections.
     pub fn ws_count(&self) -> usize {
         self.rooms.values().map(Room::ws_count).sum()
-    }
-
-    /// Reap rooms with no live connection and no activity newer than `max_age`.
-    /// The caller owns sweep scheduling and invokes this operation when due.
-    pub fn sweep(&mut self, now: Instant, max_age: Duration) {
-        self.rooms.retain(|_, room| {
-            room.ws_count() != 0 || now.saturating_duration_since(room.last_active()) <= max_age
-        });
     }
 
     pub fn room_count(&self) -> usize {
@@ -207,7 +194,7 @@ impl Protocol<Message, Message, Infallible> for RoomTable {
     }
 
     /// Drive every room's client registration deadlines and reap rooms whose last
-    /// client expired. Idle-room sweeping is deliberately not handled here.
+    /// client expired.
     fn handle_timeout(&mut self, now: Self::Time) -> Result<(), Self::Error> {
         for room in self.rooms.values_mut() {
             room.handle_timeout(now)?;
@@ -254,15 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn room_gets_or_creates_and_refreshes_last_active() {
-        let now = Instant::now();
-        let later = now + Duration::from_secs(1);
+    fn room_gets_or_creates() {
         let mut table = RoomTable::new(Duration::from_secs(10));
         let room_id = "room".to_string();
 
-        assert_eq!(table.room(now, &room_id).id(), &room_id);
+        assert_eq!(table.room(&room_id).id(), &room_id);
         assert_eq!(table.room_count(), 1);
-        assert_eq!(table.room(later, &room_id).last_active(), later);
+        assert_eq!(table.room(&room_id).id(), &room_id);
         assert_eq!(table.room_count(), 1);
     }
 
@@ -277,7 +262,7 @@ mod tests {
         table.remove(&room_id, &client1);
 
         assert_eq!(table.occupancy(&room_id), 1);
-        assert!(table.room(now, &room_id).client_is_initiator(&client2));
+        assert!(table.room(&room_id).client_is_initiator(&client2));
 
         table.remove(&room_id, &client2);
         assert_eq!(table.occupancy(&room_id), 0);
@@ -351,28 +336,6 @@ mod tests {
 
         assert_eq!(table.occupancy(&room_id), 1);
         assert_eq!(table.ws_count(), 1);
-    }
-
-    #[test]
-    fn sweep_reaps_only_idle_rooms_without_registered_clients() {
-        let now = Instant::now();
-        let old = now - Duration::from_secs(20);
-        let max_age = Duration::from_secs(10);
-        let mut table = RoomTable::new(Duration::from_secs(10));
-        let idle = "idle".to_string();
-        let active = "active".to_string();
-        let connected = "connected".to_string();
-        let client = "1".to_string();
-
-        table.join(old, &idle, &client, false).unwrap();
-        table.join(now, &active, &client, false).unwrap();
-        table.register(old, &connected, &client).unwrap();
-
-        table.sweep(now, max_age);
-
-        assert_eq!(table.occupancy(&idle), 0);
-        assert_eq!(table.occupancy(&active), 1);
-        assert_eq!(table.occupancy(&connected), 1);
     }
 
     #[test]
@@ -452,19 +415,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.poll_timeout(), Some(now + timeout));
-    }
-
-    #[test]
-    fn protocol_timeout_does_not_run_idle_room_sweeping() {
-        let now = Instant::now();
-        let old = now - Duration::from_secs(60);
-        let mut table = RoomTable::new(Duration::from_secs(120));
-        let (room_id, client1, _) = ids();
-        table.join(old, &room_id, &client1, false).unwrap();
-
-        table.handle_timeout(now).unwrap();
-
-        assert_eq!(table.occupancy(&room_id), 1);
     }
 
     #[test]
