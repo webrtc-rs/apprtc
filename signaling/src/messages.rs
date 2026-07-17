@@ -3,7 +3,16 @@
 // that can be found in the LICENSE file in the root of the source
 // tree.
 
+use crate::client::ClientId;
+use crate::room::RoomId;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default)]
+pub struct Message {
+    pub roomid: RoomId,
+    pub clientid: ClientId,
+    pub msg: String,
+}
 
 /// A WebSocket message from the client.
 ///

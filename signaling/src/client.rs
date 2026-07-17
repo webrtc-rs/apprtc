@@ -3,6 +3,8 @@
 // that can be found in the LICENSE file in the root of the source
 // tree.
 
+use crate::messages::Message;
+use crate::room::RoomId;
 use sansio::Protocol;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -30,17 +32,18 @@ pub enum ClientEvent {
 /// hub owns the real socket — and the `time.Timer` became a caller-polled deadline.
 pub struct Client {
     id: ClientId,
+    room_id: RoomId,
     /// Whether a connection is currently registered (was `rwc != nil`).
     registered: bool,
     /// Messages this client sent that are queued until the peer registers
     /// (`c.msgs` in Go).
     msgs: VecDeque<String>,
     /// Messages received on this client's socket, awaiting `poll_read` by the room.
-    reads: VecDeque<String>,
+    reads: VecDeque<Message>,
     /// Server->client messages ready for the driver to write to this client's
     /// socket (replaces the direct `sendServerMsg(rwc, …)` writes). Each entry is
     /// a raw relay payload, framed as a `{ "msg": … }` server frame on the wire.
-    writes: VecDeque<String>,
+    writes: VecDeque<Message>,
     /// Events awaiting `poll_event` by the room (currently just [`ClientEvent::Expired`]).
     events: VecDeque<ClientEvent>,
     /// The register-timeout deadline: the hub reaps the client if it is still
@@ -54,9 +57,10 @@ pub struct Client {
 
 impl Client {
     /// `timeout` is the register-timeout deadline (was the `*time.Timer` argument).
-    pub fn new(id: ClientId, timeout: Option<Instant>) -> Self {
+    pub fn new(id: ClientId, room_id: RoomId, timeout: Option<Instant>) -> Self {
         Self {
             id,
+            room_id,
             registered: false,
             msgs: VecDeque::new(),
             reads: VecDeque::new(),
@@ -69,6 +73,10 @@ impl Client {
 
     pub fn id(&self) -> &ClientId {
         &self.id
+    }
+
+    pub fn room_id(&self) -> &RoomId {
+        &self.room_id
     }
 
     pub fn is_initiator(&self) -> bool {
@@ -127,7 +135,11 @@ impl Client {
             return Err("Invalid client".to_string());
         }
         for msg in self.msgs.drain(..) {
-            other.handle_write(msg)?;
+            other.handle_write(Message {
+                roomid: self.room_id.clone(),
+                clientid: other.id.clone(),
+                msg,
+            })?;
         }
         Ok(())
     }
@@ -139,7 +151,11 @@ impl Client {
             return Err("Invalid client".to_string());
         }
         if other.registered {
-            other.handle_write(msg)?;
+            other.handle_write(Message {
+                roomid: self.room_id.clone(),
+                clientid: other.id.clone(),
+                msg,
+            })?;
             Ok(())
         } else {
             self.enqueue(msg)
@@ -147,18 +163,18 @@ impl Client {
     }
 }
 
-impl Protocol<String, String, Infallible> for Client {
+impl Protocol<Message, Message, Infallible> for Client {
     /// A message received on this client's socket, surfaced up for the room to
     /// route to the peer.
-    type Rout = String;
+    type Rout = Message;
     /// A message ready to write to this client's socket.
-    type Wout = String;
+    type Wout = Message;
     type Eout = ClientEvent;
     type Error = String;
     type Time = Instant;
 
     /// Push a message received on this client's socket.
-    fn handle_read(&mut self, msg: String) -> Result<(), Self::Error> {
+    fn handle_read(&mut self, msg: Message) -> Result<(), Self::Error> {
         self.reads.push_back(msg);
         Ok(())
     }
@@ -169,7 +185,7 @@ impl Protocol<String, String, Infallible> for Client {
     }
 
     /// Deliver a message to this client (the room routing a peer's message here).
-    fn handle_write(&mut self, msg: String) -> Result<(), Self::Error> {
+    fn handle_write(&mut self, msg: Message) -> Result<(), Self::Error> {
         self.writes.push_back(msg);
         Ok(())
     }

@@ -4,6 +4,7 @@
 // tree.
 
 use crate::client::{Client, ClientEvent, ClientId};
+use crate::messages::Message;
 use sansio::Protocol;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -17,11 +18,6 @@ const MAX_ROOM_CAPACITY: usize = 2;
 const LOOPBACK_CLIENT_ID: &str = "LOOPBACK_CLIENT_ID";
 
 pub type RoomId = String;
-
-/// A message tagged with the client id it was received from, or is destined to —
-/// the addressing the `Protocol` read/write planes need to pick a client, which the
-/// Go `io.Writer`-based API carried implicitly in the `*client` receiver.
-pub type Addressed = (ClientId, String);
 
 /// A room and its (at most two) clients.
 ///
@@ -71,8 +67,10 @@ impl Room {
                 return Err("Max room capacity reached".to_string());
             }
             let timeout = Some(now + self.register_timeout);
-            self.clients
-                .insert(client_id.clone(), Client::new(client_id.clone(), timeout));
+            self.clients.insert(
+                client_id.clone(),
+                Client::new(client_id.clone(), self.id.clone(), timeout),
+            );
         }
         Ok(self
             .clients
@@ -136,6 +134,37 @@ impl Room {
         }
     }
 
+    /// Clear a client's live registration and arm the reconnect grace period.
+    pub fn deregister(&mut self, now: Instant, client_id: &ClientId) -> bool {
+        if let Some(client) = self.clients.get_mut(client_id)
+            && client.registered()
+        {
+            client.deregister();
+            client.set_timer(Some(now + self.register_timeout));
+            return true;
+        }
+        false
+    }
+
+    /// Remove a client only when it is still unregistered.
+    pub fn remove_if_unregistered(&mut self, client_id: &ClientId) -> bool {
+        if self
+            .clients
+            .get(client_id)
+            .is_some_and(|client| !client.registered())
+        {
+            self.remove(client_id);
+            return true;
+        }
+        false
+    }
+
+    pub fn client_is_initiator(&self, client_id: &ClientId) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(Client::is_initiator)
+    }
+
     /// Allocate a new client for a `/join` request: elect the initiator (first client
     /// in the room) and return the messages queued by the other client so the joiner
     /// can replay the existing offer/ICE. Port of `apprtc.py::add_client_to_room`.
@@ -189,19 +218,18 @@ impl Room {
     }
 }
 
-impl Protocol<Addressed, Addressed, Infallible> for Room {
+impl Protocol<Message, Message, Infallible> for Room {
     /// A message received on a client's socket, tagged with its client id.
-    type Rout = Addressed;
+    type Rout = Message;
     /// A message to write to a client's socket, tagged with its client id.
-    type Wout = Addressed;
+    type Wout = Message;
     type Eout = Infallible;
     type Error = String;
     type Time = Instant;
 
-    /// Route an inbound message to the addressed client. An unknown client is dropped
-    /// (the client may have been reaped), matching the Go relay's tolerance.
-    fn handle_read(&mut self, (client_id, msg): Addressed) -> Result<(), Self::Error> {
-        if let Some(c) = self.clients.get_mut(&client_id) {
+    /// Route an inbound message to the client. An unknown client is dropped
+    fn handle_read(&mut self, msg: Message) -> Result<(), Self::Error> {
+        if let Some(c) = self.clients.get_mut(&msg.clientid) {
             c.handle_read(msg)?;
         }
         Ok(())
@@ -209,17 +237,17 @@ impl Protocol<Addressed, Addressed, Infallible> for Room {
 
     /// Drain the next message received from any client, tagged with its id.
     fn poll_read(&mut self) -> Option<Self::Rout> {
-        for (id, c) in self.clients.iter_mut() {
-            if let Some(msg) = c.poll_read() {
-                return Some((id.clone(), msg));
+        for client in self.clients.values_mut() {
+            if let Some(msg) = client.poll_read() {
+                return Some(msg);
             }
         }
         None
     }
 
-    /// Deliver a message to the addressed client (dropped if the client is unknown).
-    fn handle_write(&mut self, (client_id, msg): Addressed) -> Result<(), Self::Error> {
-        if let Some(c) = self.clients.get_mut(&client_id) {
+    /// Deliver a message to the client (dropped if the client is unknown).
+    fn handle_write(&mut self, msg: Message) -> Result<(), Self::Error> {
+        if let Some(c) = self.clients.get_mut(&msg.clientid) {
             c.handle_write(msg)?;
         }
         Ok(())
@@ -228,9 +256,9 @@ impl Protocol<Addressed, Addressed, Infallible> for Room {
     /// Drain the next server->client message from any client, tagged with its id, for
     /// the driver to frame and write to that client's socket.
     fn poll_write(&mut self) -> Option<Self::Wout> {
-        for (id, c) in self.clients.iter_mut() {
-            if let Some(msg) = c.poll_write() {
-                return Some((id.clone(), msg));
+        for client in self.clients.values_mut() {
+            if let Some(msg) = client.poll_write() {
+                return Some(msg);
             }
         }
         None
@@ -284,6 +312,13 @@ mod tests {
         Room::new(id.to_string(), Duration::from_secs(1), Instant::now())
     }
 
+    fn assert_message(actual: Option<Message>, room_id: &str, client_id: &str, msg: &str) {
+        let actual = actual.expect("expected a message");
+        assert_eq!(actual.roomid, room_id);
+        assert_eq!(actual.clientid, client_id);
+        assert_eq!(actual.msg, msg);
+    }
+
     #[test]
     fn new_room_is_empty() {
         let r = new_room("abc");
@@ -332,7 +367,7 @@ mod tests {
         assert!(r.client(now, &id2).unwrap().registered());
         // The first client's queued message is flushed to the newly-registered one
         // (was delivered to `c2.rwc.Msg`).
-        assert_eq!(r.poll_write(), Some(("2".to_string(), "hello".to_string())));
+        assert_message(r.poll_write(), "a", "2", "hello");
     }
 
     #[test]
@@ -361,7 +396,7 @@ mod tests {
 
         // Delivered to the peer, not queued on the sender.
         assert!(r.client(now, &id1).unwrap().drain_msgs().is_empty());
-        assert_eq!(r.poll_write(), Some(("2".to_string(), "hi".to_string())));
+        assert_message(r.poll_write(), "a", "2", "hi");
     }
 
     #[test]
