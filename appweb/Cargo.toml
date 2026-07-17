@@ -13,3 +13,5 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

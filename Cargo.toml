@@ -20,3 +20,5 @@ keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
 [workspace.dependencies]
+serde = "1.0.228"
+serde_json = "1.0.150"
