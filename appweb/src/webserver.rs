@@ -1,2 +1,2 @@
 #[derive(Debug, Default)]
-pub struct WebApp;
+pub struct RoomServer;
