@@ -24,3 +24,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 url = "2"
 rand = "0.10.1"
+minijinja = "2"
