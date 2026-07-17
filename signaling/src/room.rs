@@ -1,2 +1,276 @@
-#[derive(Debug, Default)]
-pub struct RouteTable;
+// Copyright (c) 2014 The WebRTC project authors. All Rights Reserved.
+// Use of this source code is governed by a BSD-style license
+// that can be found in the LICENSE file in the root of the source
+// tree.
+
+use crate::client::{Client, ClientEvent, ClientId};
+use sansio::Protocol;
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::time::{Duration, Instant};
+
+const MAX_ROOM_CAPACITY: usize = 2;
+
+/// The synthetic peer added in loopback debug mode (was `constants.LOOPBACK_CLIENT_ID`).
+/// This is a room concept — only `add_client`'s loopback branch uses it — so it lives
+/// here rather than crossing the `signaling`/`appweb` crate boundary.
+const LOOPBACK_CLIENT_ID: &str = "LOOPBACK_CLIENT_ID";
+
+pub type RoomId = String;
+
+/// A message tagged with the client id it was received from, or is destined to —
+/// the addressing the `Protocol` read/write planes need to pick a client, which the
+/// Go `io.Writer`-based API carried implicitly in the `*client` receiver.
+pub type Addressed = (ClientId, String);
+
+/// A room and its (at most two) clients.
+///
+/// The Go `parent *roomTable` back-pointer is gone: it existed only to arm a
+/// `time.AfterFunc` that reached back up to `removeIfUnregistered`. Here the room
+/// implements [`sansio::Protocol`] and reaps unregistered clients from
+/// [`Protocol::handle_timeout`] instead (each client surfaces
+/// [`ClientEvent::Expired`] when its register-timeout elapses).
+pub struct Room {
+    id: RoomId,
+    /// Client id -> client.
+    clients: HashMap<ClientId, Client>,
+    register_timeout: Duration,
+    /// Updated on every access so the room table sweeper can reap idle rooms
+    /// (replaces the memcache TTL). Managed by the room table.
+    last_active: Instant,
+}
+
+impl Room {
+    pub fn new(id: RoomId, register_timeout: Duration, now: Instant) -> Self {
+        Self {
+            id,
+            clients: HashMap::new(),
+            register_timeout,
+            last_active: now,
+        }
+    }
+
+    pub fn id(&self) -> &RoomId {
+        &self.id
+    }
+
+    pub fn last_active(&self) -> Instant {
+        self.last_active
+    }
+
+    pub fn set_last_active(&mut self, now: Instant) {
+        self.last_active = now;
+    }
+
+    /// Return the client, creating it (with a fresh register-timeout deadline) if it
+    /// does not exist and the room is not full. In Go this armed the `AfterFunc`
+    /// timer; here it just seeds the client's deadline, which the room polls.
+    fn client(&mut self, now: Instant, client_id: &ClientId) -> Result<&mut Client, String> {
+        if !self.clients.contains_key(client_id) {
+            if self.clients.len() >= MAX_ROOM_CAPACITY {
+                return Err("Max room capacity reached".to_string());
+            }
+            let timeout = Some(now + self.register_timeout);
+            self.clients
+                .insert(client_id.clone(), Client::new(client_id.clone(), timeout));
+        }
+        Ok(self
+            .clients
+            .get_mut(client_id)
+            .expect("client just inserted or already present"))
+    }
+
+    /// Register a client's connection, then flush the other client's queued messages
+    /// to it.
+    pub fn register(&mut self, now: Instant, client_id: &ClientId) -> Result<(), String> {
+        self.client(now, client_id)?.register()?;
+
+        // Send the queued messages from the other client of the room.
+        if self.clients.len() > 1
+            && let Some(other_id) = self
+                .clients
+                .keys()
+                .find(|k| k.as_str() != client_id.as_str())
+                .cloned()
+            && let [Some(other), Some(c)] = self.clients.get_disjoint_mut([&other_id, client_id])
+        {
+            let _ = other.send_queued(c);
+        }
+        Ok(())
+    }
+
+    /// Send `msg` to the other client of the room, or queue it on the source client if
+    /// the other client has not joined.
+    pub fn send(&mut self, now: Instant, src_id: &ClientId, msg: String) -> Result<(), String> {
+        self.client(now, src_id)?;
+
+        // Queue the message if the other client has not joined.
+        if self.clients.len() == 1 {
+            return self.clients.get_mut(src_id).unwrap().enqueue(msg);
+        }
+
+        // Send the message to the other client of the room.
+        if let Some(other_id) = self
+            .clients
+            .keys()
+            .find(|k| k.as_str() != src_id.as_str())
+            .cloned()
+            && let [Some(src), Some(oc)] = self.clients.get_disjoint_mut([src_id, &other_id])
+        {
+            return src.send(oc, msg);
+        }
+
+        // The room must be corrupted.
+        Err(format!("Corrupted room {}", self.id))
+    }
+
+    /// Remove the client and promote the surviving client (if any) to initiator so it
+    /// can accept a new peer. The hub closes the removed client's socket (the Go
+    /// `deregister()` → `rwc.Close()`); dropping the [`Client`] is enough here.
+    pub fn remove(&mut self, client_id: &ClientId) {
+        if let Some(mut client) = self.clients.remove(client_id) {
+            client.deregister();
+            for other in self.clients.values_mut() {
+                other.set_initiator(true);
+            }
+        }
+    }
+
+    /// Allocate a new client for a `/join` request: elect the initiator (first client
+    /// in the room) and return the messages queued by the other client so the joiner
+    /// can replay the existing offer/ICE. Port of `apprtc.py::add_client_to_room`.
+    pub fn add_client(
+        &mut self,
+        now: Instant,
+        client_id: &ClientId,
+        is_loopback: bool,
+    ) -> Result<(bool, Vec<String>), String> {
+        if self.clients.contains_key(client_id) {
+            return Err("DUPLICATE_CLIENT".to_string());
+        }
+        if self.clients.len() >= MAX_ROOM_CAPACITY {
+            return Err("FULL".to_string());
+        }
+
+        let is_initiator = self.clients.is_empty();
+
+        let mut messages = Vec::new();
+        if !is_initiator {
+            // Hand the joiner the initiator's queued offer/ICE and clear the queue.
+            for other in self.clients.values_mut() {
+                messages.extend(other.take_msgs());
+            }
+        }
+
+        self.client(now, client_id)?.set_initiator(is_initiator);
+
+        if is_loopback {
+            // Mirror the loopback debug path: add a second, non-initiator client.
+            if let Ok(lc) = self.client(now, &LOOPBACK_CLIENT_ID.to_string()) {
+                lc.set_initiator(false);
+            }
+        }
+        Ok((is_initiator, messages))
+    }
+
+    /// The number of clients in the room.
+    pub fn occupancy(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// True if there is no client in the room.
+    pub fn empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    /// The number of clients with a live connection registered.
+    pub fn ws_count(&self) -> usize {
+        self.clients.values().filter(|c| c.registered()).count()
+    }
+}
+
+impl Protocol<Addressed, Addressed, Infallible> for Room {
+    /// A message received on a client's socket, tagged with its client id.
+    type Rout = Addressed;
+    /// A message to write to a client's socket, tagged with its client id.
+    type Wout = Addressed;
+    type Eout = Infallible;
+    type Error = String;
+    type Time = Instant;
+
+    /// Route an inbound message to the addressed client. An unknown client is dropped
+    /// (the client may have been reaped), matching the Go relay's tolerance.
+    fn handle_read(&mut self, (client_id, msg): Addressed) -> Result<(), Self::Error> {
+        if let Some(c) = self.clients.get_mut(&client_id) {
+            c.handle_read(msg)?;
+        }
+        Ok(())
+    }
+
+    /// Drain the next message received from any client, tagged with its id.
+    fn poll_read(&mut self) -> Option<Self::Rout> {
+        for (id, c) in self.clients.iter_mut() {
+            if let Some(msg) = c.poll_read() {
+                return Some((id.clone(), msg));
+            }
+        }
+        None
+    }
+
+    /// Deliver a message to the addressed client (dropped if the client is unknown).
+    fn handle_write(&mut self, (client_id, msg): Addressed) -> Result<(), Self::Error> {
+        if let Some(c) = self.clients.get_mut(&client_id) {
+            c.handle_write(msg)?;
+        }
+        Ok(())
+    }
+
+    /// Drain the next server->client message from any client, tagged with its id, for
+    /// the driver to frame and write to that client's socket.
+    fn poll_write(&mut self) -> Option<Self::Wout> {
+        for (id, c) in self.clients.iter_mut() {
+            if let Some(msg) = c.poll_write() {
+                return Some((id.clone(), msg));
+            }
+        }
+        None
+    }
+
+    /// Tick every client and reap those whose register-timeout elapsed while still
+    /// unregistered. This is the sans-IO `removeIfUnregistered`: a client surfaces
+    /// [`ClientEvent::Expired`], and the room removes it (promoting any survivor).
+    fn handle_timeout(&mut self, now: Self::Time) -> Result<(), Self::Error> {
+        let mut expired: Vec<ClientId> = Vec::new();
+        for (id, c) in self.clients.iter_mut() {
+            c.handle_timeout(now)?;
+            while let Some(evt) = c.poll_event() {
+                match evt {
+                    ClientEvent::Expired => expired.push(id.clone()),
+                }
+            }
+        }
+        for id in &expired {
+            self.remove(id);
+        }
+        Ok(())
+    }
+
+    /// The earliest register-timeout deadline across the room's clients.
+    fn poll_timeout(&mut self) -> Option<Self::Time> {
+        let mut eto: Option<Instant> = None;
+        for c in self.clients.values_mut() {
+            if let Some(next) = c.poll_timeout() {
+                eto = Some(eto.map_or(next, |cur| cur.min(next)));
+            }
+        }
+        eto
+    }
+
+    fn close(&mut self) -> Result<(), Self::Error> {
+        for c in self.clients.values_mut() {
+            c.close()?;
+        }
+        self.clients.clear();
+        Ok(())
+    }
+}

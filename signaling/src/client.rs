@@ -10,6 +10,8 @@ use std::time::Instant;
 
 const MAX_QUEUED_MSG_COUNT: usize = 1024;
 
+pub type ClientId = String;
+
 /// Events a client surfaces up to its room.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
@@ -27,7 +29,7 @@ pub enum ClientEvent {
 /// plane drives the register-timeout. The Go `io.ReadWriteCloser` is gone — the
 /// hub owns the real socket — and the `time.Timer` became a caller-polled deadline.
 pub struct Client {
-    id: String,
+    id: ClientId,
     /// Whether a connection is currently registered (was `rwc != nil`).
     registered: bool,
     /// Messages this client sent that are queued until the peer registers
@@ -52,7 +54,7 @@ pub struct Client {
 
 impl Client {
     /// `timeout` is the register-timeout deadline (was the `*time.Timer` argument).
-    pub fn new(id: String, timeout: Option<Instant>) -> Self {
+    pub fn new(id: ClientId, timeout: Option<Instant>) -> Self {
         Self {
             id,
             registered: false,
@@ -65,7 +67,7 @@ impl Client {
         }
     }
 
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &ClientId {
         &self.id
     }
 
@@ -111,6 +113,12 @@ impl Client {
         }
         self.msgs.push_back(msg);
         Ok(())
+    }
+
+    /// Drain and return this client's pending-flush queue (was `other.msgs; other.msgs = nil`).
+    /// Used by `Room::add_client` to hand a joiner the peer's queued offer/ICE.
+    pub fn take_msgs(&mut self) -> Vec<String> {
+        self.msgs.drain(..).collect()
     }
 
     /// Flush this client's queued messages to `other` (which must be registered).
