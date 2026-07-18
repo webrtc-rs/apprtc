@@ -13,7 +13,7 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
-signaling = { version = "0.1.0-alpha.1", path = "../signaling" }
+signaling.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
