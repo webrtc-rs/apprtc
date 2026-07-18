@@ -164,4 +164,67 @@ mod tests {
         let out = t.render_index(&RoomParameters::default()).unwrap();
         assert_eq!(out, "e=[] w=[]", "message lists not marshaled to JS arrays");
     }
+
+    #[test]
+    fn renders_full_template_and_serializes_message_lists() {
+        let t = Templates::from_sources(
+            "index".to_string(),
+            "{{ room_id }}|{{ error_messages }}|{{ warning_messages }}|{{ include_loopback_js }}"
+                .to_string(),
+        )
+        .unwrap();
+        let params = RoomParameters {
+            room_id: "room".into(),
+            client_id: "client".into(),
+            error_messages: vec!["bad offer".into()],
+            warning_messages: vec!["slow network".into()],
+            include_loopback_js: "<script src=\"loopback.js\"></script>".into(),
+            ..Default::default()
+        };
+        let out = t.render_full(&params).unwrap();
+        assert!(out.contains("room|[\"bad offer\"]|[\"slow network\"]"));
+        assert!(out.contains("<script src=\"loopback.js\"></script>"));
+    }
+
+    #[test]
+    fn escapes_all_plain_string_delimiters_without_escaping_slashes() {
+        let t = Templates::from_sources("{{ value }}".into(), "full".into()).unwrap();
+        let params = RoomParameters {
+            room_id: "&<>'\"/".into(),
+            ..Default::default()
+        };
+        let out = t.render_index(&params).unwrap();
+        assert_eq!(out, "");
+
+        let t = Templates::from_sources("{{ room_id }}".into(), "full".into()).unwrap();
+        let out = t.render_index(&params).unwrap();
+        assert_eq!(out, "&amp;&lt;&gt;&#39;&#34;/");
+    }
+
+    #[test]
+    fn load_reads_index_and_full_templates_from_web_root() {
+        let root = std::env::temp_dir().join(format!("appweb-templates-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("html")).unwrap();
+        std::fs::write(root.join("html/index_template.html"), "index").unwrap();
+        std::fs::write(root.join("html/full_template.html"), "full").unwrap();
+        let templates = Templates::load(root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            templates.render_index(&RoomParameters::default()).unwrap(),
+            "index"
+        );
+        assert_eq!(
+            templates.render_full(&RoomParameters::default()).unwrap(),
+            "full"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_returns_error_when_template_is_missing() {
+        let root = std::env::temp_dir().join(format!("appweb-missing-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(root.join("html")).unwrap();
+        std::fs::write(root.join("html/index_template.html"), "index").unwrap();
+        assert!(Templates::load(root.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
