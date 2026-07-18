@@ -103,6 +103,49 @@ async fn accepts_opaque_string_room_and_client_ids_in_v1_websocket_protocol() ->
 }
 
 #[tokio::test]
+async fn reports_websocket_lifecycle_counters() -> Result<()> {
+    wait_for_server().await?;
+    let before = http("GET", "/status", &[]).await?.json()?;
+    let room = unique_room("status");
+    let first = join(&room).await?;
+    let first_id = client_id(&first)?;
+    let mut socket = ws_register(&room, first_id).await?;
+    let during = http("GET", "/status", &[]).await?.json()?;
+    assert!(during["openws"].as_u64().unwrap_or(0) >= before["openws"].as_u64().unwrap_or(0) + 1);
+    socket.close(None).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after = http("GET", "/status", &[]).await?.json()?;
+    assert!(after["openws"].as_u64().unwrap_or(1) < during["openws"].as_u64().unwrap_or(1));
+    cleanup(&room, first_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn internal_bridge_rejects_empty_body_and_invalid_method() -> Result<()> {
+    wait_for_server().await?;
+    let empty = http("POST", "/_internal/edge-room/edge-client", &[]).await?;
+    assert_eq!(empty.status, 500);
+    let invalid = http("GET", "/_internal/edge-room/edge-client", &[]).await?;
+    assert_eq!(invalid.status, 405);
+    Ok(())
+}
+
+#[tokio::test]
+async fn preserves_v1_debug_loopback_join_behavior() -> Result<()> {
+    wait_for_server().await?;
+    let room = unique_room("loopback");
+    let first = http("POST", &format!("/join/{room}?debug=loopback"), &[]).await?;
+    assert_eq!(first.status, 200);
+    let first_body = first.json()?;
+    assert_eq!(first_body["result"], "SUCCESS");
+    let second = join(&room).await?;
+    assert_eq!(second["result"], "FULL");
+    let first_id = client_id(&first_body)?.to_owned();
+    cleanup(&room, &first_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completes_the_stock_v1_join_queue_and_websocket_relay_flow() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("stock-flow");
