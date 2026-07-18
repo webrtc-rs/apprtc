@@ -1,172 +1,209 @@
 # AppRTC Deployment
 
-This plan details how to deploy the unified **AppRTC P2P signaling server** natively to a remote Fedora 42 server using
-Let's Encrypt SSL certificates.
+This guide deploys the Rust AppRTC binary as an all-in-one P2P V1 signaling server. The binary serves the AppRTC web
+application, HTTP room APIs, WebSocket signaling, and optional HTTPS/WSS from one process.
 
----
+The current binary does not enable V2/SFU call-mode transitions. The historical Go deployment is retained on the
+repository's `go` branch.
 
-## 1. Domain & DNS Configuration
+## 1. DNS and firewall
 
-Configure your domain registrar's DNS Management panel to point your domain (e.g. `appr.tc`) to your remote server:
+Point the domain's `A`/`AAAA` records at the server and allow TCP ports `80` and `443` as needed. Port `80` is only
+required when using Certbot's standalone HTTP validation.
 
-* **A Record** pointing `@` to your server IP (e.g., `173.249.199.192`)
-* **A Record** pointing `www` to your server IP (e.g., `173.249.199.192`)
+* **A Record** pointing `@` to server IP (e.g., `173.249.199.192`)
+* **A Record** pointing `www` to server IP (e.g., `173.249.199.192`)
 * **Note**: Make sure to delete any conflicting CNAME or AAAA (IPv6) records.
 
----
+## 2. Install prerequisites
 
-## 2. Remote Server Prerequisites
-
-On the remote Fedora 42 SSH terminal, install Rust, Git, Rsync, and Certbot:
+On Fedora:
 
 ```bash
-dnf install -y git rsync certbot
+sudo dnf install -y git rsync certbot rust cargo
+```
+
+If the distribution Rust toolchain is too old for Edition 2024, install the current stable toolchain with `rustup`
+instead. Or
+
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
----
+## 3. Obtain TLS certificates
 
-## 3. Obtain Let's Encrypt SSL Certificates
-
-Obtain a free, trusted SSL certificate. Make sure port `80` is free (stop any running web servers or the apprtc service
-first):
+Stop any service currently using the validation port, then request a certificate:
 
 ```bash
-systemctl stop apprtc || true
-certbot certonly --standalone -d appr.tc -d www.appr.tc --register-unsafely-without-email --agree-tos
+sudo systemctl stop apprtc || true
+sudo certbot certonly --standalone -d appr.tc -d www.appr.tc --agree-tos
 ```
 
-Create a `/cert` directory and link the generated Let's Encrypt certificates to the expected paths:
+The Rust binary accepts the certificate and key directly; no `/cert` symlinks are required:
 
-```bash
-mkdir -p /cert
-ln -sf /etc/letsencrypt/live/appr.tc/fullchain.pem /cert/cert.pem
-ln -sf /etc/letsencrypt/live/appr.tc/privkey.pem /cert/key.pem
+```text
+/etc/letsencrypt/live/appr.tc/fullchain.pem
+/etc/letsencrypt/live/appr.tc/privkey.pem
 ```
 
----
+## 4. Install the source tree
 
-## 4. Copy Project Files to Remote
-
-From your **local terminal** (run this inside the project root on your MacBook), upload the code to `/opt/apprtc` using
-`rsync`:
+Copy the repository to a location executable by systemd and readable by the service:
 
 ```bash
 rsync -avz --exclude 'target' --exclude '.git' --exclude '.idea' ./ root@173.249.199.192:/opt/apprtc/
 ```
 
-*Note: We use `/opt/apprtc` because Fedora's default SELinux security policy prevents systemd from executing binaries
-inside `/root`.*
+The web assets must remain at `/opt/apprtc/appweb` unless `--web-root` is changed.
 
----
+## 5. Build the release binary
 
-## 5. Build the Server on Remote
-
-On the **remote server**, compile the server binary and grant it execution permissions:
+On the server:
 
 ```bash
-cd /opt/apprtc/
+sudo mkdir -p /opt/log
+cd /opt/apprtc
 cargo build --release -p apprtc --bin apprtc
-chmod +x target/release/apprtc
+chmod +x /opt/apprtc/target/release/apprtc
 ```
 
----
+or you can install to /usr/local/bin/
 
-## 6. Run as a Systemd Background Service
+```bash
+sudo install -m 0755 /opt/apprtc/target/release/apprtc /usr/local/bin/apprtc
+```
 
-To run the server continuously in the background on port `443` (HTTPS/WSS):
+## 6. Configure systemd
 
-1. Create a service file:
-   ```bash
-   nano /etc/systemd/system/apprtc.service
-   ```
+Create a service file:
 
-2. Add the following content:
-   ```ini
-   [Unit]
-   Description=AppRTC Room and Signaling Server
-   After=network.target
+```bash
+nano /etc/systemd/system/apprtc.service
+```
 
-   [Service]
-   Type=simple
-   WorkingDirectory=/opt/apprtc
-   ExecStart=/opt/apprtc/target/release/apprtc -d --level info --host appr.tc --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem
-   Restart=always
-   RestartSec=5
+Add the following content:
 
-   [Install]
-   WantedBy=multi-user.target
-   ```
+```ini
+[Unit]
+Description=AppRTC Rust P2P Signaling Server
+After=network-online.target
+Wants=network-online.target
 
-3. Enable and start the service:
-   ```bash
-   systemctl daemon-reload
-   systemctl enable --now apprtc
-   ```
+[Service]
+Type=simple
+WorkingDirectory=/opt/apprtc
+ExecStart=/opt/apprtc/target/release/apprtc --host 173.249.199.192 --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/log/apprtc.log
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
 
-4. Verify the status:
-   ```bash
-   systemctl status apprtc
-   ```
+[Install]
+WantedBy=multi-user.target
+```
 
-5. Verify the deployment
+Enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now apprtc
+sudo systemctl status apprtc
+```
+
+Stop it:
+
+```bash
+sudo systemctl stop apprtc || true
+```
+
+The process handles Ctrl-C/SIGINT gracefully: it closes signaling WebSockets, drains HTTP/TLS connections, and exits
+cleanly.
+
+## 7. Verify the deployment
 
 ```bash
 curl -fsS https://appr.tc/status
 curl -fsS https://appr.tc/params
 ```
 
----
+Open `https://appr.tc/` in a browser. `/status` reports uptime, open WebSockets, total WebSockets, WebSocket errors, and
+HTTP errors.
 
-## 7. Certificate Auto-Renewal
+## 8. Certificate renewal
 
-On Fedora, installing Certbot automatically registers a background systemd timer to perform automated certificate
-renewals twice a day. Since your AppRTC service runs on port `443`, port `80` is left open for Certbot to spin up its
-temporary standalone validation server.
+Certbot normally installs a renewal timer. Because AppRTC loads certificates at startup, restart it after a successful
+renewal:
 
-### Systemd Renewal Files
+```bash
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh >/dev/null <<'EOF'
+#!/bin/sh
+systemctl restart apprtc
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
+sudo certbot renew --dry-run
+```
 
-* **Timer Configuration:** `/usr/lib/systemd/system/certbot-renew.timer`
-* **Renewal Service:** `/usr/lib/systemd/system/certbot-renew.service` (Runs `certbot renew --quiet --no-self-upgrade`)
+Check the timer with:
 
----
+```bash
+systemctl list-timers --all | grep certbot
+```
 
-### Step 7.1: Configure Post-Renewal Reload (Required)
+## 9. Useful CLI options
 
-The running `apprtc` service must be restarted to load new certificates once they are renewed. Create a Certbot deploy
-hook:
+```text
+--host HOST                    Bind host and generated public host (default: 127.0.0.1)
+--port PORT                    HTTP/HTTPS port (default: 8080)
+--web-root PATH                AppRTC assets (default: appweb)
+--tls                          Enable HTTPS/WSS
+--certificate PATH             PEM certificate chain
+--private-key PATH             PEM private key
+--ice-server-url URL           Repeat or provide comma-separated ICE URLs
+--ice-server-base-url URL      External ICE credential service origin
+--ice-server-api-key KEY       Credential-service API key
+--header-message TEXT          Page banner
+--bypass-join-confirmation     Skip the browser confirmation prompt
+--level LEVEL                  error, warn, info, debug, or trace
+--output-log-file PATH         Write formatted logs to a file
+```
 
-1. Create the hook script:
-   ```bash
-   echo -e '#!/bin/sh\nsystemctl restart apprtc' > /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
-   ```
-2. Make it executable:
-   ```bash
-   chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
-   ```
+Run `/opt/apprtc/target/release/apprtc -h` for the authoritative option list.
 
----
+```aiignore
+Usage: apprtc [OPTIONS]
 
-### Step 7.2: Verify and Start the Renewal Timer
-
-1. **Verify the timer is running**:
-   Check the timer status:
-   ```bash
-   systemctl status certbot-renew.timer
-   ```
-    * **Note**: If the status says `inactive (dead)`, start and enable the timer manually:
-      ```bash
-      systemctl enable --now certbot-renew.timer
-      ```
-      Once started, the status should show `active (waiting)`.
-
-2. **View the next scheduled run**:
-   ```bash
-   systemctl list-timers --all | grep certbot
-   ```
-
-3. **Simulate a renewal (Dry Run)**:
-   Run this command to test the domain validation and verify the reload script runs successfully:
-   ```bash
-   certbot renew --dry-run
-   ```
+Options:
+      --host <HOST>
+          Host used both for the listener and generated HTTP/WebSocket URLs [default: 127.0.0.1]
+  -p, --port <PORT>
+          Local HTTP/WebSocket listening port [default: 8080]
+      --web-root <WEB_ROOT>
+          Path to the AppRTC web application assets [default: appweb]
+      --tls
+          Serve HTTPS/WSS instead of HTTP/WS
+      --certificate <CERTIFICATE>
+          PEM certificate chain used by --tls; defaults to the bundled development certificate [default: ""]
+      --private-key <PRIVATE_KEY>
+          PEM private key used by --tls; defaults to the bundled development key [default: ""]
+      --ice-server-url <ICE_SERVER_URLS>
+          ICE server URL; repeat the option or use comma-separated values
+      --ice-server-base-url <ICE_SERVER_BASE_URL>
+          Optional external ICE credential service origin [default: ""]
+      --ice-server-api-key <ICE_SERVER_API_KEY>
+          API key appended to the ICE credential service URL [default: ""]
+      --header-message <HEADER_MESSAGE>
+          Banner displayed by the AppRTC page [default: ""]
+      --bypass-join-confirmation
+          Skip the browser's ready-to-join confirmation
+  -d, --debug
+          Enable application logging
+  -l, --level <LEVEL>
+          Maximum log level used when --debug is enabled [default: info] [possible values: error, warn, info, debug, trace]
+  -o, --output-log-file <OUTPUT_LOG_FILE>
+          Write logs to this file instead of stdout [default: ""]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
