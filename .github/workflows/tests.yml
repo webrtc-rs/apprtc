@@ -41,7 +41,7 @@ jobs:
           sleep 3
 
       - name: Run tests
-        run: cargo test --package apprtc --no-fail-fast --test '*'
+        run: cargo test --package apprtc --no-fail-fast --test '*' -- --nocapture
 
       - name: Stop AppRTC server
         if: always()

@@ -111,7 +111,7 @@ async fn reports_websocket_lifecycle_counters() -> Result<()> {
     let first_id = client_id(&first)?;
     let mut socket = ws_register(&room, first_id).await?;
     let during = http("GET", "/status", &[]).await?.json()?;
-    assert!(during["openws"].as_u64().unwrap_or(0) >= before["openws"].as_u64().unwrap_or(0) + 1);
+    assert!(during["openws"].as_u64().unwrap_or(0) > before["openws"].as_u64().unwrap_or(0));
     socket.close(None).await?;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let after = http("GET", "/status", &[]).await?.json()?;
@@ -166,7 +166,10 @@ async fn preserves_v1_reregister_and_unregistered_client_timeout() -> Result<()>
     // A joined client that never registers must expire and stop consuming capacity.
     let expiring_room = unique_room("register-timeout");
     let _unregistered = join(&expiring_room).await?;
-    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    for elapsed in 1..=11 {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        println!("registration-timeout test: waited {elapsed}/11 seconds");
+    }
     let admitted = join(&expiring_room).await?;
     assert_eq!(admitted["result"], "SUCCESS");
     let admitted_id = client_id(&admitted)?.to_owned();
