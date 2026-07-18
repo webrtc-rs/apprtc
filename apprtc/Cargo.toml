@@ -13,8 +13,8 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
-appweb = { version = "0.20.0-rc.3", path = "../appweb" }
-signaling = { version = "0.20.0-rc.3", path = "../signaling" }
+appweb = { version = "0.1.0-alpha.1", path = "../appweb" }
+signaling = { version = "0.1.0-alpha.1", path = "../signaling" }
 
 tokio.workspace = true
 axum.workspace = true
