@@ -1,11 +1,11 @@
 use appweb::config::Config;
-use appweb::webserver::RoomServer;
-use appweb::wsclient::WsClient;
+use appweb::room_server::RoomServer;
+use appweb::ws_client::WsClient;
 use clap::Parser;
 use env_logger::Target;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use signaling::wsserver::{ColliderHandle, router as signaling_router};
+use signaling::ws_server::{ColliderHandle, router as signaling_router};
 use std::fs::OpenOptions;
 use std::io::BufReader;
 use std::io::Write;

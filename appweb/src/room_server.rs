@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::dashboard::StatusReport;
 use crate::params::{RoomParameters, generate_random};
 use crate::templates::Templates;
-use crate::wsclient::WsClient;
+use crate::ws_client::WsClient;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -317,7 +317,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
     use serde_json::Value;
-    use signaling::wsserver::ColliderHandle;
+    use signaling::ws_server::ColliderHandle;
     use std::time::Duration;
     use tower::ServiceExt;
 

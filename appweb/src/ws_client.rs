@@ -5,7 +5,7 @@
 //! independent and can later be carried by the control WebSocket unchanged.
 
 use signaling::collider::{AuthorityOperation, AuthorityResult, StatusSnapshot};
-use signaling::wsserver::ColliderHandle;
+use signaling::ws_server::ColliderHandle;
 use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
