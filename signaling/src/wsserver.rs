@@ -49,6 +49,9 @@ enum DriverCommand {
         command: AuthorityCommand,
         reply: oneshot::Sender<AuthorityReply>,
     },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 struct Shared {
@@ -98,6 +101,19 @@ impl ColliderHandle {
             return Err("signaling authority returned a mismatched request ID".to_string());
         }
         Ok(response.result)
+    }
+
+    /// Ask the owner task to close every browser socket and release all signaling state.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.shared
+            .commands
+            .send(DriverCommand::Shutdown { reply })
+            .await
+            .map_err(|_| "signaling authority already stopped".to_string())?;
+        response
+            .await
+            .map_err(|_| "signaling authority stopped during shutdown".to_string())
     }
 }
 
@@ -248,6 +264,12 @@ async fn run(mut collider: Collider, mut commands: mpsc::Receiver<DriverCommand>
                     let _ = reply.send(response);
                 }
             }
+            DriverCommand::Shutdown { reply } => {
+                let _ = collider.close();
+                drain_outputs(&mut collider, &mut sockets);
+                let _ = reply.send(());
+                break;
+            }
         }
         drain_outputs(&mut collider, &mut sockets);
     }
@@ -313,5 +335,6 @@ mod tests {
                 messages
             } if messages.is_empty()
         ));
+        handle.shutdown().await.unwrap();
     }
 }

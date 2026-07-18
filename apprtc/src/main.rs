@@ -127,8 +127,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let room_server = RoomServer::new(config, WsClient::new(collider.clone()))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let app = room_server.router().merge(signaling_router(collider));
+    let app = room_server
+        .router()
+        .merge(signaling_router(collider.clone()));
     let listener = TcpListener::bind(&address).await?;
+    let shutdown = shutdown_signal(collider.clone());
     if let Some(tls) = tls {
         if cli.certificate.is_empty() {
             println!(
@@ -138,14 +141,16 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("AppRTC listening on https://{address}");
         axum::serve(TlsListener::new(listener, tls), app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await?;
     } else {
         println!("AppRTC listening on http://{address}");
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown)
             .await?;
     }
+    let _ = collider.shutdown().await;
+    println!("AppRTC stopped gracefully");
     Ok(())
 }
 
@@ -251,6 +256,8 @@ fn init_log(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(collider: ColliderHandle) {
     let _ = tokio::signal::ctrl_c().await;
+    log::info!("Shutdown signal received; closing AppRTC connections");
+    let _ = collider.shutdown().await;
 }
