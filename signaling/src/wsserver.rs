@@ -1,8 +1,3 @@
-// Copyright (c) 2014 The WebRTC project authors. All Rights Reserved.
-// Use of this source code is governed by a BSD-style license
-// that can be found in the LICENSE file in the root of the source
-// tree.
-
 //! Tokio/Axum driver for the Sans-I/O [`crate::collider::Collider`].
 
 use crate::collider::{
