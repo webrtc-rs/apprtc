@@ -23,3 +23,6 @@ env_logger.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 log.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true

@@ -3,10 +3,18 @@ use appweb::webserver::RoomServer;
 use appweb::wsclient::WsClient;
 use clap::Parser;
 use env_logger::Target;
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use signaling::wsserver::{ColliderHandle, router as signaling_router};
 use std::fs::OpenOptions;
+use std::io::BufReader;
 use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -53,9 +61,17 @@ struct Cli {
     #[arg(long, default_value_t = String::new())]
     public_host: String,
 
-    /// Generate https/wss public URLs when TLS terminates at a proxy.
+    /// Serve HTTPS/WSS instead of HTTP/WS.
     #[arg(long)]
-    force_tls: bool,
+    tls: bool,
+
+    /// PEM certificate chain used by --tls; defaults to the bundled development certificate.
+    #[arg(long, default_value_t = String::new())]
+    certificate: String,
+
+    /// PEM private key used by --tls; defaults to the bundled development key.
+    #[arg(long, default_value_t = String::new())]
+    private_key: String,
 
     /// ICE server URL; repeat the option or use comma-separated values.
     #[arg(long = "ice-server-url", value_delimiter = ',')]
@@ -94,12 +110,17 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_log(&cli)?;
+    let tls = if cli.tls {
+        Some(tls_config(&cli)?)
+    } else {
+        None
+    };
 
     let collider = ColliderHandle::spawn(REGISTER_TIMEOUT);
     let config = Config {
         web_root: cli.web_root,
         host: cli.public_host,
-        force_tls: cli.force_tls,
+        force_tls: cli.tls,
         ice_server_urls: cli.ice_server_urls,
         ice_server_base_url: cli.ice_server_base_url,
         ice_server_api_key: cli.ice_server_api_key,
@@ -111,12 +132,90 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let app = room_server.router().merge(signaling_router(collider));
     let address = format!("{}:{}", cli.host, cli.port);
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    log::info!("AppRTC listening on {address}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let listener = TcpListener::bind(&address).await?;
+    if let Some(tls) = tls {
+        println!("AppRTC listening on https://{address}");
+        axum::serve(TlsListener::new(listener, tls), app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    } else {
+        println!("AppRTC listening on http://{address}");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
     Ok(())
+}
+
+fn tls_config(cli: &Cli) -> anyhow::Result<Arc<ServerConfig>> {
+    let (certificate, private_key) = match (cli.certificate.is_empty(), cli.private_key.is_empty())
+    {
+        (true, true) => (
+            include_bytes!("../cert/cert.pem").to_vec(),
+            include_bytes!("../cert/key.pem").to_vec(),
+        ),
+        (false, false) => (
+            std::fs::read(&cli.certificate).map_err(|error| {
+                anyhow::anyhow!("failed to read certificate {}: {error}", cli.certificate)
+            })?,
+            std::fs::read(&cli.private_key).map_err(|error| {
+                anyhow::anyhow!("failed to read private key {}: {error}", cli.private_key)
+            })?,
+        ),
+        _ => anyhow::bail!("--certificate and --private-key must be supplied together"),
+    };
+
+    let certificates: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(&certificate[..])).collect::<Result<_, _>>()?;
+    let private_key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(&private_key[..]))?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in PEM input"))?;
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    Ok(Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)?,
+    ))
+}
+
+struct TlsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+impl TlsListener {
+    fn new(listener: TcpListener, config: Arc<ServerConfig>) -> Self {
+        Self {
+            listener,
+            acceptor: TlsAcceptor::from(config),
+        }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = TlsStream<TcpStream>;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, address)) => match self.acceptor.accept(stream).await {
+                    Ok(stream) => return (stream, address),
+                    Err(error) => log::warn!("TLS handshake from {address} failed: {error}"),
+                },
+                Err(error) => {
+                    log::error!("TCP accept failed: {error}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
 }
 
 fn init_log(cli: &Cli) -> anyhow::Result<()> {
