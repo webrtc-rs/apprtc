@@ -67,11 +67,12 @@ cargo build --release -p apprtc --bin apprtc
 chmod +x /opt/apprtc/target/release/apprtc
 ```
 
-or you can install to /usr/local/bin/
+Apply the change:
 
 ```bash
-sudo install -m 0755 /opt/apprtc/target/release/apprtc /usr/local/bin/apprtc
-```
+sudo systemctl daemon-reload
+sudo systemctl restart apprtc
+```bash
 
 ## 6. Configure systemd
 
@@ -92,6 +93,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/apprtc
+
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/log; if [ -f /opt/log/apprtc.log ]; then mv /opt/log/apprtc.log /opt/log/apprtc-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
+
 ExecStart=/opt/apprtc/target/release/apprtc --host-ip 0.0.0.0 --public-url https://appr.tc --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/log/apprtc.log
 Restart=always
 RestartSec=5
