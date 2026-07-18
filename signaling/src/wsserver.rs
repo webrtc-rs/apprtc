@@ -337,4 +337,62 @@ mod tests {
         ));
         handle.shutdown().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn shutdown_is_terminal_and_subsequent_requests_fail() {
+        let handle = ColliderHandle::spawn(Duration::from_secs(10));
+        handle.shutdown().await.unwrap();
+        assert_eq!(
+            handle.shutdown().await.unwrap_err(),
+            "signaling authority already stopped"
+        );
+        let error = handle
+            .request(AuthorityOperation::Status)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "signaling authority stopped");
+    }
+
+    #[tokio::test]
+    async fn authority_operations_return_expected_results() {
+        let handle = ColliderHandle::spawn(Duration::from_secs(10));
+        let room = "room".to_string();
+        let client = "client".to_string();
+        assert!(matches!(
+            handle
+                .request(AuthorityOperation::Occupancy {
+                    roomid: room.clone()
+                })
+                .await
+                .unwrap(),
+            AuthorityResult::Occupancy { count: 0 }
+        ));
+        assert!(matches!(
+            handle
+                .request(AuthorityOperation::Inject {
+                    roomid: room.clone(),
+                    clientid: client.clone(),
+                    msg: "offer".into(),
+                    now: Instant::now()
+                })
+                .await
+                .unwrap(),
+            AuthorityResult::Injected
+        ));
+        assert!(matches!(
+            handle
+                .request(AuthorityOperation::Remove {
+                    roomid: room.clone(),
+                    clientid: client
+                })
+                .await
+                .unwrap(),
+            AuthorityResult::Removed
+        ));
+        assert!(matches!(
+            handle.request(AuthorityOperation::Status).await.unwrap(),
+            AuthorityResult::Status(_)
+        ));
+        handle.shutdown().await.unwrap();
+    }
 }
