@@ -45,8 +45,8 @@ impl From<Level> for log::LevelFilter {
 #[command(author, version)]
 #[command(about = "AppRTC P2P/SFU signaling server", long_about = None)]
 struct Cli {
-    /// Local interface on which the HTTP/WebSocket server listens.
-    #[arg(long, default_value_t = format!("0.0.0.0"))]
+    /// Host used both for the listener and generated HTTP/WebSocket URLs.
+    #[arg(long, default_value_t = format!("127.0.0.1"))]
     host: String,
 
     /// Local HTTP/WebSocket listening port.
@@ -56,10 +56,6 @@ struct Cli {
     /// Path to the AppRTC web application assets.
     #[arg(long, default_value_t = format!("appweb"))]
     web_root: String,
-
-    /// Public host[:port] used in generated room and WebSocket URLs.
-    #[arg(long, default_value_t = String::new())]
-    public_host: String,
 
     /// Serve HTTPS/WSS instead of HTTP/WS.
     #[arg(long)]
@@ -115,11 +111,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let address = format!("{}:{}", cli.host, cli.port);
 
     let collider = ColliderHandle::spawn(REGISTER_TIMEOUT);
     let config = Config {
         web_root: cli.web_root,
-        host: cli.public_host,
+        host: address.clone(),
         force_tls: cli.tls,
         ice_server_urls: cli.ice_server_urls,
         ice_server_base_url: cli.ice_server_base_url,
@@ -131,9 +128,14 @@ async fn main() -> anyhow::Result<()> {
     let room_server = RoomServer::new(config, WsClient::new(collider.clone()))
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let app = room_server.router().merge(signaling_router(collider));
-    let address = format!("{}:{}", cli.host, cli.port);
     let listener = TcpListener::bind(&address).await?;
     if let Some(tls) = tls {
+        if cli.certificate.is_empty() {
+            println!(
+                "Using bundled self-signed development certificate; trust {}/cert/cert.pem before opening the site",
+                env!("CARGO_MANIFEST_DIR")
+            );
+        }
         println!("AppRTC listening on https://{address}");
         axum::serve(TlsListener::new(listener, tls), app)
             .with_graceful_shutdown(shutdown_signal())
@@ -203,7 +205,7 @@ impl axum::serve::Listener for TlsListener {
             match self.listener.accept().await {
                 Ok((stream, address)) => match self.acceptor.accept(stream).await {
                     Ok(stream) => return (stream, address),
-                    Err(error) => log::warn!("TLS handshake from {address} failed: {error}"),
+                    Err(error) => log::debug!("TLS handshake from {address} failed: {error}"),
                 },
                 Err(error) => {
                     log::error!("TCP accept failed: {error}");
