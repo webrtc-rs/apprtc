@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      - name: Build AppRTC server and tests
+        run: cargo build --release --package apprtc --bin apprtc --tests
+
+      - name: Start AppRTC server in background
+        run: |
+          ./target/release/apprtc --host 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info > ./logs/apprtc.log 2>&1 &
+          sleep 3
+
+      - name: Run tests
+        run: cargo test --package apprtc --no-fail-fast --test '*'
+
+      - name: Stop AppRTC server
+        if: always()
+        run: kill $(pgrep -f "target/release/apprtc") || true
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/apprtc.log

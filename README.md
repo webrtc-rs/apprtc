@@ -81,10 +81,25 @@ Use a Rust toolchain with Edition 2024 support.
 ```bash
 git submodule update --init --recursive
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --lib --bins
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+The integration tests are black-box clients of a real AppRTC TLS server. Run them locally in three steps from the repository root:
+
+```bash
+# 1. Start AppRTC on loopback in the background.
+cargo run -p apprtc -- --host 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info &
+
+# 2. Run the integration tests against that server.
+cargo test -p apprtc --test '*'
+
+# 3. Stop the background server.
+kill $(pgrep -f "target/debug/apprtc") || true
+```
+
+CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the server log when the job finishes.
 
 ## Run over HTTP and WebSocket
 

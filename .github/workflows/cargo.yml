@@ -46,7 +46,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: Run unit tests
-        run: cargo test --verbose
+        run: cargo test --workspace --lib --bins --verbose
 
   rustfmt_and_clippy:
     name: Check rustfmt style && run clippy

@@ -26,3 +26,10 @@ log.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-tungstenite.workspace = true
