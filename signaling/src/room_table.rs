@@ -140,6 +140,10 @@ impl RoomTable {
     pub fn room_count(&self) -> usize {
         self.rooms.len()
     }
+
+    pub fn client_count(&self) -> usize {
+        self.rooms.values().map(Room::occupancy).sum()
+    }
 }
 
 impl Protocol<Message, Message, Infallible> for RoomTable {

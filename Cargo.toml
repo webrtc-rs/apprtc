@@ -26,3 +26,13 @@ url = "2"
 rand = "0.10.1"
 minijinja = "2"
 sansio = "1.0.1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+tower-http = { version = "0.6", features = ["fs"] }
+tower = { version = "0.5", features = ["util"] }
+clap = { version = "4.6.1", features = ["derive"] }
+env_logger = "0.11.11"
+chrono = "0.4.45"
+anyhow = "1.0.103"
+log = "0.4.33"

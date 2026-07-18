@@ -50,7 +50,7 @@ fn must_json<T: Serialize>(v: &T) -> String {
 }
 
 /// A numeric string of the given length, mirroring `apprtc.py::generate_random`.
-fn generate_random(length: usize) -> String {
+pub(crate) fn generate_random(length: usize) -> String {
     const DIGITS: &[u8] = b"0123456789";
     let mut rng = rand::rng();
     (0..length)

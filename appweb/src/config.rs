@@ -51,8 +51,4 @@ pub struct Config {
 
     /// Skips the "Ready to join?" prompt (was `BYPASS_JOIN_CONFIRMATION`).
     pub bypass_join_confirmation: bool,
-
-    /// How long an idle room is kept before the sweeper reaps it (was
-    /// `ROOM_MEMCACHE_EXPIRATION_SEC`). 0 disables the sweeper.
-    pub room_max_age_sec: i64,
 }

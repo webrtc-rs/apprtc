@@ -16,3 +16,6 @@ readme = "../README.md"
 serde.workspace = true
 serde_json.workspace = true
 sansio.workspace = true
+tokio.workspace = true
+axum.workspace = true
+futures-util.workspace = true

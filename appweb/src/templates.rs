@@ -22,7 +22,7 @@ pub struct Templates {
 
 impl Templates {
     /// Read and parse the templates from `<web_root>/html`.
-    pub fn load(web_root: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn load(web_root: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let dir = Path::new(web_root).join("html");
         let index = fs::read_to_string(dir.join("index_template.html"))?;
         let full = fs::read_to_string(dir.join("full_template.html"))?;
