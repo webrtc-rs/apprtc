@@ -135,6 +135,7 @@ async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {
         .shared
         .next_connection_id
         .fetch_add(1, Ordering::Relaxed);
+    log::info!("WebSocket connected: connection_id={connection_id}");
     let (output, mut outputs) = mpsc::channel(SOCKET_OUTPUT_CAPACITY);
     if handle
         .shared
@@ -166,6 +167,7 @@ async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {
             },
             incoming = reader.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
+                    log::info!("WebSocket message: connection_id={connection_id} bytes={}", text.len());
                     if handle.shared.commands.send(DriverCommand::Text {
                         connection_id,
                         text: text.to_string(),
@@ -196,6 +198,7 @@ async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {
             now: Instant::now(),
         })
         .await;
+    log::info!("WebSocket disconnected: connection_id={connection_id}");
 }
 
 async fn run(mut collider: Collider, mut commands: mpsc::Receiver<DriverCommand>) {

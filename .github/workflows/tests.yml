@@ -37,7 +37,7 @@ jobs:
 
       - name: Start AppRTC server in background
         run: |
-          ./target/release/apprtc --host 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info > ./logs/apprtc.log 2>&1 &
+          ./target/release/apprtc --host-ip 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info > ./logs/apprtc.log 2>&1 &
           sleep 3
 
       - name: Run tests

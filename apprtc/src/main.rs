@@ -144,17 +144,21 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = shutdown_signal(collider.clone());
     if let Some(tls) = tls {
         if cli.certificate.is_empty() {
-            println!(
+            let message = format!(
                 "Using bundled self-signed development certificate; trust {}/cert/cert.pem before opening the site",
                 env!("CARGO_MANIFEST_DIR")
             );
+            println!("{message}");
+            log::info!("{message}");
         }
         println!("AppRTC listening on https://{address}");
+        log::info!("AppRTC listening on https://{address}");
         axum::serve(TlsListener::new(listener, tls), app)
             .with_graceful_shutdown(shutdown)
             .await?;
     } else {
         println!("AppRTC listening on http://{address}");
+        log::info!("AppRTC listening on http://{address}");
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await?;

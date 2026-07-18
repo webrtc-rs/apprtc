@@ -85,7 +85,7 @@ Add the following content:
 
 ```ini
 [Unit]
-Description=AppRTC Rust P2P Signaling Server
+Description=AppRTC P2P/SFU Signaling Server
 After=network-online.target
 Wants=network-online.target
 

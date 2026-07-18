@@ -186,6 +186,11 @@ impl Collider {
 
         match self.rooms.register(now, &msg.roomid, &msg.clientid) {
             Ok(()) => {
+                log::info!(
+                    "V1 register: connection_id={connection_id} room_id={} client_id={}",
+                    msg.roomid,
+                    msg.clientid
+                );
                 self.sessions.insert(
                     connection_id,
                     Session::Registered {
@@ -221,6 +226,10 @@ impl Collider {
             return Ok(());
         }
 
+        log::info!(
+            "V1 send: connection_id={connection_id} room_id={roomid} client_id={clientid} bytes={}",
+            msg.msg.len()
+        );
         self.rooms.handle_read(Message {
             roomid,
             clientid,

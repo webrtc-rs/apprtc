@@ -189,6 +189,7 @@ async fn join(
     let is_loopback = url
         .query_pairs()
         .any(|(key, value)| key == "debug" && value == "loopback");
+    log::info!("HTTP join: room_id={roomid} client_id={clientid} loopback={is_loopback}");
     match server
         .inner
         .authority
@@ -222,6 +223,7 @@ async fn leave(
     State(server): State<RoomServer>,
     Path((roomid, clientid)): Path<(String, String)>,
 ) -> Response {
+    log::info!("HTTP leave: room_id={roomid} client_id={clientid}");
     match server.inner.authority.remove(roomid, clientid).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => server.http_error(error),
@@ -233,6 +235,10 @@ async fn message(
     Path((roomid, clientid)): Path<(String, String)>,
     body: String,
 ) -> Response {
+    log::info!(
+        "HTTP message: room_id={roomid} client_id={clientid} bytes={}",
+        body.len()
+    );
     match server.inner.authority.inject(roomid, clientid, body).await {
         Ok(()) => axum::Json(json!({ "result": "SUCCESS" })).into_response(),
         Err(result) => axum::Json(json!({ "result": result })).into_response(),
