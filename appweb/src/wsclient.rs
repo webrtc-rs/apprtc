@@ -111,3 +111,92 @@ impl WsClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn client() -> WsClient {
+        WsClient::new(ColliderHandle::spawn(Duration::from_secs(10)))
+    }
+
+    #[tokio::test]
+    async fn admit_inject_and_occupancy_round_trip() {
+        let authority = client();
+        let first = authority
+            .admit("room".into(), "client-a".into(), false)
+            .await
+            .unwrap();
+        assert!(first.is_initiator);
+        assert!(first.messages.is_empty());
+        authority
+            .inject("room".into(), "client-a".into(), "offer".into())
+            .await
+            .unwrap();
+        assert_eq!(authority.occupancy("room".into()).await.unwrap(), 1);
+        let second = authority
+            .admit("room".into(), "client-b".into(), false)
+            .await
+            .unwrap();
+        assert!(!second.is_initiator);
+        assert_eq!(second.messages, vec!["offer"]);
+    }
+
+    #[tokio::test]
+    async fn remove_releases_capacity_and_status_is_available() {
+        let authority = client();
+        authority
+            .admit("room".into(), "client-a".into(), false)
+            .await
+            .unwrap();
+        authority
+            .remove("room".into(), "client-a".into())
+            .await
+            .unwrap();
+        assert_eq!(authority.occupancy("room".into()).await.unwrap(), 0);
+        let status = authority.status().await.unwrap();
+        assert!(status.rooms <= 1);
+        assert!(status.total_websocket_connections <= 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_admission_returns_authority_error() {
+        let authority = client();
+        authority
+            .admit("room".into(), "client-a".into(), false)
+            .await
+            .unwrap();
+        let error = authority
+            .admit("room".into(), "client-a".into(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "DUPLICATE_CLIENT");
+    }
+
+    #[tokio::test]
+    async fn all_operations_report_transport_error_after_collider_shutdown() {
+        let authority = client();
+        authority.collider.shutdown().await.unwrap();
+        assert!(
+            authority
+                .admit("room".into(), "client".into(), false)
+                .await
+                .is_err()
+        );
+        assert!(
+            authority
+                .remove("room".into(), "client".into())
+                .await
+                .is_err()
+        );
+        assert!(authority.occupancy("room".into()).await.is_err());
+        assert!(
+            authority
+                .inject("room".into(), "client".into(), "msg".into())
+                .await
+                .is_err()
+        );
+        assert!(authority.status().await.is_err());
+    }
+}
