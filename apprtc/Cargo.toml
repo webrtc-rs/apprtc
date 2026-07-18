@@ -26,6 +26,7 @@ log.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 webrtc.workspace = true

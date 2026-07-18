@@ -103,7 +103,7 @@ repository root:
 
 ```bash
 # 1. Start AppRTC on loopback in the background.
-cargo run -p apprtc -- --host 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info &
+cargo run -p apprtc -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info &
 
 # 2. Run the integration tests against that server.
 cargo test -p apprtc --test '*' -- --nocapture
@@ -121,7 +121,7 @@ Run this command from the repository root:
 
 ```bash
 cargo run -p apprtc -- \
-  --host 127.0.0.1 \
+  --host-ip 127.0.0.1 \
   --port 8080 \
   --web-root appweb \
   --debug \
@@ -136,8 +136,8 @@ AppRTC listening on http://127.0.0.1:8080
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
-`--host` is used both as the local listening host and in generated HTTP/WebSocket URLs. Use an address that browsers can
-reach; the default is `127.0.0.1`. The generated URLs include `--port`.
+`--host-ip` controls the local listener. `--public-url` controls the browser-facing origin embedded in generated
+HTTP/WebSocket URLs. Without `--public-url`, the listener address and selected scheme are used.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -145,7 +145,7 @@ Add `--tls` to serve real HTTPS and WSS from the same listener:
 
 ```bash
 cargo run -p apprtc -- \
-  --host 127.0.0.1 \
+  --host-ip 127.0.0.1 \
   --port 8080 \
   --web-root appweb \
   --tls \
@@ -163,7 +163,8 @@ For a deployment, supply a certificate issued by a trusted authority. Both optio
 
 ```bash
 cargo run -p apprtc -- \
-  --host apprtc.example.com \
+  --host-ip 0.0.0.0 \
+  --public-url https://apprtc.example.com \
   --port 443 \
   --web-root appweb \
   --tls \
@@ -177,7 +178,8 @@ Run `cargo run -p apprtc -- --help` for the authoritative list.
 
 | Option                         |                         Default | Description                                                        |
 |--------------------------------|--------------------------------:|--------------------------------------------------------------------|
-| `--host <HOST>`                |                     `127.0.0.1` | Host used by the listener and generated HTTP/WebSocket URLs.       |
+| `--host-ip <HOST-IP>`          |                     `127.0.0.1` | Local listener bind address.                                       |
+| `--public-url <URL>`           |       listener address/scheme | Browser-facing HTTP(S) origin for generated URLs.                  |
 | `-p, --port <PORT>`            |                          `8080` | HTTP/HTTPS and WS/WSS listening port.                              |
 | `--web-root <PATH>`            |                        `appweb` | Directory containing the HTML, JavaScript, CSS, and image assets.  |
 | `--tls`                        |                             off | Serve HTTPS and WSS instead of HTTP and WS.                        |

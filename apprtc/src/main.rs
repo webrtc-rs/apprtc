@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use url::Url;
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -45,9 +46,14 @@ impl From<Level> for log::LevelFilter {
 #[command(author, version)]
 #[command(about = "AppRTC P2P/SFU signaling server", long_about = None)]
 struct Cli {
-    /// Host used both for the listener and generated HTTP/WebSocket URLs.
-    #[arg(long, default_value_t = format!("127.0.0.1"))]
-    host: String,
+    /// IP address or interface used for the local listener.
+    #[arg(long = "host-ip", default_value_t = format!("127.0.0.1"))]
+    host_ip: String,
+
+    /// Public HTTP(S) origin used to generate browser HTTP/WebSocket URLs.
+    /// Defaults to the listener address and the selected TLS scheme.
+    #[arg(long, default_value_t = String::new())]
+    public_url: String,
 
     /// Local HTTP/WebSocket listening port.
     #[arg(short, long, default_value_t = 8080)]
@@ -111,13 +117,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let address = format!("{}:{}", cli.host, cli.port);
+    let address = format!("{}:{}", cli.host_ip, cli.port);
+    let (public_host, public_tls) = public_origin(&cli)?;
+    if public_tls != cli.tls {
+        anyhow::bail!("--public-url scheme must match --tls");
+    }
 
     let collider = ColliderHandle::spawn(REGISTER_TIMEOUT);
     let config = Config {
         web_root: cli.web_root,
-        host: address.clone(),
-        force_tls: cli.tls,
+        host: public_host,
+        force_tls: public_tls,
         ice_server_urls: cli.ice_server_urls,
         ice_server_base_url: cli.ice_server_base_url,
         ice_server_api_key: cli.ice_server_api_key,
@@ -152,6 +162,43 @@ async fn main() -> anyhow::Result<()> {
     let _ = collider.shutdown().await;
     println!("AppRTC stopped gracefully");
     Ok(())
+}
+
+fn public_origin(cli: &Cli) -> anyhow::Result<(String, bool)> {
+    if cli.public_url.is_empty() {
+        return Ok((address_host(&cli.host_ip, cli.port), cli.tls));
+    }
+    let url = Url::parse(&cli.public_url)
+        .map_err(|error| anyhow::anyhow!("invalid --public-url: {error}"))?;
+    let tls = match url.scheme() {
+        "http" => false,
+        "https" => true,
+        scheme => anyhow::bail!("--public-url must use http or https, got {scheme}"),
+    };
+    if url.path() != "/" && !url.path().is_empty()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("--public-url must be an origin without a path, query, or fragment");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("--public-url has no host"))?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Ok((authority, tls))
+}
+
+fn address_host(host: &str, port: u16) -> String {
+    if (port == 80 || port == 443) && !host.contains(':') {
+        host.to_string()
+    } else if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn tls_config(cli: &Cli) -> anyhow::Result<Arc<ServerConfig>> {

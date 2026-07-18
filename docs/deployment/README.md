@@ -92,7 +92,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/apprtc
-ExecStart=/opt/apprtc/target/release/apprtc --host 173.249.199.192 --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/log/apprtc.log
+ExecStart=/opt/apprtc/target/release/apprtc --host-ip 0.0.0.0 --public-url https://appr.tc --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/log/apprtc.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -153,7 +153,8 @@ systemctl list-timers --all | grep certbot
 ## 9. Useful CLI options
 
 ```text
---host HOST                    Bind host and generated public host (default: 127.0.0.1)
+--host-ip HOST-IP              Local listener bind address (default: 127.0.0.1)
+--public-url URL               Browser-facing HTTP(S) origin for generated URLs
 --port PORT                    HTTP/HTTPS port (default: 8080)
 --web-root PATH                AppRTC assets (default: appweb)
 --tls                          Enable HTTPS/WSS
@@ -169,41 +170,3 @@ systemctl list-timers --all | grep certbot
 ```
 
 Run `/opt/apprtc/target/release/apprtc -h` for the authoritative option list.
-
-```aiignore
-Usage: apprtc [OPTIONS]
-
-Options:
-      --host <HOST>
-          Host used both for the listener and generated HTTP/WebSocket URLs [default: 127.0.0.1]
-  -p, --port <PORT>
-          Local HTTP/WebSocket listening port [default: 8080]
-      --web-root <WEB_ROOT>
-          Path to the AppRTC web application assets [default: appweb]
-      --tls
-          Serve HTTPS/WSS instead of HTTP/WS
-      --certificate <CERTIFICATE>
-          PEM certificate chain used by --tls; defaults to the bundled development certificate [default: ""]
-      --private-key <PRIVATE_KEY>
-          PEM private key used by --tls; defaults to the bundled development key [default: ""]
-      --ice-server-url <ICE_SERVER_URLS>
-          ICE server URL; repeat the option or use comma-separated values
-      --ice-server-base-url <ICE_SERVER_BASE_URL>
-          Optional external ICE credential service origin [default: ""]
-      --ice-server-api-key <ICE_SERVER_API_KEY>
-          API key appended to the ICE credential service URL [default: ""]
-      --header-message <HEADER_MESSAGE>
-          Banner displayed by the AppRTC page [default: ""]
-      --bypass-join-confirmation
-          Skip the browser's ready-to-join confirmation
-  -d, --debug
-          Enable application logging
-  -l, --level <LEVEL>
-          Maximum log level used when --debug is enabled [default: info] [possible values: error, warn, info, debug, trace]
-  -o, --output-log-file <OUTPUT_LOG_FILE>
-          Write logs to this file instead of stdout [default: ""]
-  -h, --help
-          Print help
-  -V, --version
-          Print version
-```
