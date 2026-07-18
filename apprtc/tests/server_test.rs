@@ -53,6 +53,56 @@ async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
 }
 
 #[tokio::test]
+async fn serves_room_page_and_full_room_page_like_legacy_apprtc() -> Result<()> {
+    wait_for_server().await?;
+    let room = unique_room("room-page");
+
+    let page = http("GET", &format!("/r/{room}"), &[]).await?;
+    assert_eq!(page.status, 200);
+    assert!(page.text()?.contains("AppRTC"));
+
+    let first = join(&room).await?;
+    let second = join(&room).await?;
+    let full = http("GET", &format!("/r/{room}"), &[]).await?;
+    assert_eq!(full.status, 200);
+    assert!(full.text()?.contains("this room is full"));
+
+    cleanup(&room, client_id(&first)?).await?;
+    cleanup(&room, client_id(&second)?).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accepts_opaque_string_room_and_client_ids_in_v1_websocket_protocol() -> Result<()> {
+    wait_for_server().await?;
+    let room = format!("opaque-room-{}", rand::random::<u64>());
+    let client_a = "client-alpha";
+    let client_b = "client-beta";
+    let mut socket_a = ws_register(&room, client_a).await?;
+    let mut socket_b = ws_register(&room, client_b).await?;
+
+    let offer = r#"{"type":"offer","sdp":"opaque-client-offer"}"#;
+    ws_send(&mut socket_a, json!({"cmd": "send", "msg": offer})).await?;
+    assert_eq!(
+        ws_receive_json(&mut socket_b).await?,
+        json!({"msg": offer, "error": ""})
+    );
+
+    let answer = r#"{"type":"answer","sdp":"opaque-client-answer"}"#;
+    ws_send(&mut socket_b, json!({"cmd": "send", "msg": answer})).await?;
+    assert_eq!(
+        ws_receive_json(&mut socket_a).await?,
+        json!({"msg": answer, "error": ""})
+    );
+
+    let _ = http("POST", &format!("/leave/{room}/{client_a}"), &[]).await?;
+    let _ = http("POST", &format!("/leave/{room}/{client_b}"), &[]).await?;
+    ws_expect_close(&mut socket_a).await?;
+    ws_expect_close(&mut socket_b).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completes_the_stock_v1_join_queue_and_websocket_relay_flow() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("stock-flow");
@@ -214,6 +264,49 @@ async fn preserves_v1_websocket_errors_and_duplicate_registration_rules() -> Res
     cleanup(&room, second_id).await?;
     original.close(None).await?;
     second_ws.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_malformed_v1_requests_without_corrupting_other_rooms() -> Result<()> {
+    wait_for_server().await?;
+
+    let missing_join = http("POST", "/join", &[]).await?;
+    // Axum reports a method-matched path with missing parameters as 405; the
+    // legacy Go mux reported 404 for the same malformed request.
+    assert_eq!(missing_join.status, 405);
+    let missing_message = http("POST", "/message/no-such-room/no-such-client", b"offer").await?;
+    // V1 preserves messages posted before the matching client joins, so an
+    // unknown room/client pair is created and the message is queued.
+    assert_eq!(missing_message.status, 200);
+    assert_eq!(missing_message.json()?["result"], "SUCCESS");
+    let missing_leave = http("POST", "/leave/no-such-room/no-such-client", &[]).await?;
+    assert_eq!(missing_leave.status, 200);
+
+    let mut socket = ws_connect().await?;
+    ws_send(
+        &mut socket,
+        json!({"cmd": "register", "roomid": "", "clientid": "client"}),
+    )
+    .await?;
+    assert_eq!(
+        ws_receive_json(&mut socket).await?,
+        json!({
+            "msg": "",
+            "error": "Invalid register request: missing 'clientid' or 'roomid'"
+        })
+    );
+    ws_expect_close(&mut socket).await?;
+
+    let room = unique_room("malformed-isolation");
+    let first = join(&room).await?;
+    assert_eq!(first["result"], "SUCCESS");
+    let second = join(&room).await?;
+    assert_eq!(second["result"], "SUCCESS");
+    let third = join(&room).await?;
+    assert_eq!(third["result"], "FULL");
+    cleanup(&room, client_id(&first)?).await?;
+    cleanup(&room, client_id(&second)?).await?;
     Ok(())
 }
 
