@@ -32,178 +32,245 @@
  <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
 </p>
 
-[AppRTC](https://appr.tc) is a WebRTC-rs reference application designed for peer-to-peer (P2P) and selective forwarding unit (SFU) calling and signaling.
+AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The current Rust implementation provides the complete AppRTC-compatible P2P V1 room and signaling flow: HTTP join/message/leave APIs, initiator election, two-member rooms, queued signaling messages, tokenless browser WebSocket registration, reconnect grace, fallback POST/DELETE signaling, HTML templates, static web assets, ICE configuration, and HTTP/HTTPS plus WS/WSS serving.
 
-The public instance is online at **[https://appr.tc](https://appr.tc)**.
+The current executable supports P2P V1. The repository also contains the Sans-I/O SFU implementation and the architecture for P2P/SFU call modes, but V2 mode transitions and SFU worker integration are not yet enabled in the `apprtc` binary.
 
-Currently, this signaling server is implemented in **Go (Golang)**, but it will be **rewritten in Rust soon** as part of
-the `webrtc-rs` ecosystem.
+The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the repository's `go` branch.
 
-> [!NOTE]
-> The majority of the Go code in the [collider](go/collider) directory and the client-side assets in
-> the [web_app](go/web_app) directory are based on the deprecated Google AppRTC reference project located
-> at [https://github.com/webrtc/apprtc](https://github.com/webrtc/apprtc).
->
-> **Key Modifications:**
-> * We have **completely removed the Python codebase and Google App Engine (GAE) dependencies**.
-> * The Python-based Room Server was consolidated directly into the Go `collider` application. The unified Go server now
-    handles both room matching/metadata (HTTP APIs) and WebSocket message relaying (old collider) in a single process.
+## Architecture
 
----
+The workspace has three Rust crates:
 
-## AppRTC P2P/SFU Signaling Protocol
+| Crate | Responsibility |
+|---|---|
+| [`apprtc`](apprtc) | Executable composition, CLI parsing, logging, HTTP or TLS listener, and graceful shutdown. |
+| [`appweb`](appweb) | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority. |
+| [`signaling`](signaling) | Authoritative room/client state, V1 browser protocol, message queueing and relay, reconnect deadlines, Sans-I/O protocol layers, and the Axum WebSocket driver. |
 
-The AppRTC signaling process consists of an initial HTTP room handshaking API and a WebSocket-based messaging protocol.
+The initial deployment is an all-in-one process. `appweb` does not maintain a second room table: its HTTP handlers submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to the single serialized Collider owner task. Browser WebSocket traffic terminates directly in `signaling` and never passes through the web handlers.
 
-### 1. HTTP Room API
+The signaling state is composed from Sans-I/O protocols:
 
-Clients interact with the room server using the following HTTP endpoints:
-
-* **`POST /join/{roomid}`**
-    * Joins a room.
-    * **Response**: Returns a JSON object containing the assigned `client_id`, room occupancy status (`is_initiator`),
-      and WebRTC/ICE configuration parameters.
-* **`POST /message/{roomid}/{clientid}`**
-    * Sends/injects a signaling message (such as SDP or ICE candidates) to the other client in the room. Often used as a
-      fallback if WebSocket connection is not established yet.
-* **`POST /leave/{roomid}/{clientid}`**
-    * Notifies the server that the client is leaving the room. Cleans up the room state.
-* **`GET /params`**
-    * Returns global, room-independent configuration parameters.
-* **`GET /v1alpha/iceconfig`**
-    * Retrieves the list of STUN/TURN servers used for ICE candidates.
-
----
-
-### 2. WebSocket Signaling Protocol (`/ws`)
-
-Once joined, clients establish a persistent WebSocket connection to `/ws` for bi-directional signaling. The protocol
-supports the following JSON commands:
-
-#### A. Client-to-Server Commands
-
-* **`register`**
-    * Sent by the client immediately after the WebSocket connection opens to bind the socket to a room and client ID.
-    * **Format**:
-      ```json
-      {
-        "cmd": "register",
-        "roomid": "<ROOM_ID>",
-        "clientid": "<CLIENT_ID>"
-      }
-      ```
-
-* **`send`**
-    * Sent by a registered client to forward an arbitrary signaling payload to the peer.
-    * **Format**:
-      ```json
-      {
-        "cmd": "send",
-        "msg": "<JSON_STRING_PAYLOAD>"
-      }
-      ```
-      *Note: The `msg` value is a stringified JSON object containing the actual WebRTC signaling payload (see below).*
-
-#### B. Server-to-Client Messages
-
-* **Signaling Relay**:
-    * Forwarded messages from a peer client.
-    * **Format**:
-      ```json
-      {
-        "msg": "<JSON_STRING_PAYLOAD>"
-      }
-      ```
-
-* **Error Message**:
-    * Sent by the server when a WebSocket command fails (e.g., invalid command sequence or duplicate registrations).
-    * **Format**:
-      ```json
-      {
-        "error": "<ERROR_DESCRIPTION>"
-      }
-      ```
-
----
-
-### 3. Detailed Signaling Payloads (`msg` Object)
-
-The `msg` field (in both `cmd: "send"` and the server relay message) contains a serialized JSON string representing one
-of the following WebRTC signaling events:
-
-#### A. SDP Offer
-
-Sent by the initiator to propose a connection configuration.
-
-```json
-{
-  "type": "offer",
-  "sdp": "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n..."
-}
+```text
+Collider
+└── RoomTable
+    └── Room
+        └── Client
 ```
 
-#### B. SDP Answer
+Tokio tasks own sockets and timers, while `Collider` owns deterministic signaling state. Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to reconnect for 10 seconds before its membership is removed.
 
-Sent by the receiver in response to the initiator's offer.
+## Current P2P V1 behavior
 
-```json
-{
-  "type": "answer",
-  "sdp": "v=0\r\no=- 1234567890123456789 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\n..."
-}
-```
+- Room and client IDs are opaque non-empty strings.
+- A room contains at most two clients; a third join returns `FULL`.
+- The first client is the initiator and the second is the callee.
+- Removing a client promotes the survivor to initiator.
+- Offers and trickle ICE candidates sent before the peer joins are queued.
+- The second `/join` response returns queued messages in `params.messages`.
+- The stock AppRTC asymmetric signaling flow is preserved: the initiator sends early signaling through `/message`, while the callee normally sends through WebSocket.
+- A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately.
+- Root-path and `/_internal` POST/DELETE fallback routes are both supported.
+- V1 identifiers are not restricted to numeric values. Numeric `u64` validation belongs to the future V2 protocol.
 
-#### C. ICE Candidate
-
-Sent incrementally by either peer as network routing options are discovered.
-
-```json
-{
-  "type": "candidate",
-  "label": 0,
-  "id": "sdpMid",
-  "candidate": "candidate:842163049 1 udp 16777215 192.168.1.100 54321 typ host generation 0 ufrag A1B2 ..."
-}
-```
-
-#### D. Bye (Hang up)
-
-Sent when a peer disconnects or leaves the call.
-
-```json
-{
-  "type": "bye"
-}
-```
-
----
-
-## Deployment
-
-For details on compiling, running, and deploying this server to Fedora or other Linux environments using Let's Encrypt
-certificates, see [deployment/README.md](./deployment/README.md).
-
-
-## Building
-
-### Toolchain
+## Build and test
 
 Use a Rust toolchain with Edition 2024 support.
 
-### Build & test
-
 ```bash
-# Fetch the submodules first
 git submodule update --init --recursive
-cargo clippy
-cargo fmt
-cargo build
-cargo test
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
-## Open Source License
+## Run over HTTP and WebSocket
 
-This project uses dual licensing under MIT or Apache-2.0.
+Run this command from the repository root:
+
+```bash
+cargo run -p apprtc -- \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --web-root appweb \
+  --debug \
+  --level info
+```
+
+The server prints:
+
+```text
+AppRTC listening on http://127.0.0.1:8080
+```
+
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
+
+`--host` is used both as the local listening host and in generated HTTP/WebSocket URLs. Use an address that browsers can reach; the default is `127.0.0.1`. The generated URLs include `--port`.
+
+## Run over HTTPS and secure WebSocket
+
+Add `--tls` to serve real HTTPS and WSS from the same listener:
+
+```bash
+cargo run -p apprtc -- \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --web-root appweb \
+  --tls \
+  --debug \
+  --level info
+```
+
+Without certificate options, AppRTC uses the bundled development certificate at [`apprtc/cert/cert.pem`](apprtc/cert/cert.pem). Its subject alternative names include `localhost`, `127.0.0.1`, and `::1`, but it is self-signed. Trust that certificate in the browser or operating-system trust store before opening the page; otherwise HTTPS and WSS clients will reject it with `CertificateUnknown` or an equivalent certificate-authority error.
+
+For a deployment, supply a certificate issued by a trusted authority. Both options must be supplied together:
+
+```bash
+cargo run -p apprtc -- \
+  --host apprtc.example.com \
+  --port 443 \
+  --web-root appweb \
+  --tls \
+  --certificate /path/to/fullchain.pem \
+  --private-key /path/to/privkey.pem
+```
+
+## Command-line options
+
+Run `cargo run -p apprtc -- --help` for the authoritative list.
+
+| Option | Default | Description |
+|---|---:|---|
+| `--host <HOST>` | `127.0.0.1` | Host used by the listener and generated HTTP/WebSocket URLs. |
+| `-p, --port <PORT>` | `8080` | HTTP/HTTPS and WS/WSS listening port. |
+| `--web-root <PATH>` | `appweb` | Directory containing the HTML, JavaScript, CSS, and image assets. |
+| `--tls` | off | Serve HTTPS and WSS instead of HTTP and WS. |
+| `--certificate <PATH>` | bundled development certificate | PEM certificate chain used with `--tls`. |
+| `--private-key <PATH>` | bundled development key | PEM private key used with `--tls`. |
+| `--ice-server-url <URLS>` | empty | ICE server URL; repeat the option or provide comma-separated URLs. |
+| `--ice-server-base-url <URL>` | same AppRTC origin | External ICE credential service origin. |
+| `--ice-server-api-key <KEY>` | empty | API key appended to the ICE credential service URL. |
+| `--header-message <TEXT>` | empty | Banner displayed by the web application. |
+| `--bypass-join-confirmation` | off | Skip the browser's ready-to-join prompt. |
+| `-d, --debug` | off | Enable application logging. |
+| `-l, --level <LEVEL>` | `info` | Log filter: `error`, `warn`, `info`, `debug`, or `trace`. |
+| `-o, --output-log-file <PATH>` | stdout | Truncate and write formatted logs to a file. |
+
+Example ICE configuration:
+
+```bash
+cargo run -p apprtc -- \
+  --ice-server-url stun:stun.l.google.com:19302 \
+  --ice-server-url turn:turn.example.com:3478
+```
+
+## HTTP API
+
+| Method and path | Behavior |
+|---|---|
+| `GET /` | Render the room-selection page. |
+| `GET /r/{roomid}` | Render the call page or the full-room page when occupancy is two. |
+| `POST /join/{roomid}` | Generate an eight-digit client ID, admit it, and return legacy AppRTC room parameters. |
+| `POST /message/{roomid}/{clientid}` | Queue or relay the raw signaling message and return `{ "result": "SUCCESS" }`. |
+| `POST /leave/{roomid}/{clientid}` | Remove the client and return the legacy empty success response. |
+| `GET /params` | Return room-independent AppRTC parameters. |
+| `GET` or `POST /v1alpha/iceconfig` | Return the configured ICE server list. |
+| `GET /status` | Return uptime and WebSocket/HTTP counters. |
+| `POST /{roomid}/{clientid}` | V1 `wss_post_url` fallback: inject a raw signaling message. |
+| `DELETE /{roomid}/{clientid}` | V1 `wss_post_url` fallback: remove the client. |
+| `POST` or `DELETE /_internal/{roomid}/{clientid}` | Compatibility alias for the fallback bridge. |
+
+Static files under `appweb/js`, `appweb/css`, `appweb/images`, and `appweb/html` are served by the same process.
+
+### Join response
+
+A successful join returns the legacy shape consumed by `appweb/js/call.js`:
+
+```json
+{
+  "result": "SUCCESS",
+  "params": {
+    "room_id": "example-room",
+    "client_id": "12345678",
+    "is_initiator": "true",
+    "wss_url": "ws://127.0.0.1:8080/ws",
+    "wss_post_url": "http://127.0.0.1:8080"
+  }
+}
+```
+
+The actual `params` object also contains peer-connection constraints, ICE configuration, media constraints, room links, loopback settings, and UI configuration.
+
+## V1 WebSocket protocol
+
+Browsers connect to `/ws` and send a registration frame first:
+
+```json
+{
+  "cmd": "register",
+  "roomid": "example-room",
+  "clientid": "12345678"
+}
+```
+
+A successful V1 registration has no acknowledgement. The registered client sends an opaque signaling payload with:
+
+```json
+{
+  "cmd": "send",
+  "msg": "{\"type\":\"candidate\",\"label\":0,\"id\":\"0\",\"candidate\":\"candidate:...\"}"
+}
+```
+
+The peer receives the payload without the signaling authority parsing or modifying the inner JSON:
+
+```json
+{
+  "msg": "{\"type\":\"candidate\",\"label\":0,\"id\":\"0\",\"candidate\":\"candidate:...\"}",
+  "error": ""
+}
+```
+
+Protocol errors are sent once before the socket is closed:
+
+```json
+{
+  "msg": "",
+  "error": "Client not registered"
+}
+```
+
+The inner `msg` string may contain an SDP offer, SDP answer, trickle ICE candidate, end-of-candidates marker, or `bye` object. V1 signaling treats it as an opaque UTF-8 string.
+
+## Status endpoint
+
+`GET /status` preserves the Collider-compatible response:
+
+```json
+{
+  "upsec": 12.5,
+  "openws": 2,
+  "totalws": 5,
+  "wserrors": 0,
+  "httperrors": 0
+}
+```
+
+## Repository layout
+
+```text
+apprtc/       Rust executable crate and development TLS certificate
+appweb/       Rust web/API crate plus AppRTC browser assets
+signaling/    Rust Sans-I/O signaling authority and WebSocket driver
+sfu/          Rust Sans-I/O selective-forwarding media server
+docs/design/  Signaling architecture and protocol design
+```
+
+## License
+
+This project is dual-licensed under the MIT and Apache-2.0 licenses.
 
 ## Contributing
 
