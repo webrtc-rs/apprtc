@@ -207,3 +207,119 @@ impl Config {
 pub(crate) fn trim_collider_path(p: &str) -> Vec<&str> {
     p.split('/').filter(|s| !s.is_empty()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::IceServer;
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).unwrap()
+    }
+
+    #[test]
+    fn self_origin_honors_configured_host_and_tls() {
+        let config = Config {
+            host: "public.example:8443".into(),
+            force_tls: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.self_origin("request.example".into()),
+            ("https".into(), "wss".into(), "public.example:8443".into())
+        );
+    }
+
+    #[test]
+    fn builds_room_urls_and_preserves_query_string() {
+        let config = Config::default();
+        let params = config.build_room_parameters(
+            "localhost:8080".into(),
+            &url("http://localhost/r/x?debug=loopback&tt=relay"),
+            "room/a",
+            "client-α",
+            Some(true),
+        );
+        assert_eq!(
+            params.room_link,
+            "http://localhost:8080/r/room/a?debug=loopback&tt=relay"
+        );
+        assert_eq!(params.room_id, "room/a");
+        assert_eq!(params.client_id, "client-α");
+        assert_eq!(params.is_initiator, "true");
+    }
+
+    #[test]
+    fn query_options_enable_loopback_and_ice_transport_settings() {
+        let config = Config::default();
+        let params = config.build_room_parameters(
+            "host".into(),
+            &url("http://host/?debug=loopback&it=all&tt=relay"),
+            "",
+            "",
+            Some(false),
+        );
+        assert_eq!(params.is_loopback, "true");
+        assert_eq!(params.ice_server_transports, "relay");
+        assert!(params.pc_config.contains("iceTransports"));
+        assert!(params.include_loopback_js.contains("loopback.js"));
+        assert_eq!(params.is_initiator, "false");
+    }
+
+    #[test]
+    fn ice_server_url_uses_override_base_and_api_key_precedence() {
+        let config = Config {
+            ice_server_base_url: "https://turn.example/api".into(),
+            ice_server_api_key: "secret".into(),
+            ..Default::default()
+        };
+        let params = config.build_room_parameters(
+            "host".into(),
+            &url("http://host/?ts=https%3A%2F%2Fcustom.example"),
+            "",
+            "",
+            None,
+        );
+        assert_eq!(
+            params.ice_server_url,
+            "https://custom.example/v1alpha/iceconfig?key=secret"
+        );
+    }
+
+    #[test]
+    fn ice_config_returns_override_or_configured_urls() {
+        let configured = Config {
+            ice_server_urls: vec!["stun:stun.example".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            configured.ice_config()["iceServers"][0]["urls"],
+            json!(["stun:stun.example"])
+        );
+        let override_config = Config {
+            ice_server_override: vec![IceServer {
+                urls: vec!["turn:turn.example".into()],
+                username: "u".into(),
+                credential: "p".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            override_config.ice_config()["iceServers"][0]["username"],
+            "u"
+        );
+        assert_eq!(Config::default().ice_config(), json!({"iceServers": []}));
+    }
+
+    #[test]
+    fn random_ids_and_path_trimming_have_expected_shapes() {
+        let id = generate_random(32);
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_digit()));
+        assert_eq!(
+            trim_collider_path("//room///client/"),
+            vec!["room", "client"]
+        );
+        assert!(trim_collider_path("///").is_empty());
+    }
+}
