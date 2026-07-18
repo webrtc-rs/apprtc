@@ -421,4 +421,75 @@ mod tests {
         assert!(status.get("wserrors").is_some());
         assert!(status.get("httperrors").is_some());
     }
+
+    #[tokio::test]
+    async fn bridge_validates_empty_body_and_sets_cors_headers() {
+        let app = app();
+        let empty = request(&app, Method::POST, "/room/client", "").await;
+        assert_eq!(empty.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(empty.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert_eq!(
+            empty.headers()[ACCESS_CONTROL_ALLOW_METHODS],
+            "POST, DELETE"
+        );
+
+        let invalid = request(&app, Method::GET, "/room/client", "").await;
+        assert_eq!(invalid.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn params_honor_query_options_and_request_host() {
+        let collider = ColliderHandle::spawn(Duration::from_secs(10));
+        let config = Config {
+            web_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            force_tls: true,
+            ..Default::default()
+        };
+        let app = RoomServer::new(config, WsClient::new(collider))
+            .unwrap()
+            .router();
+        let response = request(
+            &app,
+            Method::GET,
+            "/params?debug=loopback&it=relay&tt=relay",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let params = json_body(response).await;
+        assert_eq!(params["wss_url"], "wss://example.test/ws");
+        assert_eq!(params["is_loopback"], "true");
+        assert_eq!(params["ice_server_transports"], "relay");
+    }
+
+    #[tokio::test]
+    async fn room_page_switches_to_full_template_at_capacity() {
+        let app = app();
+        let first = json_body(request(&app, Method::POST, "/join/full-room", "").await).await;
+        let second = json_body(request(&app, Method::POST, "/join/full-room", "").await).await;
+        let page = request(&app, Method::GET, "/r/full-room", "").await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("this room is full"));
+        let _ = request(
+            &app,
+            Method::POST,
+            &format!(
+                "/leave/full-room/{}",
+                first["params"]["client_id"].as_str().unwrap()
+            ),
+            "",
+        )
+        .await;
+        let _ = request(
+            &app,
+            Method::POST,
+            &format!(
+                "/leave/full-room/{}",
+                second["params"]["client_id"].as_str().unwrap()
+            ),
+            "",
+        )
+        .await;
+    }
 }
