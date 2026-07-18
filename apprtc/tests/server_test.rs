@@ -146,6 +146,38 @@ async fn preserves_v1_debug_loopback_join_behavior() -> Result<()> {
 }
 
 #[tokio::test]
+async fn preserves_v1_reregister_and_unregistered_client_timeout() -> Result<()> {
+    wait_for_server().await?;
+
+    let room = unique_room("reregister");
+    let first = join(&room).await?;
+    let first_id = client_id(&first)?.to_owned();
+    let mut socket = ws_register(&room, &first_id).await?;
+    socket.close(None).await?;
+
+    // Re-registering before the ten-second timeout keeps the same client alive.
+    let mut replacement = ws_register(&room, &first_id).await?;
+    let second = join(&room).await?;
+    assert_eq!(second["result"], "SUCCESS");
+    replacement.close(None).await?;
+    cleanup(&room, &first_id).await?;
+    cleanup(&room, client_id(&second)?).await?;
+
+    // A joined client that never registers must expire and stop consuming capacity.
+    let expiring_room = unique_room("register-timeout");
+    let _unregistered = join(&expiring_room).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    let admitted = join(&expiring_room).await?;
+    assert_eq!(admitted["result"], "SUCCESS");
+    let admitted_id = client_id(&admitted)?.to_owned();
+    let third = join(&expiring_room).await?;
+    assert_eq!(third["result"], "SUCCESS");
+    cleanup(&expiring_room, &admitted_id).await?;
+    cleanup(&expiring_room, client_id(&third)?).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn completes_the_stock_v1_join_queue_and_websocket_relay_flow() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("stock-flow");
