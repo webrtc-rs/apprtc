@@ -16,6 +16,8 @@ readme = "../README.md"
 appweb.workspace = true
 signaling.workspace = true
 
+sansio.workspace = true
+
 tokio.workspace = true
 axum.workspace = true
 clap.workspace = true
@@ -27,6 +29,9 @@ rustls.workspace = true
 rustls-pemfile.workspace = true
 tokio-rustls.workspace = true
 url.workspace = true
+tungstenite.workspace = true
+crossbeam-channel.workspace = true
+ctrlc.workspace = true
 
 [dev-dependencies]
 webrtc.workspace = true

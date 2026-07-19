@@ -1,14 +1,23 @@
 //! Standalone browser/AppWeb signaling endpoint.
+//!
+//! All I/O lives here (blocking threads + `tungstenite`, following the SFU `chat`
+//! example's architecture); the `signaling` crate is a pure Sans-I/O state machine.
+#[path = "../signaling_server.rs"]
+mod signaling_server;
+#[allow(dead_code)]
 #[path = "../tls.rs"]
 mod tls;
+
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;
-use signaling::ws_server::{ColliderHandle, router};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::TcpListener;
+use std::sync::mpsc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -53,8 +62,7 @@ impl From<Level> for LevelFilter {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.debug {
         env_logger::Builder::new()
@@ -82,42 +90,50 @@ async fn main() -> anyhow::Result<()> {
             .filter_level(cli.level.into())
             .init();
     }
-    let handle = ColliderHandle::spawn(Duration::from_secs(10));
-    let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port)).await?;
-    let app = router(handle.clone());
-    if cli.tls {
-        println!(
-            "Signaling WebSocket listening on wss://{}:{}/ws",
-            cli.host_ip, cli.port
-        );
-        axum::serve(
-            listener.with_tls(tls::config(&cli.certificate, &cli.private_key)?),
-            app,
-        )
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
-    } else {
-        println!(
-            "Signaling WebSocket listening on ws://{}:{}/ws",
-            cli.host_ip, cli.port
-        );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await?;
-    }
-    let _ = handle.shutdown().await;
-    Ok(())
-}
 
-trait TcpListenerTls {
-    fn with_tls(self, config: std::sync::Arc<rustls::ServerConfig>) -> tls::TlsListener;
-}
-impl TcpListenerTls for TcpListener {
-    fn with_tls(self, config: std::sync::Arc<rustls::ServerConfig>) -> tls::TlsListener {
-        tls::TlsListener::new(self, config)
-    }
+    let tls_config = if cli.tls {
+        Some(tls::config(&cli.certificate, &cli.private_key)?)
+    } else {
+        None
+    };
+
+    let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port))?;
+    println!(
+        "Signaling WebSocket listening on {}://{}:{}/ws",
+        if cli.tls { "wss" } else { "ws" },
+        cli.host_ip,
+        cli.port
+    );
+
+    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let (commands_tx, commands_rx) = mpsc::sync_channel(signaling_server::COMMAND_CAPACITY);
+
+    // The run loop that owns the Sans-I/O Collider is on a separate thread to the
+    // accept loop, exactly like the chat example's media run loops.
+    let event_loop_handle = {
+        let stop_rx = stop_rx.clone();
+        std::thread::spawn(move || {
+            signaling_server::event_loop(stop_rx, commands_rx, REGISTER_TIMEOUT)
+        })
+    };
+    let serve_io_handle = {
+        let stop_rx = stop_rx.clone();
+        std::thread::spawn(move || {
+            signaling_server::serve_io(stop_rx, listener, tls_config, commands_tx)
+        })
+    };
+
+    println!("Press Ctrl-C to stop");
+    let mut stop_tx = Some(stop_tx);
+    ctrlc::set_handler(move || {
+        if let Some(stop_tx) = stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+    })?;
+    let _ = stop_rx.recv();
+    println!("Wait for Signaling Server Gracefully Shutdown...");
+    let _ = serve_io_handle.join();
+    let _ = event_loop_handle.join();
+    println!("signaling server is gracefully down");
+    Ok(())
 }

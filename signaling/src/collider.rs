@@ -2,7 +2,7 @@
 
 use crate::client::ClientId;
 use crate::messages::{
-    AppControlMsg, AppControlReply, Message, WsClientMsg, server_err, server_msg,
+    AppControlRequest, AppControlResponse, Message, WsClientMsg, server_err, server_msg,
 };
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
@@ -152,11 +152,13 @@ impl Collider {
             }
         };
         if matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
-            let msg: AppControlMsg = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let msg: AppControlRequest =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
             return self.handle_app_message(connection_id, msg, now);
         }
         if value.get("cmd").and_then(|v| v.as_str()) == Some("app") {
-            let msg: AppControlMsg = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let msg: AppControlRequest =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
             return self.handle_app_message(connection_id, msg, now);
         }
         let msg: WsClientMsg = match serde_json::from_value(value) {
@@ -183,7 +185,7 @@ impl Collider {
     fn handle_app_message(
         &mut self,
         connection_id: ConnectionId,
-        msg: AppControlMsg,
+        msg: AppControlRequest,
         now: Instant,
     ) -> Result<(), String> {
         if !matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
@@ -224,7 +226,7 @@ impl Collider {
                 .rooms
                 .join(now, &msg.roomid, &msg.clientid, msg.is_loopback)
             {
-                Ok((is_initiator, messages)) => AppControlReply {
+                Ok((is_initiator, messages)) => AppControlResponse {
                     reply: "admitted".into(),
                     req: msg.req,
                     result: Some("SUCCESS".into()),
@@ -232,7 +234,7 @@ impl Collider {
                     messages: Some(messages),
                     ..Default::default()
                 },
-                Err(result) => AppControlReply {
+                Err(result) => AppControlResponse {
                     reply: "error".into(),
                     req: msg.req,
                     result: Some(result),
@@ -244,13 +246,13 @@ impl Collider {
                 // legacy HTTP leave: remove the room member and close its live
                 // browser WebSocket after the control reply is delivered.
                 self.rooms.leave(&msg.roomid, &msg.clientid);
-                AppControlReply {
+                AppControlResponse {
                     reply: "removed".into(),
                     req: msg.req,
                     ..Default::default()
                 }
             }
-            "occupancy" => AppControlReply {
+            "occupancy" => AppControlResponse {
                 reply: "occupancy".into(),
                 req: msg.req,
                 count: Some(self.rooms.occupancy(&msg.roomid)),
@@ -262,20 +264,20 @@ impl Collider {
             {
                 Ok(()) => {
                     self.drain_room_writes();
-                    AppControlReply {
+                    AppControlResponse {
                         reply: "injected".into(),
                         req: msg.req,
                         ..Default::default()
                     }
                 }
-                Err(result) => AppControlReply {
+                Err(result) => AppControlResponse {
                     reply: "error".into(),
                     req: msg.req,
                     result: Some(result),
                     ..Default::default()
                 },
             },
-            "status" => AppControlReply {
+            "status" => AppControlResponse {
                 reply: "status".into(),
                 req: msg.req,
                 rooms: Some(self.rooms.room_count()),
@@ -285,7 +287,7 @@ impl Collider {
                 websocket_errors: Some(self.websocket_errors),
                 ..Default::default()
             },
-            _ => AppControlReply {
+            _ => AppControlResponse {
                 reply: "error".into(),
                 req: msg.req,
                 result: Some("Invalid app command".into()),

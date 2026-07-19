@@ -13,10 +13,8 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
+sansio.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
-sansio.workspace = true
 log.workspace = true
-tokio.workspace = true
-axum.workspace = true
-futures-util.workspace = true
