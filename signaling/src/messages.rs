@@ -26,6 +26,42 @@ pub struct WsClientMsg {
     pub msg: String,
 }
 
+/// First-frame role for the shared signaling WebSocket. V1 browser frames remain
+/// unchanged; AppWeb uses the private `app` role on the same endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AppControlMsg {
+    #[serde(default)]
+    pub cmd: String,
+    #[serde(default)]
+    pub appid: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub req: u64,
+    #[serde(default)]
+    pub roomid: String,
+    #[serde(default)]
+    pub clientid: String,
+    #[serde(default)]
+    pub msg: String,
+    #[serde(default)]
+    pub is_loopback: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AppControlReply {
+    pub reply: String,
+    pub req: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_initiator: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+}
+
 /// A message sent to a client on behalf of another client. Both fields are
 /// always serialized (no `omitempty`, as in Go): a relay carries `error: ""`,
 /// an error carries `msg: ""`.
@@ -71,4 +107,34 @@ pub fn server_err(error: &str) -> String {
 /// error yields an empty string rather than propagating.
 fn to_wire<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_control_frames_preserve_role_and_correlation_fields() {
+        let request: AppControlMsg = serde_json::from_str(
+            r#"{"cmd":"admit","appid":"frontend-1","req":7,"roomid":"room","clientid":"client","is_loopback":false}"#,
+        )
+        .unwrap();
+        assert_eq!(request.cmd, "admit");
+        assert_eq!(request.appid, "frontend-1");
+        assert_eq!(request.req, 7);
+        assert_eq!(request.roomid, "room");
+
+        let reply = serde_json::to_value(AppControlReply {
+            reply: "admitted".into(),
+            req: 7,
+            is_initiator: Some(true),
+            messages: Some(vec!["offer".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(reply["reply"], "admitted");
+        assert_eq!(reply["req"], 7);
+        assert_eq!(reply["is_initiator"], true);
+        assert_eq!(reply["messages"], serde_json::json!(["offer"]));
+    }
 }

@@ -1,10 +1,13 @@
 //! Sans-I/O signaling authority and V1 browser WebSocket protocol.
 
 use crate::client::ClientId;
-use crate::messages::{Message, WsClientMsg, server_err, server_msg};
+use crate::messages::{
+    AppControlMsg, AppControlReply, Message, WsClientMsg, server_err, server_msg,
+};
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
 use sansio::Protocol;
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
@@ -105,6 +108,7 @@ pub struct AuthorityReply {
 enum Session {
     Connected,
     Registered { roomid: RoomId, clientid: ClientId },
+    App { appid: String },
 }
 
 /// Owns all mutable room state. Drivers must serialize inputs through this value.
@@ -137,7 +141,21 @@ impl Collider {
         text: String,
         now: Instant,
     ) -> Result<(), String> {
-        let msg: WsClientMsg = match serde_json::from_str(&text) {
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                self.fail_connection(
+                    connection_id,
+                    format!("websocket.JSON.Receive error: {error}"),
+                );
+                return Ok(());
+            }
+        };
+        if value.get("cmd").and_then(|v| v.as_str()) == Some("app") {
+            let msg: AppControlMsg = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            return self.handle_app_message(connection_id, msg, now);
+        }
+        let msg: WsClientMsg = match serde_json::from_value(value) {
             Ok(msg) => msg,
             Err(error) => {
                 self.fail_connection(
@@ -156,6 +174,94 @@ impl Collider {
                 Ok(())
             }
         }
+    }
+
+    fn handle_app_message(
+        &mut self,
+        connection_id: ConnectionId,
+        msg: AppControlMsg,
+        now: Instant,
+    ) -> Result<(), String> {
+        if !matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
+            if msg.cmd != "app" || msg.appid.is_empty() {
+                self.fail_connection(connection_id, "Invalid app control registration");
+                return Ok(());
+            }
+            self.sessions
+                .insert(connection_id, Session::App { appid: msg.appid });
+            self.browser_outputs.push_back(BrowserOutput::Text {
+                connection_id,
+                text: json!({"control":"registered"}).to_string(),
+            });
+            return Ok(());
+        }
+        let reply = match msg.cmd.as_str() {
+            "admit" => match self
+                .rooms
+                .join(now, &msg.roomid, &msg.clientid, msg.is_loopback)
+            {
+                Ok((is_initiator, messages)) => AppControlReply {
+                    reply: "admitted".into(),
+                    req: msg.req,
+                    result: Some("SUCCESS".into()),
+                    is_initiator: Some(is_initiator),
+                    messages: Some(messages),
+                    ..Default::default()
+                },
+                Err(result) => AppControlReply {
+                    reply: "error".into(),
+                    req: msg.req,
+                    result: Some(result),
+                    ..Default::default()
+                },
+            },
+            "remove" => {
+                self.rooms.leave(&msg.roomid, &msg.clientid);
+                AppControlReply {
+                    reply: "removed".into(),
+                    req: msg.req,
+                    ..Default::default()
+                }
+            }
+            "occupancy" => AppControlReply {
+                reply: "occupancy".into(),
+                req: msg.req,
+                count: Some(self.rooms.occupancy(&msg.roomid)),
+                ..Default::default()
+            },
+            "inject" => match self
+                .rooms
+                .save_or_send(now, &msg.roomid, &msg.clientid, msg.msg)
+            {
+                Ok(()) => AppControlReply {
+                    reply: "injected".into(),
+                    req: msg.req,
+                    ..Default::default()
+                },
+                Err(result) => AppControlReply {
+                    reply: "error".into(),
+                    req: msg.req,
+                    result: Some(result),
+                    ..Default::default()
+                },
+            },
+            "status" => AppControlReply {
+                reply: "status".into(),
+                req: msg.req,
+                ..Default::default()
+            },
+            _ => AppControlReply {
+                reply: "error".into(),
+                req: msg.req,
+                result: Some("Invalid app command".into()),
+                ..Default::default()
+            },
+        };
+        self.browser_outputs.push_back(BrowserOutput::Text {
+            connection_id,
+            text: serde_json::to_string(&reply).unwrap(),
+        });
+        Ok(())
     }
 
     fn register(
