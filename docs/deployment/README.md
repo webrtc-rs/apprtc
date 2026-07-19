@@ -1,21 +1,26 @@
 # AppRTC Deployment
 
-This guide deploys the Rust AppRTC binary as an all-in-one P2P V1 signaling server. The binary serves the AppRTC web
-application, HTTP room APIs, WebSocket signaling, and optional HTTPS/WSS from one process.
+This guide deploys the Rust AppRTC P2P V1 implementation as two services. AppWeb serves the browser application and
+HTTP room APIs. Signaling owns room state and serves the browser/control WebSocket. They may run on separate machines.
 
-The current binary does not enable V2/SFU call-mode transitions. The historical Go deployment is retained on the
-repository's `go` branch.
+```text
+Browser ── HTTPS ──> AppWeb (https://appr.tc)
+Browser ── WSS ────> Signaling (wss://sfu.rs/ws)
+AppWeb  ── WSS ────> Signaling (control role)
+```
 
-## 1. DNS and firewall
+V2/SFU call-mode transitions are not enabled yet.
 
-Point the domain's `A`/`AAAA` records at the server and allow TCP ports `80` and `443` as needed. Port `80` is only
-required when using Certbot's standalone HTTP validation.
+## DNS and firewall
 
-* **A Record** pointing `@` to server IP (e.g., `173.249.199.192`)
-* **A Record** pointing `www` to server IP (e.g., `173.249.199.192`)
+Point `appr.tc` at the AppWeb host and `sfu.rs` at the signaling host. Allow TCP `443` on both hosts. Port `80` is only
+needed for Certbot standalone validation.
+
+* **A Record** pointing `@` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
+* **A Record** pointing `www` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
 * **Note**: Make sure to delete any conflicting CNAME or AAAA (IPv6) records.
 
-## 2. Install prerequisites
+## Install prerequisites
 
 On Fedora:
 
@@ -23,80 +28,68 @@ On Fedora:
 sudo dnf install -y git rsync certbot rust cargo
 ```
 
-If the distribution Rust toolchain is too old for Edition 2024, install the current stable toolchain with `rustup`
-instead. Or
+Use the current stable Rust toolchain if the distribution version does not support Edition 2024. Or
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-## 3. Obtain TLS certificates
+## TLS certificates
 
-Stop any service currently using the validation port, then request a certificate:
+Obtain a certificate on each host for its public name:
 
 ```bash
-sudo systemctl stop apprtc || true
 sudo certbot certonly --standalone -d appr.tc -d www.appr.tc --agree-tos
 ```
 
-The Rust binary accepts the certificate and key directly; no `/cert` symlinks are required:
+```bash
+sudo certbot certonly --standalone -d sfu.rs -d www.sfu.rs --agree-tos
+```
+
+The binaries accept the certificate and key directly:
 
 ```text
 /etc/letsencrypt/live/appr.tc/fullchain.pem
 /etc/letsencrypt/live/appr.tc/privkey.pem
 ```
 
-## 4. Install the source tree
-
-Copy the repository to a location executable by systemd and readable by the service:
-
-```bash
-rsync -avz --exclude 'target' --exclude '.git' --exclude '.idea' ./ root@173.249.199.192:/opt/apprtc/
+```text
+/etc/letsencrypt/live/sfu.rs/fullchain.pem
+/etc/letsencrypt/live/sfu.rs/privkey.pem
 ```
 
-The web assets must remain at `/opt/apprtc/appweb` unless `--web-root` is changed.
+## Install and build
 
-## 5. Build the release binary
-
-On the server:
+Copy the repository to each host, preserving the `appweb` assets on the AppWeb host:
 
 ```bash
-sudo mkdir -p /opt/log
+rsync -avz --exclude target --exclude .git --exclude .idea ./ root@appweb-host:/opt/apprtc/
+```
+
+Build the required binaries:
+
+```bash
 cd /opt/apprtc
-cargo build --release -p apprtc --bin apprtc
-chmod +x /opt/apprtc/target/release/apprtc
+cargo build --release -p apprtc --bin appweb --bin signaling
+chmod +x /opt/apprtc/target/release/appweb
+chmod +x /opt/apprtc/target/release/signaling
 ```
 
-Apply the change:
+## Production services
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart apprtc
-```bash
-
-## 6. Configure systemd
-
-Create a service file:
-
-```bash
-nano /etc/systemd/system/apprtc.service
-```
-
-Add the following content:
+Run signaling on the signaling host:
 
 ```ini
 [Unit]
-Description=AppRTC P2P/SFU Signaling Server
+Description=AppRTC Signaling WebSocket
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/apprtc
-
-ExecStartPre=/bin/sh -c 'mkdir -p /opt/log; if [ -f /opt/log/apprtc.log ]; then mv /opt/log/apprtc.log /opt/log/apprtc-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-
-ExecStart=/opt/apprtc/target/release/apprtc --host-ip 0.0.0.0 --public-url https://appr.tc --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/log/apprtc.log
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/signaling.log ]; then mv /opt/logs/signaling.log /opt/logs/signaling-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
+ExecStart=/opt/apprtc/target/release/signaling --host-ip 0.0.0.0 --public-url wss://sfu.rs --port 443 --tls --certificate /etc/letsencrypt/live/sfu.rs/fullchain.pem --private-key /etc/letsencrypt/live/sfu.rs/privkey.pem -d -l info -o /opt/logs/signaling.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -106,71 +99,82 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-Enable and start it:
+Run AppWeb on the AppWeb host:
+
+```ini
+[Unit]
+Description=AppRTC AppWeb HTTP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apprtc
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/appweb.log ]; then mv /opt/logs/appweb.log /opt/logs/appweb-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
+ExecStart=/opt/apprtc/target/release/appweb --host-ip 0.0.0.0 --public-url https://appr.tc --signaling-url wss://sfu.rs/ws --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/logs/appweb.log
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Do not use `--signaling-insecure-tls` in production. Enable both services:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now apprtc
-sudo systemctl status apprtc
+sudo systemctl enable --now apprtc-signaling
+sudo systemctl enable --now apprtc-appweb
+sudo systemctl status apprtc-signaling apprtc-appweb
 ```
 
-Stop it:
+The services handle SIGINT gracefully by closing WebSocket connections and releasing signaling state.
+
+## Local two-process test
+
+The bundled certificate is self-signed. Start signaling and AppWeb on separate local ports:
 
 ```bash
-sudo systemctl stop apprtc || true
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --tls
+cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws --signaling-insecure-tls --tls
 ```
 
-The process handles Ctrl-C/SIGINT gracefully: it closes signaling WebSockets, drains HTTP/TLS connections, and exits
-cleanly.
+Then run:
 
-## 7. Verify the deployment
+```bash
+cargo test -p apprtc --test '*' -- --nocapture
+```
+
+`--signaling-insecure-tls` is for local development only; browser clients still need to trust the bundled certificate.
+
+## Verify production
 
 ```bash
 curl -fsS https://appr.tc/status
 curl -fsS https://appr.tc/params
 ```
 
-Open `https://appr.tc/` in a browser. `/status` reports uptime, open WebSockets, total WebSockets, WebSocket errors, and
-HTTP errors.
+The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`.
 
-## 8. Certificate renewal
+## Certificate renewal
 
-Certbot normally installs a renewal timer. Because AppRTC loads certificates at startup, restart it after a successful
-renewal:
+Restart the corresponding service after renewal:
 
 ```bash
 sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh >/dev/null <<'EOF'
 #!/bin/sh
-systemctl restart apprtc
+systemctl restart apprtc-signaling apprtc-appweb
 EOF
 sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
 sudo certbot renew --dry-run
 ```
 
-Check the timer with:
+## CLI reference
 
-```bash
-systemctl list-timers --all | grep certbot
-```
-
-## 9. Useful CLI options
-
-```text
---host-ip HOST-IP              Local listener bind address (default: 127.0.0.1)
---public-url URL               Browser-facing HTTP(S) origin for generated URLs
---port PORT                    HTTP/HTTPS port (default: 8080)
---web-root PATH                AppRTC assets (default: appweb)
---tls                          Enable HTTPS/WSS
---certificate PATH             PEM certificate chain
---private-key PATH             PEM private key
---ice-server-url URL           Repeat or provide comma-separated ICE URLs
---ice-server-base-url URL      External ICE credential service origin
---ice-server-api-key KEY       Credential-service API key
---header-message TEXT          Page banner
---bypass-join-confirmation     Skip the browser confirmation prompt
---level LEVEL                  error, warn, info, debug, or trace
---output-log-file PATH         Write formatted logs to a file
-```
-
-Run `/opt/apprtc/target/release/apprtc -h` for the authoritative option list.
+Run `appweb --help` and `signaling --help` for the authoritative options. Both support `--host-ip`, `--port`, `--tls`,
+`--certificate`, `--private-key`, `--debug`, `--level`, and `--output-log-file`. AppWeb additionally supports
+`--public-url`, `--signaling-url`, `--signaling-insecure-tls`, `--web-root`, ICE options, banner configuration, and
+`--bypass-join-confirmation`. Signaling supports `--public-url` for its advertised WS origin.
