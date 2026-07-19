@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package signaling.v1;
+
+message Request {
+  uint64 requestid = 1;
+
+  oneof command {
+    Register app = 10;
+    Admit admit = 11;
+    Remove remove = 12;
+    Occupancy occupancy = 13;
+    Inject inject = 14;
+    StatusRequest status = 15;
+  }
+}
+
+message Register {
+  string appid = 1;
+  string token = 2;
+}
+
+message Admit {
+  string roomid = 1;
+  string clientid = 2;
+  bool is_loopback = 3;
+}
+
+message Remove {
+  string roomid = 1;
+  string clientid = 2;
+}
+
+message Occupancy {
+  string roomid = 1;
+}
+
+message Inject {
+  string roomid = 1;
+  string clientid = 2;
+  string msg = 3;
+}
+
+message StatusRequest {}
+
+message Response {
+  uint64 requestid = 1;
+  Result result = 2;
+  string reason = 3;
+
+  oneof payload {
+    Admitted admitted = 10;
+    OccupancyResult occupancy = 11;
+    StatusResult status = 12;
+  }
+}
+
+enum Result {
+  RESULT_UNSPECIFIED = 0;
+  OK = 1;
+  ERR = 2;
+}
+
+message Admitted {
+  bool is_initiator = 1;
+  repeated string messages = 2;
+}
+
+message OccupancyResult {
+  uint64 count = 1;
+}
+
+message StatusResult {
+  uint64 rooms = 1;
+  uint64 clients = 2;
+  uint64 websocket_connections = 3;
+  uint64 total_websocket_connections = 4;
+  uint64 websocket_errors = 5;
+}

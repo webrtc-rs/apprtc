@@ -35,17 +35,20 @@ jobs:
       - name: Build AppWeb, signaling, and tests
         run: cargo build --release --package apprtc --bins --tests
 
-      - name: Start signaling and AppWeb servers
+      - name: Start AppWeb before signaling and verify startup recovery
         run: |
-          ./target/release/signaling \
-            --host-ip 127.0.0.1 --port 8081 --tls \
-            --debug --level info > ./logs/signaling.log 2>&1 &
           ./target/release/appweb \
             --host-ip 127.0.0.1 --port 8080 --web-root appweb \
             --public-url https://127.0.0.1:8080 \
             --signaling-url wss://127.0.0.1:8081/ws \
             --signaling-insecure-tls --tls \
             --debug --level info > ./logs/appweb.log 2>&1 &
+          appweb_pid=$!
+          sleep 2
+          kill -0 "$appweb_pid"
+          ./target/release/signaling \
+            --host-ip 127.0.0.1 --port 8081 --tls \
+            --debug --level info > ./logs/signaling.log 2>&1 &
           for attempt in {1..30}; do
             if curl --silent --fail --insecure https://127.0.0.1:8080/status >/dev/null; then
               exit 0

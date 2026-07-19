@@ -24,6 +24,7 @@ struct Cli {
     web_root: String,
     #[arg(long)]
     public_url: String,
+    /// Browser signaling WebSocket URL ending in /ws; /app is derived from it.
     #[arg(long)]
     signaling_url: String,
     #[arg(long, default_value = "appweb-1")]
@@ -118,8 +119,13 @@ async fn main() -> Result<()> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
+    let signaling_url = cli.signaling_url.trim_end_matches('/');
+    let signaling_origin = signaling_url
+        .strip_suffix("/ws")
+        .ok_or_else(|| anyhow::anyhow!("--signaling-url must end with /ws"))?;
+    let control_url = format!("{signaling_origin}/app");
     let authority = WebSocketAuthority::connect_with_options(
-        &cli.signaling_url,
+        &control_url,
         &cli.appid,
         &cli.signaling_token,
         cli.signaling_insecure_tls,
@@ -131,11 +137,7 @@ async fn main() -> Result<()> {
             web_root: cli.web_root,
             host: public_host,
             force_tls: scheme == "https",
-            signaling_url: cli
-                .signaling_url
-                .trim_end_matches('/')
-                .trim_end_matches("/ws")
-                .to_string(),
+            signaling_url: signaling_origin.to_string(),
             ice_server_urls: cli.ice_server_urls,
             ice_server_base_url: cli.ice_server_base_url,
             ice_server_api_key: cli.ice_server_api_key,

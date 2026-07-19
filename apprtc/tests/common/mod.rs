@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::Connector;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -121,8 +122,12 @@ pub async fn ws_register(room_id: &str, client_id: &str) -> Result<WsStream> {
 }
 
 pub async fn ws_connect() -> Result<WsStream> {
+    ws_connect_path("/ws").await
+}
+
+pub async fn ws_connect_path(path: &str) -> Result<WsStream> {
     ensure_crypto_provider();
-    let request = format!("wss://{HOST}:{SIGNALING_PORT}/ws").into_client_request()?;
+    let request = format!("wss://{HOST}:{SIGNALING_PORT}{path}").into_client_request()?;
     let connector = Connector::Rustls(tls_config()?);
     let (socket, response) = timeout(
         IO_TIMEOUT,
@@ -134,6 +139,31 @@ pub async fn ws_connect() -> Result<WsStream> {
         bail!("WebSocket upgrade returned {}", response.status());
     }
     Ok(socket)
+}
+
+pub async fn ws_send_binary(socket: &mut WsStream, bytes: Vec<u8>) -> Result<()> {
+    timeout(IO_TIMEOUT, socket.send(Message::binary(bytes)))
+        .await
+        .context("timed out sending binary WebSocket frame")??;
+    Ok(())
+}
+
+pub async fn ws_receive_binary(socket: &mut WsStream) -> Result<Vec<u8>> {
+    loop {
+        let message = timeout(IO_TIMEOUT, socket.next())
+            .await
+            .context("timed out waiting for binary WebSocket frame")?
+            .ok_or_else(|| anyhow!("WebSocket closed before a binary frame arrived"))??;
+        match message {
+            Message::Binary(bytes) => return Ok(bytes.to_vec()),
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+            Message::Pong(_) => {}
+            Message::Close(frame) => {
+                bail!("WebSocket closed before a binary frame arrived: {frame:?}")
+            }
+            Message::Text(_) | Message::Frame(_) => {}
+        }
+    }
 }
 
 pub async fn ws_send(socket: &mut WsStream, value: Value) -> Result<()> {
@@ -172,6 +202,18 @@ pub async fn ws_expect_close(socket: &mut WsStream) -> Result<()> {
             Some(Ok(Message::Close(_))) | None => return Ok(()),
             Some(Ok(Message::Ping(payload))) => socket.send(Message::Pong(payload)).await?,
             Some(Ok(_)) => {}
+            Some(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => return Ok(()),
+            Some(Err(WsError::Io(error)))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return Ok(());
+            }
             Some(Err(error)) => return Err(error.into()),
         }
     }

@@ -100,7 +100,13 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port)).await?;
     println!(
-        "Signaling WebSocket listening on {}://{}:{}/ws",
+        "Signaling browser WebSocket listening on {}://{}:{}/ws",
+        if cli.tls { "wss" } else { "ws" },
+        cli.host_ip,
+        cli.port
+    );
+    println!(
+        "Signaling control WebSocket listening on {}://{}:{}/app",
         if cli.tls { "wss" } else { "ws" },
         cli.host_ip,
         cli.port

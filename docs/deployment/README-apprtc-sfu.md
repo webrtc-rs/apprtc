@@ -1,12 +1,13 @@
 # AppRTC Deployment
 
-This guide deploys the Rust AppRTC P2P V1 implementation as two services. AppWeb serves the browser application and
-HTTP room APIs. Signaling owns room state and serves the browser/control WebSocket. They may run on separate machines.
+This guide deploys the Rust AppRTC P2P V1 implementation as two services. AppWeb serves the browser application and HTTP
+room APIs. Signaling owns room state and exposes separate browser and AppWeb-control WebSocket endpoints. They may run
+on separate machines.
 
 ```text
 Browser ── HTTPS ──> AppWeb (https://appr.tc)
 Browser ── WSS ────> Signaling (wss://sfu.rs/ws)
-AppWeb  ── WSS ────> Signaling (control role)
+AppWeb  ── WSS/Protobuf ──> Signaling (wss://sfu.rs/app)
 ```
 
 V2/SFU call-mode transitions are not enabled yet.
@@ -156,7 +157,8 @@ curl -fsS https://appr.tc/status
 curl -fsS https://appr.tc/params
 ```
 
-The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`.
+The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`. AppWeb derives `wss://sfu.rs/app` from that
+browser URL for its private Protobuf connection.
 
 ## Certificate renewal
 

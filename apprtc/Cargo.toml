@@ -13,6 +13,7 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
+signaling-proto.workspace = true
 appweb.workspace = true
 signaling.workspace = true
 

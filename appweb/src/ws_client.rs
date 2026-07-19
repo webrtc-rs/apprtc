@@ -2,8 +2,8 @@
 //!
 //! This module is the *I/O driver* only: sockets, TLS, channels, timers, and
 //! randomness (jitter sampling). The wire format is shared with the signaling
-//! authority — [`AppControlRequest`]/[`AppControlResponse`] live in the Sans-I/O
-//! `signaling` crate — and every protocol decision lives in [`crate::controller`],
+//! authority — [`AppControlRequest`]/[`AppControlResponse`] live in the shared
+//! `signaling-proto` crate — and every protocol decision lives in [`crate::controller`],
 //! unit-tested without sockets or a clock: the per-connection [`Controller`]
 //! object owns heartbeat/backoff sequencing and the frame decisions, and
 //! [`ControlResponseExt`] converts responses into domain values.
@@ -11,7 +11,7 @@
 use crate::controller::{ControlResponseExt, Controller, FrameAction};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use signaling::messages::{AppControlRequest, AppControlResponse};
+use signaling_proto::{Request as AppControlRequest, Response as AppControlResponse};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -22,8 +22,7 @@ use tokio_tungstenite::{
     tungstenite::Message,
 };
 
-pub use crate::controller::Admission;
-pub use signaling::collider::StatusSnapshot;
+pub use crate::controller::{Admission, StatusSnapshot};
 
 #[async_trait]
 pub trait RoomAuthority: Send + Sync {
@@ -97,20 +96,27 @@ impl WebSocketAuthority {
 
     async fn request(&self, request: AppControlRequest) -> Result<AppControlResponse, String> {
         let requestid = request.requestid;
-        let operation = request.cmd.clone();
+        let operation = request.operation_name();
         let (response_tx, response_rx) = oneshot::channel();
-        self.requests
-            .send(AuthorityRequest {
-                request,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| "signaling control worker stopped".to_string())?;
         let started = Instant::now();
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, response_rx)
-            .await
-            .map_err(|_| format!("signaling {operation} request {requestid} timed out"))?
-            .map_err(|_| "signaling control worker stopped".to_string())?;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            self.requests
+                .send(AuthorityRequest {
+                    request,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| "signaling control worker stopped".to_string())?;
+            response_rx
+                .await
+                .map_err(|_| "signaling control worker stopped".to_string())?
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "signaling {operation} request {requestid} timed out"
+            ))
+        });
         match &result {
             Ok(_) => log::debug!(
                 "Signaling control request completed: operation={operation} requestid={requestid} elapsed_ms={}",
@@ -197,10 +203,10 @@ async fn connect_control(
         options.appid
     );
     socket
-        .send(Message::text(register.to_wire()))
+        .send(Message::binary(register.encode_wire()))
         .await
         .map_err(|e| e.to_string())?;
-    let Some(Ok(Message::Text(frame))) = socket.next().await else {
+    let Some(Ok(Message::Binary(frame))) = socket.next().await else {
         return Err("signaling control socket closed during registration".into());
     };
     Controller::registration_ack(&frame, requestid)?;
@@ -260,7 +266,7 @@ async fn run_connection(
                             FrameAction::Pong => return Ok::<(), String>(()),
                             FrameAction::Ping(payload) => socket.send(Message::Pong(payload)).await.map_err(|error| error.to_string())?,
                             FrameAction::Closed => return Err("signaling control socket closed".into()),
-                            FrameAction::Text(_) | FrameAction::Ignore => {}
+                            FrameAction::Binary(_) | FrameAction::Ignore => {}
                         }
                     }
                 };
@@ -287,10 +293,10 @@ async fn exchange(
     request: AppControlRequest,
     request_id: u64,
 ) -> Result<AppControlResponse, String> {
-    let operation = request.cmd.clone();
+    let operation = request.operation_name();
     log::info!("Signaling control request: operation={operation} requestid={request_id}");
     socket
-        .send(Message::text(request.to_wire()))
+        .send(Message::binary(request.encode_wire()))
         .await
         .map_err(|error| error.to_string())?;
     loop {
@@ -300,12 +306,12 @@ async fn exchange(
             .ok_or_else(|| "signaling control socket closed".to_string())?
             .map_err(|error| error.to_string())?;
         match Controller::classify_frame(frame) {
-            FrameAction::Text(text) => {
-                if let Some(response) = Controller::correlate_response(&text, request_id)? {
+            FrameAction::Binary(bytes) => {
+                if let Some(response) = Controller::correlate_response(&bytes, request_id)? {
                     log::info!(
                         "Signaling control response: operation={operation} requestid={request_id} result={} reason={}",
-                        response.result.as_deref().unwrap_or("MISSING"),
-                        response.reason.as_deref().unwrap_or("")
+                        response.result_name(),
+                        response.reason
                     );
                     return Ok(response);
                 }

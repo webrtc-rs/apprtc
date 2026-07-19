@@ -11,10 +11,12 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::{
-    http, join, unique_room, wait_for_server, ws_connect, ws_expect_close, ws_receive_json,
-    ws_register, ws_send,
+    http, join, unique_room, wait_for_server, ws_connect, ws_connect_path, ws_expect_close,
+    ws_receive_binary, ws_receive_json, ws_register, ws_send, ws_send_binary,
 };
 use serde_json::{Value, json};
+use signaling_proto::v1::response::Payload as ControlPayload;
+use signaling_proto::{Request as ControlRequest, Response as ControlResponse, ResultCode};
 
 #[tokio::test]
 async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
@@ -55,38 +57,50 @@ async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
 #[tokio::test]
 async fn preserves_appweb_signaling_status_contract() -> Result<()> {
     wait_for_server().await?;
-    let mut socket = ws_connect().await?;
-    ws_send(
+    let mut socket = ws_connect_path("/app").await?;
+    ws_send_binary(
         &mut socket,
-        json!({"cmd":"app", "requestid":"500", "appid":"contract-test", "token":""}),
+        ControlRequest::register(500, "contract-test".into(), String::new()).encode_wire(),
     )
     .await?;
-    assert_eq!(
-        ws_receive_json(&mut socket).await?,
-        json!({"requestid":"500", "result":"OK"})
-    );
-    ws_send(&mut socket, json!({"cmd":"status", "requestid":"1"})).await?;
-    let status = ws_receive_json(&mut socket).await?;
-    assert_eq!(status["requestid"], "1");
-    assert_eq!(status["result"], "OK");
-    for field in [
-        "rooms",
-        "clients",
-        "websocket_connections",
-        "total_websocket_connections",
-        "websocket_errors",
-    ] {
-        assert!(
-            status[field].is_u64(),
-            "status field {field} must be an unsigned integer"
-        );
-    }
-    ws_send(&mut socket, json!({"cmd":"unknown", "requestid":"2"})).await?;
-    assert_eq!(
-        ws_receive_json(&mut socket).await?,
-        json!({"requestid":"2", "result":"ERR", "reason":"Invalid app command"})
-    );
+    let registered = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(registered.requestid, 500);
+    assert_eq!(registered.result, i32::from(ResultCode::Ok));
+
+    ws_send_binary(&mut socket, ControlRequest::status(1).encode_wire()).await?;
+    let status = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(status.requestid, 1);
+    assert_eq!(status.result, i32::from(ResultCode::Ok));
+    assert!(matches!(status.payload, Some(ControlPayload::Status(_))));
     socket.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn separates_browser_json_and_appweb_protobuf_endpoints() -> Result<()> {
+    wait_for_server().await?;
+
+    let mut control = ws_connect_path("/app").await?;
+    ws_send(&mut control, json!({"cmd":"register"})).await?;
+    ws_expect_close(&mut control).await?;
+
+    let mut browser = ws_connect().await?;
+    ws_send_binary(&mut browser, ControlRequest::status(1).encode_wire()).await?;
+    ws_expect_close(&mut browser).await?;
+
+    let mut malformed = ws_connect_path("/app").await?;
+    ws_send_binary(
+        &mut malformed,
+        ControlRequest {
+            requestid: 1,
+            command: None,
+        }
+        .encode_wire(),
+    )
+    .await?;
+    ws_expect_close(&mut malformed).await?;
     Ok(())
 }
 

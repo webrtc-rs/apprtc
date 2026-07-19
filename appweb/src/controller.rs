@@ -13,8 +13,9 @@
 //!
 //! The I/O driver that moves the frames lives in [`crate::ws_client`].
 
-use signaling::collider::StatusSnapshot;
-use signaling::messages::AppControlResponse;
+use signaling_proto::{
+    Response as AppControlResponse, ResultCode, v1::response::Payload as AppPayload,
+};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
 
@@ -28,11 +29,20 @@ pub struct Admission {
     pub messages: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub rooms: usize,
+    pub clients: usize,
+    pub websocket_connections: usize,
+    pub total_websocket_connections: u64,
+    pub websocket_errors: u64,
+}
+
 /// What one control-channel frame means to whoever is waiting on the socket.
 #[derive(Debug, PartialEq)]
 pub(crate) enum FrameAction {
-    /// A JSON text payload — a control response, for [`Controller::correlate_response`].
-    Text(String),
+    /// A Protobuf binary payload — a control response, for [`Controller::correlate_response`].
+    Binary(Bytes),
     /// The peer acknowledged our ping (any pong counts as the heartbeat ack).
     Pong,
     /// The peer pinged us; answer with this payload.
@@ -61,11 +71,11 @@ impl Controller {
 
     pub(crate) fn classify_frame(frame: Message) -> FrameAction {
         match frame {
-            Message::Text(text) => FrameAction::Text(text.to_string()),
+            Message::Binary(bytes) => FrameAction::Binary(bytes),
             Message::Pong(_) => FrameAction::Pong,
             Message::Ping(payload) => FrameAction::Ping(payload),
             Message::Close(_) => FrameAction::Closed,
-            Message::Binary(_) | Message::Frame(_) => FrameAction::Ignore,
+            Message::Text(_) | Message::Frame(_) => FrameAction::Ignore,
         }
     }
 
@@ -73,22 +83,30 @@ impl Controller {
     /// `Ok(Some)` is our response, `Ok(None)` is a stale response for an earlier request
     /// (keep waiting), `Err` is an undecodable frame, which fails the request.
     pub(crate) fn correlate_response(
-        text: &str,
+        bytes: &[u8],
         request_id: u64,
     ) -> Result<Option<AppControlResponse>, String> {
-        let response = AppControlResponse::from_wire(text)?;
+        let response = AppControlResponse::decode_wire(bytes)?;
+        if response.requestid == 0 {
+            return Err("signaling control response has zero requestid".into());
+        }
         Ok((response.requestid == request_id).then_some(response))
     }
 
     /// Registration uses the same response envelope as other control operations.
-    pub(crate) fn registration_ack(frame: &str, expected_requestid: u64) -> Result<(), String> {
-        let response = AppControlResponse::from_wire(frame)?;
-        let registered =
-            response.result.as_deref() == Some("OK") && response.requestid == expected_requestid;
+    pub(crate) fn registration_ack(frame: &[u8], expected_requestid: u64) -> Result<(), String> {
+        let response = AppControlResponse::decode_wire(frame)?;
+        let registered = response.result == i32::from(ResultCode::Ok)
+            && response.requestid == expected_requestid;
         if registered {
             Ok(())
         } else {
-            Err(format!("signaling control registration failed: {frame}"))
+            Err(format!(
+                "signaling control registration failed: requestid={} result={} reason={}",
+                response.requestid,
+                response.result_name(),
+                response.reason
+            ))
         }
     }
 
@@ -130,38 +148,52 @@ pub(crate) trait ControlResponseExt: Sized {
 
 impl ControlResponseExt for AppControlResponse {
     fn ack(self, fallback: &str) -> Result<Self, String> {
-        match self.result.as_deref() {
-            Some("OK") => Ok(self),
-            Some("ERR") => Err(self.reason.unwrap_or_else(|| fallback.to_string())),
-            Some(result) => Err(format!("invalid control result: {result}")),
-            None => Err(fallback.to_string()),
+        match ResultCode::try_from(self.result) {
+            Ok(ResultCode::Ok) => Ok(self),
+            Ok(ResultCode::Err) => Err(if self.reason.is_empty() {
+                fallback.to_string()
+            } else {
+                self.reason
+            }),
+            Ok(ResultCode::Unspecified) | Err(_) => {
+                Err(format!("invalid control result: {}", self.result))
+            }
         }
     }
 
     fn admission(self) -> Result<Admission, String> {
         let response = self.ack("admission failed")?;
-        Ok(Admission {
-            is_initiator: response.is_initiator.unwrap_or(false),
-            messages: response.messages.unwrap_or_default(),
-        })
+        match response.payload {
+            Some(AppPayload::Admitted(admitted)) => Ok(Admission {
+                is_initiator: admitted.is_initiator,
+                messages: admitted.messages,
+            }),
+            _ => Err("admission response missing admitted payload".into()),
+        }
     }
 
     fn occupancy_count(self) -> Result<usize, String> {
         let response = self.ack("occupancy failed")?;
-        match response.count {
-            Some(count) => Ok(count),
-            None => Err("occupancy failed".into()),
+        match response.payload {
+            Some(AppPayload::Occupancy(occupancy)) => {
+                usize::try_from(occupancy.count).map_err(|_| "occupancy count exceeds usize".into())
+            }
+            _ => Err("occupancy response missing occupancy payload".into()),
         }
     }
 
     fn status_snapshot(self) -> Result<StatusSnapshot, String> {
         let response = self.ack("status failed")?;
+        let Some(AppPayload::Status(status)) = response.payload else {
+            return Err("status response missing status payload".into());
+        };
         Ok(StatusSnapshot {
-            rooms: response.rooms.unwrap_or(0),
-            clients: response.clients.unwrap_or(0),
-            websocket_connections: response.websocket_connections.unwrap_or(0),
-            total_websocket_connections: response.total_websocket_connections.unwrap_or(0),
-            websocket_errors: response.websocket_errors.unwrap_or(0),
+            rooms: usize::try_from(status.rooms).map_err(|_| "room count exceeds usize")?,
+            clients: usize::try_from(status.clients).map_err(|_| "client count exceeds usize")?,
+            websocket_connections: usize::try_from(status.websocket_connections)
+                .map_err(|_| "WebSocket count exceeds usize")?,
+            total_websocket_connections: status.total_websocket_connections,
+            websocket_errors: status.websocket_errors,
         })
     }
 }
@@ -169,6 +201,11 @@ impl ControlResponseExt for AppControlResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use signaling_proto::v1::{Admitted, OccupancyResult, StatusResult};
+
+    fn wire(response: AppControlResponse) -> Vec<u8> {
+        response.encode_wire()
+    }
 
     #[test]
     fn backoff_doubles_from_one_second_and_caps_at_thirty() {
@@ -219,31 +256,30 @@ mod tests {
 
     #[test]
     fn replies_are_correlated_by_request_id() {
-        let matched =
-            Controller::correlate_response(r#"{"requestid":"5","result":"OK"}"#, 5).unwrap();
+        let matched = Controller::correlate_response(&wire(AppControlResponse::ok(5)), 5).unwrap();
         assert_eq!(matched.unwrap().requestid, 5);
         // A stale response for an earlier request is skipped, not an error.
         assert!(
-            Controller::correlate_response(r#"{"requestid":"4","result":"OK"}"#, 5)
+            Controller::correlate_response(&wire(AppControlResponse::ok(4)), 5)
                 .unwrap()
                 .is_none()
         );
         // An undecodable frame fails the request.
-        assert!(Controller::correlate_response("not json", 5).is_err());
+        assert!(Controller::correlate_response(&[0xff], 5).is_err());
     }
 
     #[test]
     fn registration_requires_the_registered_control_frame() {
-        assert!(Controller::registration_ack(r#"{"requestid":"1","result":"OK"}"#, 1).is_ok());
-        assert!(Controller::registration_ack(r#"{"requestid":"2","result":"OK"}"#, 1).is_err());
-        assert!(Controller::registration_ack("garbage", 1).is_err());
+        assert!(Controller::registration_ack(&wire(AppControlResponse::ok(1)), 1).is_ok());
+        assert!(Controller::registration_ack(&wire(AppControlResponse::ok(2)), 1).is_err());
+        assert!(Controller::registration_ack(&[0xff], 1).is_err());
     }
 
     #[test]
     fn control_frames_classify_by_what_the_waiter_should_do() {
         assert_eq!(
-            Controller::classify_frame(Message::text(r#"{"requestid":"1","result":"OK"}"#)),
-            FrameAction::Text(r#"{"requestid":"1","result":"OK"}"#.into())
+            Controller::classify_frame(Message::binary(vec![1_u8, 2])),
+            FrameAction::Binary(Bytes::from_static(&[1, 2]))
         );
         assert_eq!(
             Controller::classify_frame(Message::Pong(Bytes::from_static(b"1"))),
@@ -258,7 +294,7 @@ mod tests {
             FrameAction::Closed
         );
         assert_eq!(
-            Controller::classify_frame(Message::Binary(Bytes::from_static(b"x"))),
+            Controller::classify_frame(Message::text("ignored")),
             FrameAction::Ignore
         );
     }
@@ -266,26 +302,23 @@ mod tests {
     #[test]
     fn error_replies_map_to_their_result_or_the_fallback() {
         let error = AppControlResponse {
-            requestid: 1,
-            result: Some("ERR".into()),
-            reason: Some("FULL".into()),
-            ..Default::default()
+            reason: "FULL".into(),
+            ..AppControlResponse::err(1, "FULL")
         };
         assert_eq!(error.admission().unwrap_err(), "FULL");
 
         let bare_error = AppControlResponse {
-            requestid: 1,
-            result: Some("ERR".into()),
-            ..Default::default()
+            reason: String::new(),
+            ..AppControlResponse::err(1, "")
         };
         assert_eq!(bare_error.admission().unwrap_err(), "admission failed");
 
         let admitted = AppControlResponse {
-            requestid: 1,
-            result: Some("OK".into()),
-            is_initiator: Some(true),
-            messages: Some(vec!["offer".into()]),
-            ..Default::default()
+            payload: Some(AppPayload::Admitted(Admitted {
+                is_initiator: true,
+                messages: vec!["offer".into()],
+            })),
+            ..AppControlResponse::ok(1)
         };
         assert_eq!(
             admitted.admission().unwrap(),
@@ -299,25 +332,25 @@ mod tests {
     #[test]
     fn occupancy_and_status_replies_convert_with_defaults() {
         let counted = AppControlResponse {
-            requestid: 1,
-            result: Some("OK".into()),
-            count: Some(2),
-            ..Default::default()
+            payload: Some(AppPayload::Occupancy(OccupancyResult { count: 2 })),
+            ..AppControlResponse::ok(1)
         };
         assert_eq!(counted.occupancy_count().unwrap(), 2);
         let missing = AppControlResponse {
-            requestid: 1,
-            result: Some("OK".into()),
-            ..Default::default()
+            ..AppControlResponse::ok(1)
         };
-        assert_eq!(missing.occupancy_count().unwrap_err(), "occupancy failed");
+        assert_eq!(
+            missing.occupancy_count().unwrap_err(),
+            "occupancy response missing occupancy payload"
+        );
 
         let snapshot = AppControlResponse {
-            requestid: 1,
-            result: Some("OK".into()),
-            rooms: Some(1),
-            clients: Some(2),
-            ..Default::default()
+            payload: Some(AppPayload::Status(StatusResult {
+                rooms: 1,
+                clients: 2,
+                ..Default::default()
+            })),
+            ..AppControlResponse::ok(1)
         }
         .status_snapshot()
         .unwrap();

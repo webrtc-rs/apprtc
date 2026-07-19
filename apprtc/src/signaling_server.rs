@@ -6,16 +6,17 @@
 //! event loop sleep on `tokio::select!` instead of polling with read timeouts: inputs,
 //! outputs, deadlines, and the stop signal all wake their task immediately.
 //!
-//! Each browser opens **one** WebSocket on `/ws`. A hand-rolled HTTP layer completes the
-//! RFC 6455 upgrade, then a `tokio-tungstenite` session task shuttles frames to the
-//! event loop over channels. The event loop serializes every [`BrowserInput`] through
-//! the single `Collider` and routes every [`BrowserOutput`] back to the owning session's
-//! channel.
+//! Browsers use JSON text frames on `/ws`; AppWeb uses Protobuf binary frames on
+//! `/app`. A hand-rolled HTTP layer completes the RFC 6455 upgrade, then a
+//! `tokio-tungstenite` session task shuttles typed inputs to the event loop over channels.
+//! The event loop serializes every [`BrowserInput`] through the single `Collider` and
+//! routes every [`BrowserOutput`] back to the owning session's channel.
 
 use futures_util::{SinkExt, StreamExt};
 use rustls::ServerConfig;
 use sansio::Protocol;
 use signaling::collider::{BrowserInput, BrowserOutput, Collider, ConnectionId};
+use signaling_proto::Request as AppControlRequest;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,7 +47,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum SocketOutput {
     Text(String),
+    Binary(Vec<u8>),
     Close,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+    Browser,
+    AppControl,
 }
 
 /// Commands a session task hands to the event loop that owns the `Collider`.
@@ -58,6 +66,11 @@ pub enum DriverCommand {
     Text {
         connection_id: ConnectionId,
         text: String,
+        now: Instant,
+    },
+    AppControl {
+        connection_id: ConnectionId,
+        request: AppControlRequest,
         now: Instant,
     },
     Disconnected {
@@ -114,7 +127,7 @@ impl AsyncWrite for Stream {
 
 // ───────────────────────────── TLS + HTTP + WebSocket ──────────────────────────────
 
-/// Accept connections until `stop_rx` fires; upgrade `/ws` to a WebSocket session.
+/// Accept connections until `stop_rx` fires; upgrade a supported WebSocket endpoint.
 pub async fn accept_loop(
     mut stop_rx: watch::Receiver<()>,
     commands: mpsc::Sender<DriverCommand>,
@@ -149,7 +162,7 @@ pub async fn accept_loop(
 }
 
 /// One accepted connection: optional TLS handshake, read the HTTP request head, then
-/// either upgrade `/ws` to a WebSocket or answer with a plain HTTP status.
+/// either upgrade `/ws` or `/app` to a WebSocket or answer with HTTP status.
 async fn handle_connection(
     tcp: TcpStream,
     tls_acceptor: Option<TlsAcceptor>,
@@ -178,9 +191,11 @@ async fn handle_connection(
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
         && request.header("sec-websocket-key").is_some();
 
-    if request.path != "/ws" && request.path != "/ws/" {
-        return respond(&mut stream, "404 Not Found", "not found").await;
-    }
+    let endpoint = match request.path.as_str() {
+        "/ws" | "/ws/" => Endpoint::Browser,
+        "/app" | "/app/" => Endpoint::AppControl,
+        _ => return respond(&mut stream, "404 Not Found", "not found").await,
+    };
     if !is_upgrade {
         return respond(&mut stream, "426 Upgrade Required", "upgrade required").await;
     }
@@ -202,7 +217,7 @@ async fn handle_connection(
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
     let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
-    ws_session(ws, connection_id, commands).await;
+    ws_session(ws, endpoint, connection_id, commands).await;
     Ok(())
 }
 
@@ -278,10 +293,11 @@ async fn respond(stream: &mut Stream, status: &str, body: &str) -> anyhow::Resul
 /// the moment it is ready, with no polling interval in between.
 async fn ws_session(
     ws: WebSocketStream<Stream>,
+    endpoint: Endpoint,
     connection_id: ConnectionId,
     commands: mpsc::Sender<DriverCommand>,
 ) {
-    log::info!("WebSocket connected: connection_id={connection_id}");
+    log::info!("WebSocket connected: connection_id={connection_id} endpoint={endpoint:?}");
     // Event-loop→browser channel; its sender is owned by the event loop for routing.
     let (output, mut outputs) = mpsc::channel::<SocketOutput>(SOCKET_OUTPUT_CAPACITY);
     if commands
@@ -305,6 +321,11 @@ async fn ws_session(
                         break;
                     }
                 }
+                Some(SocketOutput::Binary(bytes)) => {
+                    if writer.send(Message::binary(bytes)).await.is_err() {
+                        break;
+                    }
+                }
                 Some(SocketOutput::Close) | None => {
                     let _ = writer.send(Message::Close(None)).await;
                     break;
@@ -312,6 +333,10 @@ async fn ws_session(
             },
             incoming = reader.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
+                    if !matches!(endpoint, Endpoint::Browser) {
+                        log::warn!("AppWeb control text frame rejected: connection_id={connection_id}");
+                        break;
+                    }
                     log::info!(
                         "WebSocket message: connection_id={connection_id} bytes={}",
                         text.len()
@@ -319,6 +344,37 @@ async fn ws_session(
                     if commands.send(DriverCommand::Text {
                         connection_id,
                         text: text.to_string(),
+                        now: Instant::now(),
+                    }).await.is_err() {
+                        break;
+                    }
+                    idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    if !matches!(endpoint, Endpoint::AppControl) {
+                        log::warn!("Browser binary frame rejected: connection_id={connection_id}");
+                        break;
+                    }
+                    let request = match AppControlRequest::decode_wire(&bytes) {
+                        Ok(request) if request.requestid != 0 && request.command.is_some() => request,
+                        Ok(_) => {
+                            log::warn!("AppWeb control Protobuf request rejected: connection_id={connection_id} reason=missing_requestid_or_command");
+                            break;
+                        }
+                        Err(error) => {
+                            log::warn!("AppWeb control Protobuf decode failed: connection_id={connection_id} bytes={} error={error}", bytes.len());
+                            break;
+                        }
+                    };
+                    log::info!(
+                        "AppWeb control WebSocket message: connection_id={connection_id} operation={} requestid={} bytes={}",
+                        request.operation_name(),
+                        request.requestid,
+                        bytes.len()
+                    );
+                    if commands.send(DriverCommand::AppControl {
+                        connection_id,
+                        request,
                         now: Instant::now(),
                     }).await.is_err() {
                         break;
@@ -334,7 +390,6 @@ async fn ws_session(
                     idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
                 }
                 Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(Message::Binary(_))) => break,
                 Some(Ok(Message::Frame(_))) => {}
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
             },
@@ -434,6 +489,23 @@ fn handle_command(
                 let _ = socket.try_send(SocketOutput::Close);
             }
         }
+        DriverCommand::AppControl {
+            connection_id,
+            request,
+            now,
+        } => {
+            if collider
+                .handle_read(BrowserInput::AppControl {
+                    connection_id,
+                    request,
+                    now,
+                })
+                .is_err()
+                && let Some(socket) = sockets.remove(&connection_id)
+            {
+                let _ = socket.try_send(SocketOutput::Close);
+            }
+        }
         DriverCommand::Disconnected { connection_id, now } => {
             sockets.remove(&connection_id);
             let _ = collider.handle_read(BrowserInput::Disconnected { connection_id, now });
@@ -459,6 +531,18 @@ fn drain_outputs(
                     disconnected.push(connection_id);
                 }
             }
+            BrowserOutput::AppControl {
+                connection_id,
+                response,
+            } => {
+                if sockets.get(&connection_id).is_some_and(|socket| {
+                    socket
+                        .try_send(SocketOutput::Binary(response.encode_wire()))
+                        .is_err()
+                }) {
+                    disconnected.push(connection_id);
+                }
+            }
             BrowserOutput::Close { connection_id } => {
                 if let Some(socket) = sockets.remove(&connection_id) {
                     let _ = socket.try_send(SocketOutput::Close);
@@ -481,6 +565,7 @@ fn drain_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use signaling_proto::{Response as AppControlResponse, ResultCode};
 
     struct Harness {
         stop_tx: watch::Sender<()>,
@@ -523,6 +608,17 @@ mod tests {
                 .unwrap();
         }
 
+        async fn app_control(&self, connection_id: ConnectionId, request: AppControlRequest) {
+            self.commands
+                .send(DriverCommand::AppControl {
+                    connection_id,
+                    request,
+                    now: Instant::now(),
+                })
+                .await
+                .unwrap();
+        }
+
         async fn shutdown(self) {
             self.stop_tx.send(()).unwrap();
             self.run.await.unwrap();
@@ -536,6 +632,7 @@ mod tests {
             .unwrap()
         {
             SocketOutput::Text(text) => text,
+            SocketOutput::Binary(_) => panic!("expected a text frame, got binary"),
             SocketOutput::Close => panic!("expected a text frame, got a close"),
         }
     }
@@ -548,6 +645,19 @@ mod tests {
         {
             SocketOutput::Close => {}
             SocketOutput::Text(text) => panic!("expected a close, got text: {text}"),
+            SocketOutput::Binary(_) => panic!("expected a close, got binary"),
+        }
+    }
+
+    async fn recv_control(outputs: &mut mpsc::Receiver<SocketOutput>) -> AppControlResponse {
+        match tokio::time::timeout(Duration::from_secs(5), outputs.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            SocketOutput::Binary(bytes) => AppControlResponse::decode_wire(&bytes).unwrap(),
+            SocketOutput::Text(text) => panic!("expected binary, got text: {text}"),
+            SocketOutput::Close => panic!("expected binary, got close"),
         }
     }
 
@@ -568,6 +678,27 @@ mod tests {
             r#"{"msg":"candidate","error":""}"#.to_string()
         );
         assert!(outputs_1.try_recv().is_err(), "registration is silent");
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn protobuf_app_control_registers_and_reports_status() {
+        let harness = Harness::spawn();
+        let mut outputs = harness.connect(9).await;
+        harness
+            .app_control(
+                9,
+                AppControlRequest::register(1, "appweb-test".into(), String::new()),
+            )
+            .await;
+        let registered = recv_control(&mut outputs).await;
+        assert_eq!(registered.requestid, 1);
+        assert_eq!(registered.result, i32::from(ResultCode::Ok));
+
+        harness.app_control(9, AppControlRequest::status(2)).await;
+        let status = recv_control(&mut outputs).await;
+        assert_eq!(status.requestid, 2);
+        assert_eq!(status.result, i32::from(ResultCode::Ok));
         harness.shutdown().await;
     }
 

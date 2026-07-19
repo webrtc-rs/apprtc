@@ -46,16 +46,18 @@ repository's `go` branch.
 
 ## Architecture
 
-The workspace has three Rust crates:
+The workspace has four Rust crates:
 
-| Crate                    | Responsibility                                                                                                                                                                          |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)       | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, and the async WebSocket I/O driver that hosts the Sans-I/O signaling core.        |
-| [`appweb`](appweb)       | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                                              |
-| [`signaling`](signaling) | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
+| Crate                                | Responsibility                                                                                                                                                                          |
+|--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, and the async WebSocket I/O driver that hosts the Sans-I/O signaling core.        |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf contract shared by AppWeb and signaling for their private control WebSocket.                                                                                         |
+| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                                              |
+| [`signaling`](signaling)             | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
 
 AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses a
-control WebSocket to submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to signaling. Browser
+Protobuf control WebSocket at `/app` to submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to
+signaling. Browser
 WebSocket traffic connects directly to signaling and never passes through AppWeb.
 
 The signaling state is composed from Sans-I/O protocols:
@@ -72,7 +74,8 @@ testable in memory, without sockets or a wall clock.
 
 All I/O lives at the binary level, in [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs), keeping
 the SFU `chat` example's architecture in async form on Tokio: an accept loop (`accept_loop`) performs the optional TLS
-handshake and the `/ws` WebSocket upgrade, spawning one session task per connection, while a single event-loop task
+handshake and the browser `/ws` or private `/app` WebSocket upgrade, spawning one session task per connection,
+while a single event-loop task
 (`event_loop`) owns the `Collider` — serializing every browser input through it, firing its timeouts, and routing
 its outputs back to each session over channels. Sessions and the event loop sleep on `tokio::select!` and wake
 immediately on input, output, deadline, or shutdown — no blocking calls and no polling intervals.
@@ -146,7 +149,8 @@ AppWeb listening on http://127.0.0.1:8080/
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
 `--host-ip` and `--port` control each local listener. AppWeb's `--public-url` controls the browser-facing HTTP origin;
-`--signaling-url` controls the browser-facing WebSocket origin and must include `/ws`.
+`--signaling-url` controls the browser-facing WebSocket URL and must include `/ws`. AppWeb derives the same signaling
+origin's private `/app` endpoint for its Protobuf control connection.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -201,7 +205,7 @@ authoritative lists.
 | `--tls`                        |                     off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
 | `--certificate <PATH>`         |     bundled certificate | PEM certificate chain used with `--tls`.                                |
 | `--private-key <PATH>`         |             bundled key | PEM private key used with `--tls`.                                      |
-| `--signaling-url <URL>`        |                    none | Signaling control/browser WebSocket URL, including `/ws` (`appweb`).    |
+| `--signaling-url <URL>`        |                    none | Browser signaling URL ending in `/ws`; AppWeb derives `/app`.           |
 | `--signaling-insecure-tls`     |                     off | Disable verification for local self-signed signaling TLS (`appweb`).    |
 | `--appid`, `--signaling-token` |       `appweb-1`, empty | AppWeb control identity and token (`appweb`).                           |
 | `--ice-server-url <URLS>`      |                   empty | ICE server URLs (`appweb`).                                             |
