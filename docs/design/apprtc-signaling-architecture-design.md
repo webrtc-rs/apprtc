@@ -762,7 +762,7 @@ AppWeb sends a WebSocket Ping every 30 seconds and requires a Pong within 10 sec
 in-flight request, reconnects with exponential backoff plus jitter (1–30 seconds), and re-registers the same configured
 `appid`. It does not automatically replay a request that may already have reached signaling; later requests use the
 recovered connection. Connection/registration attempts time out after 10 seconds, and an HTTP-side authority request
-times out after 15 seconds. AppWeb and signaling log every valid control request and reply at INFO with its operation and `requestid`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect lifecycle events are also logged, without tokens or signaling payloads.
+times out after 15 seconds. AppWeb startup does not depend on signaling availability: it starts serving HTTP immediately while the control worker attempts an immediate connection and then retries indefinitely with the same backoff until signaling becomes available. Authority requests accepted while disconnected remain subject to the bounded queue and 15-second caller timeout. AppWeb and signaling log every valid control request and reply at INFO with its operation and `requestid`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect lifecycle events are also logged, without tokens or signaling payloads.
 
 ### 8.5 SFU worker WebSocket
 

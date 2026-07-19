@@ -87,11 +87,8 @@ impl WebSocketAuthority {
             insecure_tls,
             next_requestid: next_requestid.clone(),
         };
-        let socket = tokio::time::timeout(CONNECT_TIMEOUT, connect_control(&options, 0))
-            .await
-            .map_err(|_| "initial signaling control connection timed out".to_string())??;
         let (requests, receiver) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
-        tokio::spawn(run_connection(options, socket, receiver));
+        tokio::spawn(run_control_worker(options, receiver));
         Ok(Self {
             requests,
             next_requestid,
@@ -129,6 +126,32 @@ impl WebSocketAuthority {
     fn requestid(&self) -> u64 {
         self.next_requestid.fetch_add(1, Ordering::Relaxed)
     }
+}
+
+async fn run_control_worker(
+    options: ConnectionOptions,
+    receiver: mpsc::Receiver<AuthorityRequest>,
+) {
+    let mut controller = Controller::new();
+    let socket = match tokio::time::timeout(CONNECT_TIMEOUT, connect_control(&options, 0)).await {
+        Ok(Ok(socket)) => socket,
+        Ok(Err(error)) => {
+            log::warn!(
+                "Signaling control unavailable at AppWeb startup; retrying: appid={} error={error}",
+                options.appid
+            );
+            reconnect(&options, &mut controller).await
+        }
+        Err(_) => {
+            log::warn!(
+                "Signaling control connection timed out at AppWeb startup; retrying: appid={} timeout_secs={}",
+                options.appid,
+                CONNECT_TIMEOUT.as_secs()
+            );
+            reconnect(&options, &mut controller).await
+        }
+    };
+    run_connection(options, socket, receiver).await;
 }
 
 async fn open_socket(options: &ConnectionOptions) -> Result<ControlSocket, String> {
