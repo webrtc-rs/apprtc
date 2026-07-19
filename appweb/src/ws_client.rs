@@ -267,14 +267,14 @@ async fn run_connection(
                     }
                 };
                 match tokio::time::timeout(HEARTBEAT_TIMEOUT, heartbeat_result).await {
-                    Ok(Ok(())) => log::debug!("Signaling control heartbeat succeeded: appid={} latency_ms={}", options.appid, started.elapsed().as_millis()),
+                    Ok(Ok(())) => log::info!("Signaling control heartbeat succeeded: appid={} sequence={} latency_ms={}", options.appid, sequence, started.elapsed().as_millis()),
                     Ok(Err(error)) => {
-                        log::warn!("Signaling control heartbeat failed: appid={} error={error}", options.appid);
+                        log::warn!("Signaling control heartbeat failed: appid={} sequence={} error={error}", options.appid, sequence);
                         socket = reconnect(&options, &mut reconnect_attempt).await;
                         heartbeat.reset();
                     }
                     Err(_) => {
-                        log::warn!("Signaling control heartbeat timed out: appid={} timeout_secs={}", options.appid, HEARTBEAT_TIMEOUT.as_secs());
+                        log::warn!("Signaling control heartbeat timed out: appid={} sequence={} timeout_secs={}", options.appid, sequence, HEARTBEAT_TIMEOUT.as_secs());
                         socket = reconnect(&options, &mut reconnect_attempt).await;
                         heartbeat.reset();
                     }

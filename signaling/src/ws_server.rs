@@ -182,6 +182,10 @@ async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {
                     read_deadline = tokio::time::Instant::now() + WS_READ_TIMEOUT;
                 }
                 Some(Ok(Message::Ping(payload))) => {
+                    log::info!(
+                        "WebSocket keep-alive ping received: connection_id={connection_id} bytes={}",
+                        payload.len()
+                    );
                     if writer.send(Message::Pong(payload)).await.is_err() {
                         break;
                     }

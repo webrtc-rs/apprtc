@@ -188,9 +188,18 @@ impl Collider {
     ) -> Result<(), String> {
         if !matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
             if msg.cmd != "app" || msg.appid.is_empty() {
+                log::warn!(
+                    "AppWeb control registration rejected: connection_id={connection_id} appid={} reason=invalid_registration",
+                    msg.appid
+                );
                 self.fail_connection(connection_id, "Invalid app control registration");
                 return Ok(());
             }
+            log::info!(
+                "AppWeb control registered: connection_id={connection_id} appid={} token_present={}",
+                msg.appid,
+                !msg.token.is_empty()
+            );
             self.sessions
                 .insert(connection_id, Session::App { appid: msg.appid });
             self.browser_outputs.push_back(BrowserOutput::Text {
@@ -199,6 +208,17 @@ impl Collider {
             });
             return Ok(());
         }
+        let appid = match self.sessions.get(&connection_id) {
+            Some(Session::App { appid }) => appid.clone(),
+            _ => unreachable!("AppWeb session was checked above"),
+        };
+        log::info!(
+            "AppWeb control command: connection_id={connection_id} appid={appid} operation={} request_id={} room_id={} client_id={}",
+            msg.cmd,
+            msg.req,
+            msg.roomid,
+            msg.clientid
+        );
         let reply = match msg.cmd.as_str() {
             "admit" => match self
                 .rooms
@@ -276,6 +296,13 @@ impl Collider {
             connection_id,
             text: serde_json::to_string(&reply).unwrap(),
         });
+        log::debug!(
+            "AppWeb control reply: connection_id={connection_id} appid={appid} operation={} request_id={} reply={} error={}",
+            msg.cmd,
+            msg.req,
+            reply.reply,
+            reply.reply == "error"
+        );
         if msg.cmd == "remove" {
             self.close_client_connection(&msg.roomid, &msg.clientid);
         }
@@ -366,12 +393,18 @@ impl Collider {
         let Some(session) = self.sessions.remove(&connection_id) else {
             return;
         };
-        if let Session::Registered { roomid, clientid } = session {
-            let key = (roomid.clone(), clientid.clone());
-            if self.connections.get(&key) == Some(&connection_id) {
-                self.connections.remove(&key);
-                self.rooms.deregister(now, &roomid, &clientid);
+        match session {
+            Session::Registered { roomid, clientid } => {
+                let key = (roomid.clone(), clientid.clone());
+                if self.connections.get(&key) == Some(&connection_id) {
+                    self.connections.remove(&key);
+                    self.rooms.deregister(now, &roomid, &clientid);
+                }
             }
+            Session::App { appid } => log::info!(
+                "AppWeb control disconnected: connection_id={connection_id} appid={appid}"
+            ),
+            Session::Connected => {}
         }
     }
 
