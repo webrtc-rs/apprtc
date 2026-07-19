@@ -19,6 +19,12 @@ use tokio::sync::{mpsc, oneshot};
 
 const COMMAND_CAPACITY: usize = 1024;
 const SOCKET_OUTPUT_CAPACITY: usize = 1024;
+/// Maximum size of one signaling WebSocket message/frame.
+///
+/// SDP and trickle-ICE messages are normally only a few KiB, but a 1 MiB
+/// limit leaves room for larger browser-generated descriptions without
+/// allowing an unbounded allocation on the dedicated signaling host.
+const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 
 enum SocketOutput {
@@ -122,7 +128,10 @@ async fn websocket_upgrade(
     State(handle): State<ColliderHandle>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    upgrade.on_upgrade(move |socket| serve_socket(handle, socket))
+    upgrade
+        .max_message_size(MAX_WS_MESSAGE_SIZE)
+        .max_frame_size(MAX_WS_MESSAGE_SIZE)
+        .on_upgrade(move |socket| serve_socket(handle, socket))
 }
 
 async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {

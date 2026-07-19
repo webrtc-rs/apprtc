@@ -317,6 +317,7 @@ fn cors(mut response: Response, methods: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws_client::WsClient;
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
     use serde_json::Value;
