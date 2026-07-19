@@ -38,9 +38,8 @@ initiator election, two-member rooms, queued signaling messages, tokenless brows
 grace, fallback POST/DELETE signaling, HTML templates, static web assets, ICE configuration, and HTTP/HTTPS plus WS/WSS
 serving.
 
-The current executable supports P2P V1. The repository also contains the Sans-I/O SFU implementation and the
-architecture for P2P/SFU call modes, but V2 mode transitions and SFU worker integration are not yet enabled in the
-`apprtc` binary.
+The current binaries support P2P V1. The repository also contains the Sans-I/O SFU implementation and the architecture
+for P2P/SFU call modes, but V2 mode transitions and SFU worker integration are not yet enabled.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -51,13 +50,13 @@ The workspace has three Rust crates:
 
 | Crate                    | Responsibility                                                                                                                                                  |
 |--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)       | Executable composition, CLI parsing, logging, HTTP or TLS listener, and graceful shutdown.                                                                      |
+| [`apprtc`](apprtc)       | Standalone `appweb` and `signaling` binaries, CLI parsing, TLS listeners, logging, and graceful shutdown.                                                         |
 | [`appweb`](appweb)       | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                      |
 | [`signaling`](signaling) | Authoritative room/client state, V1 browser protocol, message queueing and relay, reconnect deadlines, Sans-I/O protocol layers, and the Axum WebSocket driver. |
 
-The initial deployment is an all-in-one process. `appweb` does not maintain a second room table: its HTTP handlers
-submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to the single serialized Collider owner task.
-Browser WebSocket traffic terminates directly in `signaling` and never passes through the web handlers.
+AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses a
+control WebSocket to submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to signaling. Browser
+WebSocket traffic connects directly to signaling and never passes through AppWeb.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -98,18 +97,22 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The integration tests are black-box clients of a real AppRTC TLS server. Run them locally in three steps from the
-repository root:
+The integration tests are black-box clients of real standalone AppWeb and signaling TLS servers:
 
 ```bash
-# 1. Start AppRTC on loopback in the background.
-cargo run -p apprtc -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info &
+# 1. Start signaling.
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --tls &
 
-# 2. Run the integration tests against that server.
+# 2. Start AppWeb.
+cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+  --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws \
+  --signaling-insecure-tls --tls &
+
+# 3. Run the integration tests.
 cargo test -p apprtc --test '*' -- --nocapture
 
-# 3. Stop the background server.
-kill $(pgrep -f "target/debug/apprtc") || true
+# 4. Stop both servers.
+kill $(pgrep -f "target/debug/(appweb|signaling)") || true
 ```
 
 CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the server log when the
@@ -117,37 +120,39 @@ job finishes.
 
 ## Run over HTTP and WebSocket
 
-Run this command from the repository root:
+Run signaling and AppWeb separately from the repository root:
 
 ```bash
-cargo run -p apprtc -- \
-  --host-ip 127.0.0.1 \
-  --port 8080 \
-  --web-root appweb \
-  --debug \
-  --level info
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081
+cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+  --public-url http://127.0.0.1:8080 --signaling-url ws://127.0.0.1:8081/ws
 ```
 
-The server prints:
+AppWeb prints:
 
 ```text
-AppRTC listening on http://127.0.0.1:8080
+AppWeb listening on http://127.0.0.1:8080/
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
-`--host-ip` controls the local listener. `--public-url` controls the browser-facing origin embedded in generated
-HTTP/WebSocket URLs. Without `--public-url`, the listener address and selected scheme are used.
+`--host-ip` and `--port` control each local listener. AppWeb's `--public-url` controls the browser-facing HTTP origin;
+`--signaling-url` controls the browser-facing WebSocket origin and must include `/ws`.
 
 ## Run over HTTPS and secure WebSocket
 
 Add `--tls` to serve real HTTPS and WSS from the same listener:
 
 ```bash
-cargo run -p apprtc -- \
+cargo run -p apprtc --bin signaling -- \
+  --host-ip 127.0.0.1 --port 8081 --tls
+cargo run -p apprtc --bin appweb -- \
   --host-ip 127.0.0.1 \
   --port 8080 \
   --web-root appweb \
+  --public-url https://127.0.0.1:8080 \
+  --signaling-url wss://127.0.0.1:8081/ws \
+  --signaling-insecure-tls \
   --tls \
   --debug \
   --level info
@@ -162,37 +167,42 @@ error.
 For a deployment, supply a certificate issued by a trusted authority. Both options must be supplied together:
 
 ```bash
-cargo run -p apprtc -- \
-  --host-ip 0.0.0.0 \
-  --public-url https://apprtc.example.com \
-  --port 443 \
-  --web-root appweb \
-  --tls \
+cargo run -p apprtc --bin signaling -- \
+  --host-ip 0.0.0.0 --public-url wss://sfu.example.com --port 443 --tls \
   --certificate /path/to/fullchain.pem \
   --private-key /path/to/privkey.pem
+
+cargo run -p apprtc --bin appweb -- \
+  --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
+  --signaling-url wss://sfu.example.com/ws --tls \
+  --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
 ```
 
 ## Command-line options
 
-Run `cargo run -p apprtc -- --help` for the authoritative list.
+Run `cargo run -p apprtc --bin appweb -- --help` or `cargo run -p apprtc --bin signaling -- --help` for the
+authoritative lists.
 
-| Option                         |                         Default | Description                                                        |
-|--------------------------------|--------------------------------:|--------------------------------------------------------------------|
-| `--host-ip <HOST-IP>`          |                     `127.0.0.1` | Local listener bind address.                                       |
-| `--public-url <URL>`           |       listener address/scheme | Browser-facing HTTP(S) origin for generated URLs.                  |
-| `-p, --port <PORT>`            |                          `8080` | HTTP/HTTPS and WS/WSS listening port.                              |
-| `--web-root <PATH>`            |                        `appweb` | Directory containing the HTML, JavaScript, CSS, and image assets.  |
-| `--tls`                        |                             off | Serve HTTPS and WSS instead of HTTP and WS.                        |
-| `--certificate <PATH>`         | bundled development certificate | PEM certificate chain used with `--tls`.                           |
-| `--private-key <PATH>`         |         bundled development key | PEM private key used with `--tls`.                                 |
-| `--ice-server-url <URLS>`      |                           empty | ICE server URL; repeat the option or provide comma-separated URLs. |
-| `--ice-server-base-url <URL>`  |              same AppRTC origin | External ICE credential service origin.                            |
-| `--ice-server-api-key <KEY>`   |                           empty | API key appended to the ICE credential service URL.                |
-| `--header-message <TEXT>`      |                           empty | Banner displayed by the web application.                           |
-| `--bypass-join-confirmation`   |                             off | Skip the browser's ready-to-join prompt.                           |
-| `-d, --debug`                  |                             off | Enable application logging.                                        |
-| `-l, --level <LEVEL>`          |                          `info` | Log filter: `error`, `warn`, `info`, `debug`, or `trace`.          |
-| `-o, --output-log-file <PATH>` |                          stdout | Truncate and write formatted logs to a file.                       |
+| Option | Default | Description |
+|---|---:|---|
+| `--host-ip <HOST-IP>` | `127.0.0.1` | Local listener bind address (both binaries). |
+| `--public-url <URL>` | listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
+| `-p, --port <PORT>` | `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port. |
+| `--web-root <PATH>` | `appweb` | Static asset directory (`appweb`). |
+| `--tls` | off | Serve HTTPS/WSS instead of HTTP/WS. |
+| `--certificate <PATH>` | bundled certificate | PEM certificate chain used with `--tls`. |
+| `--private-key <PATH>` | bundled key | PEM private key used with `--tls`. |
+| `--signaling-url <URL>` | none | Signaling control/browser WebSocket URL, including `/ws` (`appweb`). |
+| `--signaling-insecure-tls` | off | Disable verification for local self-signed signaling TLS (`appweb`). |
+| `--appid`, `--signaling-token` | `appweb-1`, empty | AppWeb control identity and token (`appweb`). |
+| `--ice-server-url <URLS>` | empty | ICE server URLs (`appweb`). |
+| `--ice-server-base-url <URL>` | AppWeb origin | External ICE credential service origin (`appweb`). |
+| `--ice-server-api-key <KEY>` | empty | API key for the ICE credential service (`appweb`). |
+| `--header-message <TEXT>` | empty | Banner displayed by the web application (`appweb`). |
+| `--bypass-join-confirmation` | off | Skip the browser ready-to-join prompt (`appweb`). |
+| `-d, --debug` | off | Enable application logging (both binaries). |
+| `-l, --level <LEVEL>` | `info` | Log filter (both binaries). |
+| `-o, --output-log-file <PATH>` | stdout | Write formatted logs to a file (both binaries). |
 
 Example ICE configuration:
 
@@ -231,7 +241,7 @@ A successful join returns the legacy shape consumed by `appweb/js/call.js`:
     "room_id": "example-room",
     "client_id": "12345678",
     "is_initiator": "true",
-    "wss_url": "ws://127.0.0.1:8080/ws",
+    "wss_url": "ws://127.0.0.1:8081/ws",
     "wss_post_url": "http://127.0.0.1:8080"
   }
 }
