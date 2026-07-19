@@ -42,7 +42,7 @@ pub trait RoomAuthority: Send + Sync {
 #[derive(Clone)]
 pub struct WebSocketAuthority {
     requests: mpsc::Sender<AuthorityRequest>,
-    next_req: Arc<AtomicU64>,
+    next_requestid: Arc<AtomicU64>,
 }
 
 type ControlSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -65,6 +65,7 @@ struct ConnectionOptions {
     appid: String,
     token: String,
     insecure_tls: bool,
+    next_requestid: Arc<AtomicU64>,
 }
 
 impl WebSocketAuthority {
@@ -78,11 +79,13 @@ impl WebSocketAuthority {
         token: &str,
         insecure_tls: bool,
     ) -> Result<Self, String> {
+        let next_requestid = Arc::new(AtomicU64::new(1));
         let options = ConnectionOptions {
             url: url.to_owned(),
             appid: appid.to_owned(),
             token: token.to_owned(),
             insecure_tls,
+            next_requestid: next_requestid.clone(),
         };
         let socket = tokio::time::timeout(CONNECT_TIMEOUT, connect_control(&options, 0))
             .await
@@ -91,12 +94,12 @@ impl WebSocketAuthority {
         tokio::spawn(run_connection(options, socket, receiver));
         Ok(Self {
             requests,
-            next_req: Arc::new(AtomicU64::new(1)),
+            next_requestid,
         })
     }
 
     async fn request(&self, request: AppControlRequest) -> Result<AppControlResponse, String> {
-        let req = request.req;
+        let requestid = request.requestid;
         let operation = request.cmd.clone();
         let (response_tx, response_rx) = oneshot::channel();
         self.requests
@@ -109,22 +112,22 @@ impl WebSocketAuthority {
         let started = Instant::now();
         let result = tokio::time::timeout(REQUEST_TIMEOUT, response_rx)
             .await
-            .map_err(|_| format!("signaling {operation} request {req} timed out"))?
+            .map_err(|_| format!("signaling {operation} request {requestid} timed out"))?
             .map_err(|_| "signaling control worker stopped".to_string())?;
         match &result {
             Ok(_) => log::debug!(
-                "Signaling control request completed: operation={operation} request_id={req} elapsed_ms={}",
+                "Signaling control request completed: operation={operation} requestid={requestid} elapsed_ms={}",
                 started.elapsed().as_millis()
             ),
             Err(error) => log::warn!(
-                "Signaling control request failed: operation={operation} request_id={req} elapsed_ms={} error={error}",
+                "Signaling control request failed: operation={operation} requestid={requestid} elapsed_ms={} error={error}",
                 started.elapsed().as_millis()
             ),
         }
         result
     }
-    fn req(&self) -> u64 {
-        self.next_req.fetch_add(1, Ordering::Relaxed)
+    fn requestid(&self) -> u64 {
+        self.next_requestid.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -161,7 +164,15 @@ async fn connect_control(
     );
     let started = Instant::now();
     let mut socket = open_socket(options).await?;
-    let register = AppControlRequest::register(options.appid.clone(), options.token.clone());
+    let requestid = options.next_requestid.fetch_add(1, Ordering::Relaxed);
+    let register =
+        AppControlRequest::register(requestid, options.appid.clone(), options.token.clone());
+    log::info!(
+        "Signaling control registration request: url={} requestid={} appid={}",
+        options.url,
+        requestid,
+        options.appid
+    );
     socket
         .send(Message::text(register.to_wire()))
         .await
@@ -169,10 +180,11 @@ async fn connect_control(
     let Some(Ok(Message::Text(frame))) = socket.next().await else {
         return Err("signaling control socket closed during registration".into());
     };
-    Controller::registration_ack(&frame)?;
+    Controller::registration_ack(&frame, requestid)?;
     log::info!(
-        "Signaling control WebSocket registered: url={} appid={} attempt={} elapsed_ms={}",
+        "Signaling control registration response: url={} requestid={} appid={} result=OK registered=true attempt={} elapsed_ms={}",
         options.url,
+        requestid,
         options.appid,
         attempt,
         started.elapsed().as_millis()
@@ -201,7 +213,7 @@ async fn run_connection(
                 if request.response.is_closed() {
                     continue;
                 }
-                let request_id = request.request.req;
+                let request_id = request.request.requestid;
                 let outcome = match tokio::time::timeout(HEARTBEAT_TIMEOUT, exchange(&mut socket, request.request, request_id)).await {
                     Ok(outcome) => outcome,
                     Err(_) => Err(format!("signaling control request {request_id} timed out waiting for response")),
@@ -209,7 +221,7 @@ async fn run_connection(
                 let failed = outcome.is_err();
                 let _ = request.response.send(outcome);
                 if failed {
-                    log::warn!("Signaling control connection lost during request: appid={} request_id={request_id}", options.appid);
+                    log::warn!("Signaling control connection lost during request: appid={} requestid={request_id}", options.appid);
                     socket = reconnect(&options, &mut controller).await;
                     heartbeat.reset();
                 }
@@ -252,6 +264,8 @@ async fn exchange(
     request: AppControlRequest,
     request_id: u64,
 ) -> Result<AppControlResponse, String> {
+    let operation = request.cmd.clone();
+    log::info!("Signaling control request: operation={operation} requestid={request_id}");
     socket
         .send(Message::text(request.to_wire()))
         .await
@@ -265,6 +279,11 @@ async fn exchange(
         match Controller::classify_frame(frame) {
             FrameAction::Text(text) => {
                 if let Some(response) = Controller::correlate_response(&text, request_id)? {
+                    log::info!(
+                        "Signaling control response: operation={operation} requestid={request_id} result={} reason={}",
+                        response.result.as_deref().unwrap_or("MISSING"),
+                        response.reason.as_deref().unwrap_or("")
+                    );
                     return Ok(response);
                 }
             }
@@ -360,7 +379,7 @@ impl RoomAuthority for WebSocketAuthority {
         is_loopback: bool,
     ) -> Result<Admission, String> {
         self.request(AppControlRequest::admit(
-            self.req(),
+            self.requestid(),
             roomid,
             clientid,
             is_loopback,
@@ -369,26 +388,34 @@ impl RoomAuthority for WebSocketAuthority {
         .admission()
     }
     async fn remove(&self, roomid: String, clientid: String) -> Result<(), String> {
-        self.request(AppControlRequest::remove(self.req(), roomid, clientid))
-            .await?
-            .ack("remove failed")
-            .map(|_| ())
+        self.request(AppControlRequest::remove(
+            self.requestid(),
+            roomid,
+            clientid,
+        ))
+        .await?
+        .ack("remove failed")
+        .map(|_| ())
     }
     async fn occupancy(&self, roomid: String) -> Result<usize, String> {
-        self.request(AppControlRequest::occupancy(self.req(), roomid))
+        self.request(AppControlRequest::occupancy(self.requestid(), roomid))
             .await?
             .occupancy_count()
     }
     async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String> {
-        self.request(AppControlRequest::inject(self.req(), roomid, clientid, msg))
-            .await?
-            .ack("inject failed")
-            .map(|_| ())
+        self.request(AppControlRequest::inject(
+            self.requestid(),
+            roomid,
+            clientid,
+            msg,
+        ))
+        .await?
+        .ack("inject failed")
+        .map(|_| ())
     }
     async fn status(&self) -> Result<StatusSnapshot, String> {
-        Ok(self
-            .request(AppControlRequest::status(self.req()))
+        self.request(AppControlRequest::status(self.requestid()))
             .await?
-            .status_snapshot())
+            .status_snapshot()
     }
 }

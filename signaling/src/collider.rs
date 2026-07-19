@@ -7,7 +7,6 @@ use crate::messages::{
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
 use sansio::Protocol;
-use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::time::{Duration, Instant};
@@ -152,13 +151,29 @@ impl Collider {
             }
         };
         if matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
-            let msg: AppControlRequest =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let msg: AppControlRequest = match serde_json::from_value(value) {
+                Ok(msg) => msg,
+                Err(error) => {
+                    log::warn!(
+                        "AppWeb control request rejected: connection_id={connection_id} reason=invalid_frame error={error}"
+                    );
+                    self.fail_connection(connection_id, "Invalid app control requestid");
+                    return Ok(());
+                }
+            };
             return self.handle_app_message(connection_id, msg, now);
         }
         if value.get("cmd").and_then(|v| v.as_str()) == Some("app") {
-            let msg: AppControlRequest =
-                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            let msg: AppControlRequest = match serde_json::from_value(value) {
+                Ok(msg) => msg,
+                Err(error) => {
+                    log::warn!(
+                        "AppWeb control registration rejected: connection_id={connection_id} reason=invalid_frame error={error}"
+                    );
+                    self.fail_connection(connection_id, "Invalid app control registration");
+                    return Ok(());
+                }
+            };
             return self.handle_app_message(connection_id, msg, now);
         }
         let msg: WsClientMsg = match serde_json::from_value(value) {
@@ -189,35 +204,76 @@ impl Collider {
         now: Instant,
     ) -> Result<(), String> {
         if !matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
-            if msg.cmd != "app" || msg.appid.is_empty() {
-                log::warn!(
-                    "AppWeb control registration rejected: connection_id={connection_id} appid={} reason=invalid_registration",
-                    msg.appid
-                );
-                self.fail_connection(connection_id, "Invalid app control registration");
-                return Ok(());
-            }
             log::info!(
-                "AppWeb control registered: connection_id={connection_id} appid={} token_present={}",
+                "AppWeb control registration request: connection_id={connection_id} requestid={} appid={} token_present={}",
+                msg.requestid,
                 msg.appid,
                 !msg.token.is_empty()
             );
-            self.sessions
-                .insert(connection_id, Session::App { appid: msg.appid });
+            if msg.cmd != "app" || msg.requestid == 0 || msg.appid.is_empty() {
+                log::warn!(
+                    "AppWeb control registration rejected: connection_id={connection_id} requestid={} appid={} reason=invalid_registration",
+                    msg.requestid,
+                    msg.appid
+                );
+                self.websocket_errors = self.websocket_errors.saturating_add(1);
+                self.browser_outputs.push_back(BrowserOutput::Text {
+                    connection_id,
+                    text: serde_json::to_string(&AppControlResponse {
+                        requestid: msg.requestid,
+                        result: Some("ERR".into()),
+                        reason: Some("Invalid app control registration".into()),
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                });
+                self.browser_outputs
+                    .push_back(BrowserOutput::Close { connection_id });
+                log::info!(
+                    "AppWeb control registration response: connection_id={connection_id} requestid={} appid={} result=ERR reason=Invalid app control registration registered=false",
+                    msg.requestid,
+                    msg.appid
+                );
+                return Ok(());
+            }
+            let appid = msg.appid;
+            self.sessions.insert(
+                connection_id,
+                Session::App {
+                    appid: appid.clone(),
+                },
+            );
             self.browser_outputs.push_back(BrowserOutput::Text {
                 connection_id,
-                text: json!({"control":"registered"}).to_string(),
+                text: serde_json::to_string(&AppControlResponse {
+                    requestid: msg.requestid,
+                    result: Some("OK".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
             });
+            log::info!(
+                "AppWeb control registration response: connection_id={connection_id} requestid={} appid={appid} result=OK registered=true",
+                msg.requestid
+            );
             return Ok(());
         }
         let appid = match self.sessions.get(&connection_id) {
             Some(Session::App { appid }) => appid.clone(),
             _ => unreachable!("AppWeb session was checked above"),
         };
+        if msg.requestid == 0 {
+            log::warn!(
+                "AppWeb control command rejected: connection_id={connection_id} appid={appid} operation={} reason=missing_requestid",
+                msg.cmd
+            );
+            self.fail_connection(connection_id, "Invalid app control requestid");
+            return Ok(());
+        }
         log::info!(
-            "AppWeb control command: connection_id={connection_id} appid={appid} operation={} request_id={} room_id={} client_id={}",
+            "AppWeb control command: connection_id={connection_id} appid={appid} operation={} requestid={} room_id={} client_id={}",
             msg.cmd,
-            msg.req,
+            msg.requestid,
             msg.roomid,
             msg.clientid
         );
@@ -227,17 +283,16 @@ impl Collider {
                 .join(now, &msg.roomid, &msg.clientid, msg.is_loopback)
             {
                 Ok((is_initiator, messages)) => AppControlResponse {
-                    response: "admitted".into(),
-                    req: msg.req,
-                    result: Some("SUCCESS".into()),
+                    requestid: msg.requestid,
+                    result: Some("OK".into()),
                     is_initiator: Some(is_initiator),
                     messages: Some(messages),
                     ..Default::default()
                 },
                 Err(result) => AppControlResponse {
-                    response: "error".into(),
-                    req: msg.req,
-                    result: Some(result),
+                    requestid: msg.requestid,
+                    result: Some("ERR".into()),
+                    reason: Some(result),
                     ..Default::default()
                 },
             },
@@ -247,14 +302,14 @@ impl Collider {
                 // browser WebSocket after the control response is delivered.
                 self.rooms.leave(&msg.roomid, &msg.clientid);
                 AppControlResponse {
-                    response: "removed".into(),
-                    req: msg.req,
+                    requestid: msg.requestid,
+                    result: Some("OK".into()),
                     ..Default::default()
                 }
             }
             "occupancy" => AppControlResponse {
-                response: "occupancy".into(),
-                req: msg.req,
+                requestid: msg.requestid,
+                result: Some("OK".into()),
                 count: Some(self.rooms.occupancy(&msg.roomid)),
                 ..Default::default()
             },
@@ -265,21 +320,21 @@ impl Collider {
                 Ok(()) => {
                     self.drain_room_writes();
                     AppControlResponse {
-                        response: "injected".into(),
-                        req: msg.req,
+                        requestid: msg.requestid,
+                        result: Some("OK".into()),
                         ..Default::default()
                     }
                 }
                 Err(result) => AppControlResponse {
-                    response: "error".into(),
-                    req: msg.req,
-                    result: Some(result),
+                    requestid: msg.requestid,
+                    result: Some("ERR".into()),
+                    reason: Some(result),
                     ..Default::default()
                 },
             },
             "status" => AppControlResponse {
-                response: "status".into(),
-                req: msg.req,
+                requestid: msg.requestid,
+                result: Some("OK".into()),
                 rooms: Some(self.rooms.room_count()),
                 clients: Some(self.rooms.client_count()),
                 websocket_connections: Some(self.rooms.ws_count()),
@@ -288,9 +343,9 @@ impl Collider {
                 ..Default::default()
             },
             _ => AppControlResponse {
-                response: "error".into(),
-                req: msg.req,
-                result: Some("Invalid app command".into()),
+                requestid: msg.requestid,
+                result: Some("ERR".into()),
+                reason: Some("Invalid app command".into()),
                 ..Default::default()
             },
         };
@@ -298,12 +353,12 @@ impl Collider {
             connection_id,
             text: serde_json::to_string(&response).unwrap(),
         });
-        log::debug!(
-            "AppWeb control response: connection_id={connection_id} appid={appid} operation={} request_id={} response={} error={}",
+        log::info!(
+            "AppWeb control response: connection_id={connection_id} appid={appid} operation={} requestid={} result={} reason={}",
             msg.cmd,
-            msg.req,
-            response.response,
-            response.response == "error"
+            msg.requestid,
+            response.result.as_deref().unwrap_or("MISSING"),
+            response.reason.as_deref().unwrap_or("")
         );
         if msg.cmd == "remove" {
             self.close_client_connection(&msg.roomid, &msg.clientid);
@@ -584,34 +639,88 @@ mod tests {
         text(
             &mut collider,
             99,
+            r#"{"cmd":"app","requestid":"500","appid":"frontend-1"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text == r#"{"requestid":"500","result":"OK"}"#)
+        );
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"admit","requestid":"1","roomid":"room","clientid":"client"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"requestid\":\"1\"") && text.contains("\"result\":\"OK\"") && text.contains("\"is_initiator\":true"))
+        );
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"occupancy","requestid":"2","roomid":"room"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"requestid\":\"2\"") && text.contains("\"result\":\"OK\"") && text.contains("\"count\":1"))
+        );
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"status","requestid":"3"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"requestid\":\"3\"") && text.contains("\"result\":\"OK\"") && text.contains("\"rooms\":1"))
+        );
+    }
+
+    #[test]
+    fn app_role_requires_requestid_for_registration_and_every_command() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+
+        connect(&mut collider, 98);
+        text(
+            &mut collider,
+            98,
             r#"{"cmd":"app","appid":"frontend-1"}"#,
             now,
         );
-        assert!(
-            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("registered"))
+        assert_error_and_close(&mut collider, 98, "Invalid app control registration");
+
+        connect(&mut collider, 97);
+        text(
+            &mut collider,
+            97,
+            r#"{"cmd":"app","requestid":"499","appid":""}"#,
+            now,
         );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 97,
+                text: r#"{"requestid":"499","result":"ERR","reason":"Invalid app control registration"}"#.into(),
+            })
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Close { connection_id: 97 })
+        );
+
+        connect(&mut collider, 99);
         text(
             &mut collider,
             99,
-            r#"{"cmd":"admit","req":1,"roomid":"room","clientid":"client"}"#,
+            r#"{"cmd":"app","requestid":"500","appid":"frontend-1"}"#,
             now,
         );
-        assert!(
-            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("admitted"))
-        );
-        text(
-            &mut collider,
-            99,
-            r#"{"cmd":"occupancy","req":2,"roomid":"room"}"#,
-            now,
-        );
-        assert!(
-            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("occupancy") && text.contains("\"count\":1"))
-        );
-        text(&mut collider, 99, r#"{"cmd":"status","req":3}"#, now);
-        assert!(
-            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"response\":\"status\"") && text.contains("\"rooms\":1"))
-        );
+        assert!(matches!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text { connection_id: 99, text })
+                if text == r#"{"requestid":"500","result":"OK"}"#
+        ));
+        text(&mut collider, 99, r#"{"cmd":"status"}"#, now);
+        assert_error_and_close(&mut collider, 99, "Invalid app control requestid");
     }
 
     fn authority(

@@ -58,17 +58,17 @@ async fn preserves_appweb_signaling_status_contract() -> Result<()> {
     let mut socket = ws_connect().await?;
     ws_send(
         &mut socket,
-        json!({"cmd":"app", "appid":"contract-test", "token":""}),
+        json!({"cmd":"app", "requestid":"500", "appid":"contract-test", "token":""}),
     )
     .await?;
     assert_eq!(
         ws_receive_json(&mut socket).await?,
-        json!({"control":"registered"})
+        json!({"requestid":"500", "result":"OK"})
     );
-    ws_send(&mut socket, json!({"cmd":"status", "req":1})).await?;
+    ws_send(&mut socket, json!({"cmd":"status", "requestid":"1"})).await?;
     let status = ws_receive_json(&mut socket).await?;
-    assert_eq!(status["response"], "status");
-    assert_eq!(status["req"], 1);
+    assert_eq!(status["requestid"], "1");
+    assert_eq!(status["result"], "OK");
     for field in [
         "rooms",
         "clients",
@@ -81,6 +81,11 @@ async fn preserves_appweb_signaling_status_contract() -> Result<()> {
             "status field {field} must be an unsigned integer"
         );
     }
+    ws_send(&mut socket, json!({"cmd":"unknown", "requestid":"2"})).await?;
+    assert_eq!(
+        ws_receive_json(&mut socket).await?,
+        json!({"requestid":"2", "result":"ERR", "reason":"Invalid app command"})
+    );
     socket.close(None).await?;
     Ok(())
 }

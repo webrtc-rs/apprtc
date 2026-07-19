@@ -108,15 +108,16 @@ It must not require a browser, hub, or wire-protocol revision.
 
 ## 3. One WebSocket hub, three authenticated roles
 
-Every connection reaches `wss://signaling/ws`; its first frame chooses an authenticated role. V2 browser credentials are
+Every connection reaches `wss://signaling/ws`; its first frame chooses a role. V2 browser credentials are
 admission tokens created by `appweb`; the v1 browser path deliberately retains its current tokenless framing. Service
-roles use mTLS or a rotated worker/app token and should normally be reachable only on a private listener.
+roles are intended to use mTLS or a rotated worker/app token and should normally be reachable only on a private
+listener. The currently implemented P2P V1 AppWeb control role transports but does not validate its token (§8.4).
 
 | Role              | First frame                                        | Direction after registration                                                               |
 |-------------------|----------------------------------------------------|--------------------------------------------------------------------------------------------|
 | Browser v1        | `{cmd:"register", roomid, clientid}`               | Existing `{cmd:"send", msg}` and `{msg}` framing, no new required field                    |
 | Browser v2        | `{cmd:"register", roomid, clientid, ver:2, token}` | Same `send`/`msg` framing plus a required `epoch` on `send` and v2-only `{control}` pushes |
-| AppRTC front door | `{cmd:"app", appid, token}`                        | `admit`, `remove`, `occupancy`, v1 `inject`; replies correlated by `req`                   |
+| AppRTC front door | `{cmd:"app", requestid, appid, token}`             | `admit`, `remove`, `occupancy`, v1 `inject`, `status`; every reply echoes `requestid`      |
 | SFU worker        | `{cmd:"sfu", sfuid, token, capacity}`              | lifecycle and addressed SDP frames in both directions                                      |
 
 The hub validates a service role before processing any other command. A V2 browser may register only after an `admit`
@@ -297,7 +298,7 @@ corresponding `SFUEvent::SessionDescription`.
 ### 4.1 P2P, one or two members
 
 1. Browser calls `POST /join/{room}` on `appweb`.
-2. `appweb` sends `admit(req, roomid, clientid, ver)` over its control WebSocket.
+2. `appweb` sends `admit(requestid, roomid, clientid, ver)` over its control WebSocket.
 3. `signaling` creates the member, elects the first member as initiator, and replies.
 4. Browser registers its own WebSocket with `signaling`.
 5. Every browser `{cmd:"send"}` is relayed to the other member; early messages queue and flush when that member
@@ -701,80 +702,67 @@ subscribe re-offers.
 ### 8.4 AppRTC control WebSocket
 
 `appweb` keeps HTTP request/response compatibility but delegates every room mutation to the hub. These frames are
-private service protocol, not browser API. One connection has the state `Connecting → Registered → Closed`; its first
-frame must be `app`.
+private service protocol, not browser API. One AppWeb process maintains one steady-state control connection with the
+state `Connecting → Registered → Reconnecting → Registered → Closed`; its first frame after every connection or
+reconnection must be `app`.
 
-This protocol is the WebSocket binding of the internal `RoomAuthority` interface (`admit`, `remove`, `occupancy`,
-`inject`, plus the `client-disconnected` push). A merged `appweb`+`signaling` binary implements `RoomAuthority` as
-direct in-process calls; the `req` correlation, cached terminal replies, and reconnect/replay rules below are properties
-of this socket binding only and must not be reimplemented in-process. In every deployment mode, browser `send`/`msg`
-relay traffic terminates at the `signaling` module's own listener and never routes through `appweb` — merging the
-processes merges listeners, not message paths.
+This protocol is the WebSocket binding of the `RoomAuthority` interface currently implemented for P2P V1: `admit`,
+`remove`, `occupancy`, `inject`, and `status`. AppWeb and signaling run as separate processes. Browser `send`/`msg`
+relay traffic terminates at signaling's own `/ws` listener and never routes through AppWeb.
 
 ```text
-AppId          = random non-empty process-instance string; stable across socket reconnects, regenerated on process restart
-ControlReqId   = canonical decimal u64 string, monotonic per appid, never reused across reconnects
-Version        = 1 | 2
-Mode           = "p2p" | "upgrading" | "sfu" | "downgrading"
+AppId          = non-empty configured string; default "appweb-1"; stable across reconnects
+ControlRequestId = canonical decimal u64 string, monotonic within one AppWeb process
 ```
 
-#### AppRTC → signaling commands
+#### appweb → signaling commands
 
-| Frame       | Required fields                                            | Semantics                                                                                                                                                                         | Reply                              |
-|-------------|------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------|
-| `app`       | `appid`, `token`                                           | Authenticate and bind this control socket to an AppRTC instance. Must be first.                                                                                                   | `registered` or `error` then close |
-| `admit`     | `req`, `roomid`, `clientid`, `ver`; optional `is_loopback` | Create/admit a member, pin room version if first member, elect initiator, and possibly begin a v2 upgrade.                                                                        | `admit`                            |
-| `remove`    | `req`, `roomid`, `clientid`, `ver`                         | Remove a member and reply `removed` as soon as membership is removed; in SFU mode the worker `leave` is issued asynchronously (idempotent, hub-owned) and never delays the reply. | `removed`                          |
-| `occupancy` | `req`, `roomid`, `ver`                                     | Read current room occupancy/mode for a room page.                                                                                                                                 | `occupancy`                        |
-| `inject`    | `req`, `roomid`, `clientid`, `ver:1`, `msg`                | V1 only: implement legacy `/message` and WSS POST fallback queue-or-relay.                                                                                                        | `injected`                         |
+| Frame       | Required fields                                         | Current P2P V1 semantics                                               | Successful reply fields                                                        |
+|-------------|---------------------------------------------------------|------------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| `app`       | `requestid`, `appid`; optional `token`                  | Claim the AppWeb control role. Must be the first frame.                 | `requestid`, `result`; a validly framed rejection also carries `reason`, then the socket closes |
+| `admit`     | `requestid`, `roomid`, `clientid`; optional `is_loopback` | Admit a room member, enforce capacity, and elect the initiator.         | `requestid`, `result`, `is_initiator`, `messages`                               |
+| `remove`    | `requestid`, `roomid`, `clientid`                      | Remove a member and close its live browser WebSocket after responding. | `requestid`, `result`                                                         |
+| `occupancy` | `requestid`, `roomid`                                  | Return current room occupancy.                                         | `requestid`, `result`, `count`                                                |
+| `inject`    | `requestid`, `roomid`, `clientid`, `msg`               | Implement legacy `/message` and POST fallback queue-or-relay.           | `requestid`, `result`                                                         |
+| `status`    | `requestid`                                            | Return signaling room, client, WebSocket, and error counters.           | `requestid`, `result`, status counters                                        |
+
+The current implementation requires a non-empty `appid`. It transports the optional `token` but does not yet validate
+it; production authentication is future work.
 
 ```jsonc
 // registration
-{ "cmd":"app", "appid":"edge-a-8f31", "token":"..." }
+{ "cmd":"app", "requestid":"500", "appid":"edge-a-8f31", "token":"..." }
 
-// v1 uses opaque string IDs; v2 uses canonical decimal u64 strings
-{ "cmd":"admit", "req":"501", "roomid":"legacy-room", "clientid":"old-client", "ver":1 }
-{ "cmd":"admit", "req":"502", "roomid":"42", "clientid":"101", "ver":2 }
-{ "cmd":"remove", "req":"503", "roomid":"42", "clientid":"101", "ver":2 }
-{ "cmd":"occupancy", "req":"504", "roomid":"42", "ver":2 }
-{ "cmd":"inject", "req":"505", "roomid":"legacy-room", "clientid":"old-client", "ver":1, "msg":"..." }
+{ "cmd":"admit", "requestid":"501", "roomid":"legacy-room", "clientid":"old-client" }
+{ "cmd":"remove", "requestid":"502", "roomid":"legacy-room", "clientid":"old-client" }
+{ "cmd":"occupancy", "requestid":"503", "roomid":"legacy-room" }
+{ "cmd":"inject", "requestid":"504", "roomid":"legacy-room", "clientid":"old-client", "msg":"..." }
+{ "cmd":"status", "requestid":"505" }
 ```
 
-#### signaling → AppRTC replies and pushes
+#### signaling → appweb responses
 
-Every command with `req` receives exactly one terminal reply. Repeating a command with the same `(appid, req)` returns
-the cached terminal reply; this lets an HTTP handler retry safely after a control-socket write/read uncertainty.
+Every command, including registration, receives exactly one reply carrying the same nonzero canonical decimal-string `requestid`. The request's `cmd` and its `requestid` identify the reply, so a separate response-type discriminator would be redundant and is deliberately omitted. To align with Rust's `Result`, every reply carries `result:"OK"` or `result:"ERR"`; an error reply also carries its operation-specific code or diagnostic in `reason`.
 
 ```jsonc
-{ "reply":"registered", "result":"SUCCESS", "appid":"edge-a-8f31" }
-{ "reply":"admit", "req":"501", "result":"SUCCESS", "is_initiator":true }
-{ "reply":"admit", "req":"502", "result":"SUCCESS", "mode":"sfu", "epoch":"1" }
-{ "reply":"removed", "req":"503", "result":"SUCCESS" }
-{ "reply":"occupancy", "req":"504", "result":"SUCCESS", "count":2, "mode":"p2p", "epoch":"0" }
-{ "reply":"injected", "req":"505", "result":"SUCCESS" }
-{ "reply":"error", "req":"502", "code":"INVALID_ROOM_ID", "reason":"..." }
-
-// unsolicited hub event: the hub already removed the membership on grace expiry and,
-// in SFU mode, already issued the worker `leave` — appweb is informed, not consulted
-{ "event":"client-disconnected", "roomid":"42", "clientid":"101", "ver":2, "reason":"register_timeout" }
+{ "requestid":"500", "result":"OK" }
+{ "requestid":"501", "result":"OK", "is_initiator":true, "messages":[] }
+{ "requestid":"502", "result":"OK" }
+{ "requestid":"503", "result":"OK", "count":1 }
+{ "requestid":"504", "result":"OK" }
+{ "requestid":"505", "result":"OK", "rooms":1, "clients":1, "websocket_connections":1, "total_websocket_connections":2, "websocket_errors":0 }
+{ "requestid":"501", "result":"ERR", "reason":"DUPLICATE_CLIENT" }
 ```
 
-For v2, `admit` and `occupancy` replies carry the room's current signal `epoch` as a decimal string — this is how
-`appweb` populates the `/v2/join` response's `epoch` without holding room state. The `admit` reply also carries
-`is_initiator`: always for `ver:1`, and for `ver:2` only when `mode` is `"p2p"` (omitted for `"sfu"`, mirroring the
-browser-facing rule) — this is likewise how the stateless `appweb` populates the join response's `is_initiator`.
+Admission failures use `result:"ERR"` with a legacy reason such as `FULL` or `DUPLICATE_CLIENT`. V1 `roomid` and `clientid` remain opaque non-empty strings. The current control protocol has no response discriminator, `ver`, `mode`, `epoch`, `code`, terminal-response cache, request replay, or unsolicited push events. Those fields and behaviors require a future versioned extension.
 
-`result` is one of `SUCCESS`, `FULL`, `DUPLICATE_CLIENT`, or `ERROR`; `code` refines `ERROR` (`UNAUTHORIZED`,
-`INVALID_ROOM_ID`, `INVALID_CLIENT_ID`, `VERSION_MISMATCH`, `NO_SFU_AVAILABLE`, `ROOM_TRANSITION`, `NOT_FOUND`, or
-`INTERNAL`). `inject` with `ver:2`, or a version change for an existing room, returns `VERSION_MISMATCH`. For `ver:1`,
-identifiers are opaque strings. For `ver:2`, they must be canonical decimal `u64` strings.
+A missing, zero, non-decimal, or out-of-range `requestid` makes a frame malformed. Because signaling then has no valid correlation identifier to echo, it logs the protocol violation and closes the socket without an AppWeb control reply. If the ID is valid but another field or operation is invalid, signaling sends the correlated `ERR` reply before closing when closure is required.
 
-If the control socket disconnects, `appweb` fails unresolved HTTP requests with a retryable error; it does not invent
-occupancy or initiator state locally. On reconnect it re-registers the same process-instance `appid` and may resend only
-requests whose `req` has not received a terminal reply. A process restart creates a new `appid` before opening its first
-control socket. Because `req` values are never reused for one live `appid`, the `(appid, req)` reply cache — retained
-for a bounded window — stays unambiguous; a per-connection `req` namespace would let a new session's request collide
-with a previous session's cached reply.
+AppWeb sends a WebSocket Ping every 30 seconds and requires a Pong within 10 seconds. On connection loss it fails the
+in-flight request, reconnects with exponential backoff plus jitter (1–30 seconds), and re-registers the same configured
+`appid`. It does not automatically replay a request that may already have reached signaling; later requests use the
+recovered connection. Connection/registration attempts time out after 10 seconds, and an HTTP-side authority request
+times out after 15 seconds. AppWeb and signaling log every valid control request and reply at INFO with its operation and `requestid`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect lifecycle events are also logged, without tokens or signaling payloads.
 
 ### 8.5 SFU worker WebSocket
 
@@ -994,7 +982,7 @@ sequenceDiagram
     Note over C,F: Leave and SFU room maintenance
     C->>AR: POST v2 leave
     AR->>S: remove C from room
-    Note over S: A WS disconnect past grace triggers the same removal in the hub, which informs appweb via client-disconnected
+    Note over S: A WS disconnect past grace triggers removal in the hub; a future v2 extension may also notify appweb
     S->>F: C leaves room with lifecycle ID
     F->>F: apply SFUEvent Leave
     F-->>S: C left room with lifecycle ID

@@ -77,21 +77,14 @@ impl Controller {
         request_id: u64,
     ) -> Result<Option<AppControlResponse>, String> {
         let response = AppControlResponse::from_wire(text)?;
-        Ok((response.req == request_id).then_some(response))
+        Ok((response.requestid == request_id).then_some(response))
     }
 
-    /// The response to the `app` registration frame must be `{"control":"registered"}`.
-    pub(crate) fn registration_ack(frame: &str) -> Result<(), String> {
-        let registered = serde_json::from_str::<serde_json::Value>(frame)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("control")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some("registered");
+    /// Registration uses the same response envelope as other control operations.
+    pub(crate) fn registration_ack(frame: &str, expected_requestid: u64) -> Result<(), String> {
+        let response = AppControlResponse::from_wire(frame)?;
+        let registered =
+            response.result.as_deref() == Some("OK") && response.requestid == expected_requestid;
         if registered {
             Ok(())
         } else {
@@ -127,20 +120,21 @@ impl Controller {
 
 /// Response→domain conversions, as methods on the response itself.
 pub(crate) trait ControlResponseExt: Sized {
-    /// An `error` response carries its message in `result`; `fallback` covers a
-    /// malformed error response that omitted it.
+    /// Every successful response carries `result: "OK"`; any other result
+    /// is the operation's error, and `fallback` covers a malformed omission.
     fn ack(self, fallback: &str) -> Result<Self, String>;
     fn admission(self) -> Result<Admission, String>;
     fn occupancy_count(self) -> Result<usize, String>;
-    fn status_snapshot(self) -> StatusSnapshot;
+    fn status_snapshot(self) -> Result<StatusSnapshot, String>;
 }
 
 impl ControlResponseExt for AppControlResponse {
     fn ack(self, fallback: &str) -> Result<Self, String> {
-        if self.response == "error" {
-            Err(self.result.unwrap_or_else(|| fallback.to_string()))
-        } else {
-            Ok(self)
+        match self.result.as_deref() {
+            Some("OK") => Ok(self),
+            Some("ERR") => Err(self.reason.unwrap_or_else(|| fallback.to_string())),
+            Some(result) => Err(format!("invalid control result: {result}")),
+            None => Err(fallback.to_string()),
         }
     }
 
@@ -152,24 +146,23 @@ impl ControlResponseExt for AppControlResponse {
         })
     }
 
-    fn occupancy_count(mut self) -> Result<usize, String> {
-        match self.count {
+    fn occupancy_count(self) -> Result<usize, String> {
+        let response = self.ack("occupancy failed")?;
+        match response.count {
             Some(count) => Ok(count),
-            None => Err(self
-                .result
-                .take()
-                .unwrap_or_else(|| "occupancy failed".into())),
+            None => Err("occupancy failed".into()),
         }
     }
 
-    fn status_snapshot(self) -> StatusSnapshot {
-        StatusSnapshot {
-            rooms: self.rooms.unwrap_or(0),
-            clients: self.clients.unwrap_or(0),
-            websocket_connections: self.websocket_connections.unwrap_or(0),
-            total_websocket_connections: self.total_websocket_connections.unwrap_or(0),
-            websocket_errors: self.websocket_errors.unwrap_or(0),
-        }
+    fn status_snapshot(self) -> Result<StatusSnapshot, String> {
+        let response = self.ack("status failed")?;
+        Ok(StatusSnapshot {
+            rooms: response.rooms.unwrap_or(0),
+            clients: response.clients.unwrap_or(0),
+            websocket_connections: response.websocket_connections.unwrap_or(0),
+            total_websocket_connections: response.total_websocket_connections.unwrap_or(0),
+            websocket_errors: response.websocket_errors.unwrap_or(0),
+        })
     }
 }
 
@@ -227,11 +220,11 @@ mod tests {
     #[test]
     fn replies_are_correlated_by_request_id() {
         let matched =
-            Controller::correlate_response(r#"{"response":"status","req":5}"#, 5).unwrap();
-        assert_eq!(matched.unwrap().response, "status");
+            Controller::correlate_response(r#"{"requestid":"5","result":"OK"}"#, 5).unwrap();
+        assert_eq!(matched.unwrap().requestid, 5);
         // A stale response for an earlier request is skipped, not an error.
         assert!(
-            Controller::correlate_response(r#"{"response":"status","req":4}"#, 5)
+            Controller::correlate_response(r#"{"requestid":"4","result":"OK"}"#, 5)
                 .unwrap()
                 .is_none()
         );
@@ -241,17 +234,16 @@ mod tests {
 
     #[test]
     fn registration_requires_the_registered_control_frame() {
-        assert!(Controller::registration_ack(r#"{"control":"registered"}"#).is_ok());
-        let error = Controller::registration_ack(r#"{"control":"nope"}"#).unwrap_err();
-        assert!(error.contains(r#"{"control":"nope"}"#));
-        assert!(Controller::registration_ack("garbage").is_err());
+        assert!(Controller::registration_ack(r#"{"requestid":"1","result":"OK"}"#, 1).is_ok());
+        assert!(Controller::registration_ack(r#"{"requestid":"2","result":"OK"}"#, 1).is_err());
+        assert!(Controller::registration_ack("garbage", 1).is_err());
     }
 
     #[test]
     fn control_frames_classify_by_what_the_waiter_should_do() {
         assert_eq!(
-            Controller::classify_frame(Message::text(r#"{"response":"ok"}"#)),
-            FrameAction::Text(r#"{"response":"ok"}"#.into())
+            Controller::classify_frame(Message::text(r#"{"requestid":"1","result":"OK"}"#)),
+            FrameAction::Text(r#"{"requestid":"1","result":"OK"}"#.into())
         );
         assert_eq!(
             Controller::classify_frame(Message::Pong(Bytes::from_static(b"1"))),
@@ -274,20 +266,23 @@ mod tests {
     #[test]
     fn error_replies_map_to_their_result_or_the_fallback() {
         let error = AppControlResponse {
-            response: "error".into(),
-            result: Some("FULL".into()),
+            requestid: 1,
+            result: Some("ERR".into()),
+            reason: Some("FULL".into()),
             ..Default::default()
         };
         assert_eq!(error.admission().unwrap_err(), "FULL");
 
         let bare_error = AppControlResponse {
-            response: "error".into(),
+            requestid: 1,
+            result: Some("ERR".into()),
             ..Default::default()
         };
         assert_eq!(bare_error.admission().unwrap_err(), "admission failed");
 
         let admitted = AppControlResponse {
-            response: "admitted".into(),
+            requestid: 1,
+            result: Some("OK".into()),
             is_initiator: Some(true),
             messages: Some(vec!["offer".into()]),
             ..Default::default()
@@ -304,24 +299,28 @@ mod tests {
     #[test]
     fn occupancy_and_status_replies_convert_with_defaults() {
         let counted = AppControlResponse {
-            response: "occupancy".into(),
+            requestid: 1,
+            result: Some("OK".into()),
             count: Some(2),
             ..Default::default()
         };
         assert_eq!(counted.occupancy_count().unwrap(), 2);
         let missing = AppControlResponse {
-            response: "occupancy".into(),
+            requestid: 1,
+            result: Some("OK".into()),
             ..Default::default()
         };
         assert_eq!(missing.occupancy_count().unwrap_err(), "occupancy failed");
 
         let snapshot = AppControlResponse {
-            response: "status".into(),
+            requestid: 1,
+            result: Some("OK".into()),
             rooms: Some(1),
             clients: Some(2),
             ..Default::default()
         }
-        .status_snapshot();
+        .status_snapshot()
+        .unwrap();
         assert_eq!(snapshot.rooms, 1);
         assert_eq!(snapshot.clients, 2);
         assert_eq!(snapshot.websocket_connections, 0);

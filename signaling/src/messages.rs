@@ -6,8 +6,23 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-fn is_zero(value: &u64) -> bool {
-    *value == 0
+mod u64_decimal_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let value = value.parse().map_err(serde::de::Error::custom)?;
+        if value == 0 {
+            return Err(serde::de::Error::custom(
+                "requestid must be greater than zero",
+            ));
+        }
+        Ok(value)
+    }
 }
 
 /// First-frame role for the shared signaling WebSocket. V1 browser frames remain
@@ -17,18 +32,18 @@ fn is_zero(value: &u64) -> bool {
 /// authority deserializes them and the AppWeb control client serializes them, so
 /// both sides of the wire are defined once, here. The `skip_serializing_if`
 /// attributes keep encoded frames minimal (a `status` request is just
-/// `{"cmd":"status","req":N}`); deserialization treats every absent field as its
-/// default either way.
+/// `{"cmd":"status","requestid":"N"}`). `requestid` is intentionally not
+/// defaulted: every control request must carry it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppControlRequest {
     #[serde(default)]
     pub cmd: String,
+    #[serde(with = "u64_decimal_string")]
+    pub requestid: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub appid: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub token: String,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub req: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub roomid: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -41,19 +56,20 @@ pub struct AppControlRequest {
 
 impl AppControlRequest {
     /// The first frame on a control socket: claim the `app` role.
-    pub fn register(appid: impl Into<String>, token: impl Into<String>) -> Self {
+    pub fn register(requestid: u64, appid: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             cmd: "app".into(),
+            requestid,
             appid: appid.into(),
             token: token.into(),
             ..Default::default()
         }
     }
 
-    pub fn admit(req: u64, roomid: RoomId, clientid: ClientId, is_loopback: bool) -> Self {
+    pub fn admit(requestid: u64, roomid: RoomId, clientid: ClientId, is_loopback: bool) -> Self {
         Self {
             cmd: "admit".into(),
-            req,
+            requestid,
             roomid,
             clientid,
             is_loopback,
@@ -61,29 +77,29 @@ impl AppControlRequest {
         }
     }
 
-    pub fn remove(req: u64, roomid: RoomId, clientid: ClientId) -> Self {
+    pub fn remove(requestid: u64, roomid: RoomId, clientid: ClientId) -> Self {
         Self {
             cmd: "remove".into(),
-            req,
+            requestid,
             roomid,
             clientid,
             ..Default::default()
         }
     }
 
-    pub fn occupancy(req: u64, roomid: RoomId) -> Self {
+    pub fn occupancy(requestid: u64, roomid: RoomId) -> Self {
         Self {
             cmd: "occupancy".into(),
-            req,
+            requestid,
             roomid,
             ..Default::default()
         }
     }
 
-    pub fn inject(req: u64, roomid: RoomId, clientid: ClientId, msg: String) -> Self {
+    pub fn inject(requestid: u64, roomid: RoomId, clientid: ClientId, msg: String) -> Self {
         Self {
             cmd: "inject".into(),
-            req,
+            requestid,
             roomid,
             clientid,
             msg,
@@ -91,10 +107,10 @@ impl AppControlRequest {
         }
     }
 
-    pub fn status(req: u64) -> Self {
+    pub fn status(requestid: u64) -> Self {
         Self {
             cmd: "status".into(),
-            req,
+            requestid,
             ..Default::default()
         }
     }
@@ -107,12 +123,13 @@ impl AppControlRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppControlResponse {
-    #[serde(default)]
-    pub response: String,
-    #[serde(default)]
-    pub req: u64,
+    /// Required correlation identifier copied from the corresponding request.
+    #[serde(with = "u64_decimal_string")]
+    pub requestid: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_initiator: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,24 +233,24 @@ mod tests {
     #[test]
     fn app_control_frames_preserve_role_and_correlation_fields() {
         let request: AppControlRequest = serde_json::from_str(
-            r#"{"cmd":"admit","appid":"frontend-1","req":7,"roomid":"room","clientid":"client","is_loopback":false}"#,
+            r#"{"cmd":"admit","appid":"frontend-1","requestid":"7","roomid":"room","clientid":"client","is_loopback":false}"#,
         )
         .unwrap();
         assert_eq!(request.cmd, "admit");
         assert_eq!(request.appid, "frontend-1");
-        assert_eq!(request.req, 7);
+        assert_eq!(request.requestid, 7);
         assert_eq!(request.roomid, "room");
 
         let response = serde_json::to_value(AppControlResponse {
-            response: "admitted".into(),
-            req: 7,
+            requestid: 7,
+            result: Some("OK".into()),
             is_initiator: Some(true),
             messages: Some(vec!["offer".into()]),
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(response["response"], "admitted");
-        assert_eq!(response["req"], 7);
+        assert_eq!(response["requestid"], "7");
+        assert_eq!(response["result"], "OK");
         assert_eq!(response["is_initiator"], true);
         assert_eq!(response["messages"], serde_json::json!(["offer"]));
     }
@@ -241,24 +258,24 @@ mod tests {
     #[test]
     fn request_constructors_encode_minimal_frames() {
         assert_eq!(
-            AppControlRequest::register("frontend-1", "").to_wire(),
-            r#"{"cmd":"app","appid":"frontend-1"}"#
+            AppControlRequest::register(1, "frontend-1", "").to_wire(),
+            r#"{"cmd":"app","requestid":"1","appid":"frontend-1"}"#
         );
         assert_eq!(
             AppControlRequest::status(3).to_wire(),
-            r#"{"cmd":"status","req":3}"#
+            r#"{"cmd":"status","requestid":"3"}"#
         );
         assert_eq!(
             AppControlRequest::admit(7, "room".into(), "client".into(), false).to_wire(),
-            r#"{"cmd":"admit","req":7,"roomid":"room","clientid":"client"}"#
+            r#"{"cmd":"admit","requestid":"7","roomid":"room","clientid":"client"}"#
         );
         assert_eq!(
             AppControlRequest::admit(7, "room".into(), "client".into(), true).to_wire(),
-            r#"{"cmd":"admit","req":7,"roomid":"room","clientid":"client","is_loopback":true}"#
+            r#"{"cmd":"admit","requestid":"7","roomid":"room","clientid":"client","is_loopback":true}"#
         );
         assert_eq!(
             AppControlRequest::inject(9, "room".into(), "client".into(), "offer".into()).to_wire(),
-            r#"{"cmd":"inject","req":9,"roomid":"room","clientid":"client","msg":"offer"}"#
+            r#"{"cmd":"inject","requestid":"9","roomid":"room","clientid":"client","msg":"offer"}"#
         );
     }
 
@@ -267,24 +284,31 @@ mod tests {
         let request = AppControlRequest::admit(7, "room".into(), "client".into(), true);
         let decoded: AppControlRequest = serde_json::from_str(&request.to_wire()).unwrap();
         assert_eq!(decoded.cmd, "admit");
-        assert_eq!(decoded.req, 7);
+        assert_eq!(decoded.requestid, 7);
         assert_eq!(decoded.roomid, "room");
         assert_eq!(decoded.clientid, "client");
         assert!(decoded.is_loopback);
 
         let response = AppControlResponse {
-            response: "occupancy".into(),
-            req: 7,
+            requestid: 7,
+            result: Some("OK".into()),
             count: Some(2),
             ..Default::default()
         };
         let decoded =
             AppControlResponse::from_wire(&serde_json::to_string(&response).unwrap()).unwrap();
-        assert_eq!(decoded.response, "occupancy");
-        assert_eq!(decoded.req, 7);
+        assert_eq!(decoded.requestid, 7);
         assert_eq!(decoded.count, Some(2));
-        assert_eq!(decoded.result, None);
+        assert_eq!(decoded.result.as_deref(), Some("OK"));
+        assert_eq!(decoded.reason, None);
 
         assert!(AppControlResponse::from_wire("not json").is_err());
+        assert!(AppControlResponse::from_wire(r#"{"result":"OK"}"#).is_err());
+        assert!(AppControlResponse::from_wire(r#"{"requestid":"0","result":"OK"}"#).is_err());
+        assert!(serde_json::from_str::<AppControlRequest>(r#"{"cmd":"status"}"#).is_err());
+        assert!(
+            serde_json::from_str::<AppControlRequest>(r#"{"cmd":"status","requestid":"0"}"#)
+                .is_err()
+        );
     }
 }
