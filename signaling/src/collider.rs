@@ -99,7 +99,7 @@ pub enum AuthorityResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorityReply {
+pub struct AuthorityResponse {
     pub request_id: RequestId,
     pub result: AuthorityResult,
 }
@@ -117,7 +117,7 @@ pub struct Collider {
     sessions: HashMap<ConnectionId, Session>,
     connections: HashMap<(RoomId, ClientId), ConnectionId>,
     browser_outputs: VecDeque<BrowserOutput>,
-    authority_replies: VecDeque<AuthorityReply>,
+    authority_responses: VecDeque<AuthorityResponse>,
     total_websocket_connections: u64,
     websocket_errors: u64,
 }
@@ -129,7 +129,7 @@ impl Collider {
             sessions: HashMap::new(),
             connections: HashMap::new(),
             browser_outputs: VecDeque::new(),
-            authority_replies: VecDeque::new(),
+            authority_responses: VecDeque::new(),
             total_websocket_connections: 0,
             websocket_errors: 0,
         }
@@ -221,13 +221,13 @@ impl Collider {
             msg.roomid,
             msg.clientid
         );
-        let reply = match msg.cmd.as_str() {
+        let response = match msg.cmd.as_str() {
             "admit" => match self
                 .rooms
                 .join(now, &msg.roomid, &msg.clientid, msg.is_loopback)
             {
                 Ok((is_initiator, messages)) => AppControlResponse {
-                    reply: "admitted".into(),
+                    response: "admitted".into(),
                     req: msg.req,
                     result: Some("SUCCESS".into()),
                     is_initiator: Some(is_initiator),
@@ -235,7 +235,7 @@ impl Collider {
                     ..Default::default()
                 },
                 Err(result) => AppControlResponse {
-                    reply: "error".into(),
+                    response: "error".into(),
                     req: msg.req,
                     result: Some(result),
                     ..Default::default()
@@ -244,16 +244,16 @@ impl Collider {
             "remove" => {
                 // A control-plane leave must have the same wire behavior as the
                 // legacy HTTP leave: remove the room member and close its live
-                // browser WebSocket after the control reply is delivered.
+                // browser WebSocket after the control response is delivered.
                 self.rooms.leave(&msg.roomid, &msg.clientid);
                 AppControlResponse {
-                    reply: "removed".into(),
+                    response: "removed".into(),
                     req: msg.req,
                     ..Default::default()
                 }
             }
             "occupancy" => AppControlResponse {
-                reply: "occupancy".into(),
+                response: "occupancy".into(),
                 req: msg.req,
                 count: Some(self.rooms.occupancy(&msg.roomid)),
                 ..Default::default()
@@ -265,20 +265,20 @@ impl Collider {
                 Ok(()) => {
                     self.drain_room_writes();
                     AppControlResponse {
-                        reply: "injected".into(),
+                        response: "injected".into(),
                         req: msg.req,
                         ..Default::default()
                     }
                 }
                 Err(result) => AppControlResponse {
-                    reply: "error".into(),
+                    response: "error".into(),
                     req: msg.req,
                     result: Some(result),
                     ..Default::default()
                 },
             },
             "status" => AppControlResponse {
-                reply: "status".into(),
+                response: "status".into(),
                 req: msg.req,
                 rooms: Some(self.rooms.room_count()),
                 clients: Some(self.rooms.client_count()),
@@ -288,7 +288,7 @@ impl Collider {
                 ..Default::default()
             },
             _ => AppControlResponse {
-                reply: "error".into(),
+                response: "error".into(),
                 req: msg.req,
                 result: Some("Invalid app command".into()),
                 ..Default::default()
@@ -296,14 +296,14 @@ impl Collider {
         };
         self.browser_outputs.push_back(BrowserOutput::Text {
             connection_id,
-            text: serde_json::to_string(&reply).unwrap(),
+            text: serde_json::to_string(&response).unwrap(),
         });
         log::debug!(
-            "AppWeb control reply: connection_id={connection_id} appid={appid} operation={} request_id={} reply={} error={}",
+            "AppWeb control response: connection_id={connection_id} appid={appid} operation={} request_id={} response={} error={}",
             msg.cmd,
             msg.req,
-            reply.reply,
-            reply.reply == "error"
+            response.response,
+            response.response == "error"
         );
         if msg.cmd == "remove" {
             self.close_client_connection(&msg.roomid, &msg.clientid);
@@ -485,7 +485,7 @@ impl Collider {
                 websocket_errors: self.websocket_errors,
             }),
         };
-        self.authority_replies.push_back(AuthorityReply {
+        self.authority_responses.push_back(AuthorityResponse {
             request_id: command.request_id,
             result,
         });
@@ -495,7 +495,7 @@ impl Collider {
 impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
     type Rout = Infallible;
     type Wout = BrowserOutput;
-    type Eout = AuthorityReply;
+    type Eout = AuthorityResponse;
     type Error = String;
     type Time = Instant;
 
@@ -530,7 +530,7 @@ impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
     }
 
     fn poll_event(&mut self) -> Option<Self::Eout> {
-        self.authority_replies.pop_front()
+        self.authority_responses.pop_front()
     }
 
     fn handle_event(&mut self, event: Infallible) -> Result<(), Self::Error> {
@@ -610,7 +610,7 @@ mod tests {
         );
         text(&mut collider, 99, r#"{"cmd":"status","req":3}"#, now);
         assert!(
-            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"reply\":\"status\"") && text.contains("\"rooms\":1"))
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"response\":\"status\"") && text.contains("\"rooms\":1"))
         );
     }
 
@@ -625,9 +625,9 @@ mod tests {
                 operation,
             })
             .unwrap();
-        let reply = collider.poll_event().unwrap();
-        assert_eq!(reply.request_id, request_id);
-        reply.result
+        let response = collider.poll_event().unwrap();
+        assert_eq!(response.request_id, request_id);
+        response.result
     }
 
     fn assert_error_and_close(collider: &mut Collider, connection_id: ConnectionId, error: &str) {

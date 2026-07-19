@@ -6,8 +6,8 @@
 //!
 //! - [`Controller`] owns the client-side protocol state (heartbeat sequence,
 //!   reconnect backoff bookkeeping) and namespaces the stateless frame decisions
-//!   (classification, reply correlation, registration acknowledgement).
-//! - [`ControlReplyExt`] puts the reply→domain conversions on
+//!   (classification, response correlation, registration acknowledgement).
+//! - [`ControlResponseExt`] puts the response→domain conversions on
 //!   [`AppControlResponse`] itself, so the request side reads
 //!   `request(…).await?.admission()`.
 //!
@@ -31,12 +31,12 @@ pub struct Admission {
 /// What one control-channel frame means to whoever is waiting on the socket.
 #[derive(Debug, PartialEq)]
 pub(crate) enum FrameAction {
-    /// A JSON text payload — a control reply, for [`Controller::correlate_reply`].
+    /// A JSON text payload — a control response, for [`Controller::correlate_response`].
     Text(String),
     /// The peer acknowledged our ping (any pong counts as the heartbeat ack).
     Pong,
     /// The peer pinged us; answer with this payload.
-    ReplyPing(Bytes),
+    Ping(Bytes),
     /// The peer closed the socket.
     Closed,
     /// Frame types with no meaning on the control channel.
@@ -63,24 +63,24 @@ impl Controller {
         match frame {
             Message::Text(text) => FrameAction::Text(text.to_string()),
             Message::Pong(_) => FrameAction::Pong,
-            Message::Ping(payload) => FrameAction::ReplyPing(payload),
+            Message::Ping(payload) => FrameAction::Ping(payload),
             Message::Close(_) => FrameAction::Closed,
             Message::Binary(_) | Message::Frame(_) => FrameAction::Ignore,
         }
     }
 
-    /// Decode a control reply and match it against the outstanding request.
-    /// `Ok(Some)` is our reply, `Ok(None)` is a stale reply for an earlier request
+    /// Decode a control response and match it against the outstanding request.
+    /// `Ok(Some)` is our response, `Ok(None)` is a stale response for an earlier request
     /// (keep waiting), `Err` is an undecodable frame, which fails the request.
-    pub(crate) fn correlate_reply(
+    pub(crate) fn correlate_response(
         text: &str,
         request_id: u64,
     ) -> Result<Option<AppControlResponse>, String> {
-        let reply = AppControlResponse::from_wire(text)?;
-        Ok((reply.req == request_id).then_some(reply))
+        let response = AppControlResponse::from_wire(text)?;
+        Ok((response.req == request_id).then_some(response))
     }
 
-    /// The reply to the `app` registration frame must be `{"control":"registered"}`.
+    /// The response to the `app` registration frame must be `{"control":"registered"}`.
     pub(crate) fn registration_ack(frame: &str) -> Result<(), String> {
         let registered = serde_json::from_str::<serde_json::Value>(frame)
             .ok()
@@ -125,19 +125,19 @@ impl Controller {
     }
 }
 
-/// Reply→domain conversions, as methods on the reply itself.
-pub(crate) trait ControlReplyExt: Sized {
-    /// An `error` reply carries its message in `result`; `fallback` covers a
-    /// malformed error reply that omitted it.
+/// Response→domain conversions, as methods on the response itself.
+pub(crate) trait ControlResponseExt: Sized {
+    /// An `error` response carries its message in `result`; `fallback` covers a
+    /// malformed error response that omitted it.
     fn ack(self, fallback: &str) -> Result<Self, String>;
     fn admission(self) -> Result<Admission, String>;
     fn occupancy_count(self) -> Result<usize, String>;
     fn status_snapshot(self) -> StatusSnapshot;
 }
 
-impl ControlReplyExt for AppControlResponse {
+impl ControlResponseExt for AppControlResponse {
     fn ack(self, fallback: &str) -> Result<Self, String> {
-        if self.reply == "error" {
+        if self.response == "error" {
             Err(self.result.unwrap_or_else(|| fallback.to_string()))
         } else {
             Ok(self)
@@ -145,10 +145,10 @@ impl ControlReplyExt for AppControlResponse {
     }
 
     fn admission(self) -> Result<Admission, String> {
-        let reply = self.ack("admission failed")?;
+        let response = self.ack("admission failed")?;
         Ok(Admission {
-            is_initiator: reply.is_initiator.unwrap_or(false),
-            messages: reply.messages.unwrap_or_default(),
+            is_initiator: response.is_initiator.unwrap_or(false),
+            messages: response.messages.unwrap_or_default(),
         })
     }
 
@@ -226,16 +226,17 @@ mod tests {
 
     #[test]
     fn replies_are_correlated_by_request_id() {
-        let matched = Controller::correlate_reply(r#"{"reply":"status","req":5}"#, 5).unwrap();
-        assert_eq!(matched.unwrap().reply, "status");
-        // A stale reply for an earlier request is skipped, not an error.
+        let matched =
+            Controller::correlate_response(r#"{"response":"status","req":5}"#, 5).unwrap();
+        assert_eq!(matched.unwrap().response, "status");
+        // A stale response for an earlier request is skipped, not an error.
         assert!(
-            Controller::correlate_reply(r#"{"reply":"status","req":4}"#, 5)
+            Controller::correlate_response(r#"{"response":"status","req":4}"#, 5)
                 .unwrap()
                 .is_none()
         );
         // An undecodable frame fails the request.
-        assert!(Controller::correlate_reply("not json", 5).is_err());
+        assert!(Controller::correlate_response("not json", 5).is_err());
     }
 
     #[test]
@@ -249,8 +250,8 @@ mod tests {
     #[test]
     fn control_frames_classify_by_what_the_waiter_should_do() {
         assert_eq!(
-            Controller::classify_frame(Message::text(r#"{"reply":"ok"}"#)),
-            FrameAction::Text(r#"{"reply":"ok"}"#.into())
+            Controller::classify_frame(Message::text(r#"{"response":"ok"}"#)),
+            FrameAction::Text(r#"{"response":"ok"}"#.into())
         );
         assert_eq!(
             Controller::classify_frame(Message::Pong(Bytes::from_static(b"1"))),
@@ -258,7 +259,7 @@ mod tests {
         );
         assert_eq!(
             Controller::classify_frame(Message::Ping(Bytes::from_static(b"2"))),
-            FrameAction::ReplyPing(Bytes::from_static(b"2"))
+            FrameAction::Ping(Bytes::from_static(b"2"))
         );
         assert_eq!(
             Controller::classify_frame(Message::Close(None)),
@@ -273,20 +274,20 @@ mod tests {
     #[test]
     fn error_replies_map_to_their_result_or_the_fallback() {
         let error = AppControlResponse {
-            reply: "error".into(),
+            response: "error".into(),
             result: Some("FULL".into()),
             ..Default::default()
         };
         assert_eq!(error.admission().unwrap_err(), "FULL");
 
         let bare_error = AppControlResponse {
-            reply: "error".into(),
+            response: "error".into(),
             ..Default::default()
         };
         assert_eq!(bare_error.admission().unwrap_err(), "admission failed");
 
         let admitted = AppControlResponse {
-            reply: "admitted".into(),
+            response: "admitted".into(),
             is_initiator: Some(true),
             messages: Some(vec!["offer".into()]),
             ..Default::default()
@@ -303,19 +304,19 @@ mod tests {
     #[test]
     fn occupancy_and_status_replies_convert_with_defaults() {
         let counted = AppControlResponse {
-            reply: "occupancy".into(),
+            response: "occupancy".into(),
             count: Some(2),
             ..Default::default()
         };
         assert_eq!(counted.occupancy_count().unwrap(), 2);
         let missing = AppControlResponse {
-            reply: "occupancy".into(),
+            response: "occupancy".into(),
             ..Default::default()
         };
         assert_eq!(missing.occupancy_count().unwrap_err(), "occupancy failed");
 
         let snapshot = AppControlResponse {
-            reply: "status".into(),
+            response: "status".into(),
             rooms: Some(1),
             clients: Some(2),
             ..Default::default()

@@ -326,7 +326,7 @@ async fn ws_session(
                     idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    // tokio-tungstenite queues the pong reply automatically.
+                    // tokio-tungstenite queues the pong response automatically.
                     log::info!(
                         "WebSocket keep-alive ping received: connection_id={connection_id} bytes={}",
                         payload.len()

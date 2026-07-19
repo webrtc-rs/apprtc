@@ -6,9 +6,9 @@
 //! `signaling` crate — and every protocol decision lives in [`crate::controller`],
 //! unit-tested without sockets or a clock: the per-connection [`Controller`]
 //! object owns heartbeat/backoff sequencing and the frame decisions, and
-//! [`ControlReplyExt`] converts replies into domain values.
+//! [`ControlResponseExt`] converts responses into domain values.
 
-use crate::controller::{ControlReplyExt, Controller, FrameAction};
+use crate::controller::{ControlResponseExt, Controller, FrameAction};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use signaling::messages::{AppControlRequest, AppControlResponse};
@@ -56,7 +56,7 @@ const RECONNECT_JITTER_MS: u64 = 250;
 
 struct AuthorityRequest {
     request: AppControlRequest,
-    reply: oneshot::Sender<Result<AppControlResponse, String>>,
+    response: oneshot::Sender<Result<AppControlResponse, String>>,
 }
 
 #[derive(Clone)]
@@ -98,13 +98,16 @@ impl WebSocketAuthority {
     async fn request(&self, request: AppControlRequest) -> Result<AppControlResponse, String> {
         let req = request.req;
         let operation = request.cmd.clone();
-        let (reply, response) = oneshot::channel();
+        let (response_tx, response_rx) = oneshot::channel();
         self.requests
-            .send(AuthorityRequest { request, reply })
+            .send(AuthorityRequest {
+                request,
+                response: response_tx,
+            })
             .await
             .map_err(|_| "signaling control worker stopped".to_string())?;
         let started = Instant::now();
-        let result = tokio::time::timeout(REQUEST_TIMEOUT, response)
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, response_rx)
             .await
             .map_err(|_| format!("signaling {operation} request {req} timed out"))?
             .map_err(|_| "signaling control worker stopped".to_string())?;
@@ -195,16 +198,16 @@ async fn run_connection(
                     let _ = socket.close(None).await;
                     return;
                 };
-                if request.reply.is_closed() {
+                if request.response.is_closed() {
                     continue;
                 }
                 let request_id = request.request.req;
                 let outcome = match tokio::time::timeout(HEARTBEAT_TIMEOUT, exchange(&mut socket, request.request, request_id)).await {
                     Ok(outcome) => outcome,
-                    Err(_) => Err(format!("signaling control request {request_id} timed out waiting for reply")),
+                    Err(_) => Err(format!("signaling control request {request_id} timed out waiting for response")),
                 };
                 let failed = outcome.is_err();
-                let _ = request.reply.send(outcome);
+                let _ = request.response.send(outcome);
                 if failed {
                     log::warn!("Signaling control connection lost during request: appid={} request_id={request_id}", options.appid);
                     socket = reconnect(&options, &mut controller).await;
@@ -220,7 +223,7 @@ async fn run_connection(
                         let frame = socket.next().await.ok_or_else(|| "signaling control socket closed".to_string())?.map_err(|error| error.to_string())?;
                         match Controller::classify_frame(frame) {
                             FrameAction::Pong => return Ok::<(), String>(()),
-                            FrameAction::ReplyPing(payload) => socket.send(Message::Pong(payload)).await.map_err(|error| error.to_string())?,
+                            FrameAction::Ping(payload) => socket.send(Message::Pong(payload)).await.map_err(|error| error.to_string())?,
                             FrameAction::Closed => return Err("signaling control socket closed".into()),
                             FrameAction::Text(_) | FrameAction::Ignore => {}
                         }
@@ -261,11 +264,11 @@ async fn exchange(
             .map_err(|error| error.to_string())?;
         match Controller::classify_frame(frame) {
             FrameAction::Text(text) => {
-                if let Some(reply) = Controller::correlate_reply(&text, request_id)? {
-                    return Ok(reply);
+                if let Some(response) = Controller::correlate_response(&text, request_id)? {
+                    return Ok(response);
                 }
             }
-            FrameAction::ReplyPing(payload) => socket
+            FrameAction::Ping(payload) => socket
                 .send(Message::Pong(payload))
                 .await
                 .map_err(|error| error.to_string())?,

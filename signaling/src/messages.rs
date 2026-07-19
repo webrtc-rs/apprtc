@@ -108,7 +108,7 @@ impl AppControlRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppControlResponse {
     #[serde(default)]
-    pub reply: String,
+    pub response: String,
     #[serde(default)]
     pub req: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,7 +132,7 @@ pub struct AppControlResponse {
 }
 
 impl AppControlResponse {
-    /// Decode a control reply from its JSON wire string.
+    /// Decode a control response from its JSON wire string.
     pub fn from_wire(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|error| error.to_string())
     }
@@ -224,18 +224,18 @@ mod tests {
         assert_eq!(request.req, 7);
         assert_eq!(request.roomid, "room");
 
-        let reply = serde_json::to_value(AppControlResponse {
-            reply: "admitted".into(),
+        let response = serde_json::to_value(AppControlResponse {
+            response: "admitted".into(),
             req: 7,
             is_initiator: Some(true),
             messages: Some(vec!["offer".into()]),
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(reply["reply"], "admitted");
-        assert_eq!(reply["req"], 7);
-        assert_eq!(reply["is_initiator"], true);
-        assert_eq!(reply["messages"], serde_json::json!(["offer"]));
+        assert_eq!(response["response"], "admitted");
+        assert_eq!(response["req"], 7);
+        assert_eq!(response["is_initiator"], true);
+        assert_eq!(response["messages"], serde_json::json!(["offer"]));
     }
 
     #[test]
@@ -273,14 +273,14 @@ mod tests {
         assert!(decoded.is_loopback);
 
         let response = AppControlResponse {
-            reply: "occupancy".into(),
+            response: "occupancy".into(),
             req: 7,
             count: Some(2),
             ..Default::default()
         };
         let decoded =
             AppControlResponse::from_wire(&serde_json::to_string(&response).unwrap()).unwrap();
-        assert_eq!(decoded.reply, "occupancy");
+        assert_eq!(decoded.response, "occupancy");
         assert_eq!(decoded.req, 7);
         assert_eq!(decoded.count, Some(2));
         assert_eq!(decoded.result, None);

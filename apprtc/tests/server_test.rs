@@ -67,7 +67,7 @@ async fn preserves_appweb_signaling_status_contract() -> Result<()> {
     );
     ws_send(&mut socket, json!({"cmd":"status", "req":1})).await?;
     let status = ws_receive_json(&mut socket).await?;
-    assert_eq!(status["reply"], "status");
+    assert_eq!(status["response"], "status");
     assert_eq!(status["req"], 1);
     for field in [
         "rooms",
