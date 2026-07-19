@@ -317,21 +317,88 @@ fn cors(mut response: Response, methods: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ws_client::WsClient;
+    use crate::ws_client::{Admission, RoomAuthority};
+    use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
     use serde_json::Value;
-    use signaling::ws_server::ColliderHandle;
-    use std::time::Duration;
+    use signaling::collider::StatusSnapshot;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    type MockClient = (String, Vec<String>);
+    type MockRooms = HashMap<String, Vec<MockClient>>;
+
+    #[derive(Clone, Default)]
+    struct MockAuthority(Arc<Mutex<MockRooms>>);
+
+    #[async_trait]
+    impl RoomAuthority for MockAuthority {
+        async fn admit(
+            &self,
+            roomid: String,
+            clientid: String,
+            _: bool,
+        ) -> Result<Admission, String> {
+            let mut rooms = self.0.lock().unwrap();
+            let clients = rooms.entry(roomid).or_default();
+            if clients.iter().any(|(id, _)| id == &clientid) {
+                return Err("DUPLICATE_CLIENT".into());
+            }
+            if clients.len() >= 2 {
+                return Err("FULL".into());
+            }
+            let initiator = clients.is_empty();
+            let messages = clients.first().map(|(_, q)| q.clone()).unwrap_or_default();
+            clients.push((clientid, Vec::new()));
+            Ok(Admission {
+                is_initiator: initiator,
+                messages,
+            })
+        }
+        async fn remove(&self, roomid: String, clientid: String) -> Result<(), String> {
+            if let Some(clients) = self.0.lock().unwrap().get_mut(&roomid) {
+                clients.retain(|(id, _)| id != &clientid);
+            }
+            Ok(())
+        }
+        async fn occupancy(&self, roomid: String) -> Result<usize, String> {
+            Ok(self.0.lock().unwrap().get(&roomid).map_or(0, Vec::len))
+        }
+        async fn inject(
+            &self,
+            roomid: String,
+            clientid: String,
+            msg: String,
+        ) -> Result<(), String> {
+            let mut rooms = self.0.lock().unwrap();
+            let clients = rooms.entry(roomid).or_default();
+            if let Some((_, queue)) = clients.iter_mut().find(|(id, _)| id == &clientid) {
+                queue.push(msg);
+            } else {
+                clients.push((clientid, vec![msg]));
+            }
+            Ok(())
+        }
+        async fn status(&self) -> Result<StatusSnapshot, String> {
+            let rooms = self.0.lock().unwrap();
+            Ok(StatusSnapshot {
+                rooms: rooms.len(),
+                clients: rooms.values().map(Vec::len).sum(),
+                websocket_connections: 0,
+                total_websocket_connections: 0,
+                websocket_errors: 0,
+            })
+        }
+    }
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let collider = ColliderHandle::spawn(Duration::from_secs(10));
         let config = Config {
             web_root: env!("CARGO_MANIFEST_DIR").to_string(),
             ..Default::default()
         };
-        RoomServer::new(config, WsClient::new(collider))
+        RoomServer::new(config, MockAuthority::default())
             .unwrap()
             .router()
     }
@@ -444,13 +511,12 @@ mod tests {
 
     #[tokio::test]
     async fn params_honor_query_options_and_request_host() {
-        let collider = ColliderHandle::spawn(Duration::from_secs(10));
         let config = Config {
             web_root: env!("CARGO_MANIFEST_DIR").to_string(),
             force_tls: true,
             ..Default::default()
         };
-        let app = RoomServer::new(config, WsClient::new(collider))
+        let app = RoomServer::new(config, MockAuthority::default())
             .unwrap()
             .router();
         let response = request(
