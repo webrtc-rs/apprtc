@@ -220,6 +220,9 @@ impl Collider {
                 },
             },
             "remove" => {
+                // A control-plane leave must have the same wire behavior as the
+                // legacy HTTP leave: remove the room member and close its live
+                // browser WebSocket after the control reply is delivered.
                 self.rooms.leave(&msg.roomid, &msg.clientid);
                 AppControlReply {
                     reply: "removed".into(),
@@ -237,10 +240,13 @@ impl Collider {
                 .rooms
                 .save_or_send(now, &msg.roomid, &msg.clientid, msg.msg)
             {
-                Ok(()) => AppControlReply {
-                    reply: "injected".into(),
-                    req: msg.req,
-                    ..Default::default()
+                Ok(()) => {
+                    self.drain_room_writes();
+                    AppControlReply {
+                        reply: "injected".into(),
+                        req: msg.req,
+                        ..Default::default()
+                    }
                 },
                 Err(result) => AppControlReply {
                     reply: "error".into(),
@@ -270,6 +276,9 @@ impl Collider {
             connection_id,
             text: serde_json::to_string(&reply).unwrap(),
         });
+        if msg.cmd == "remove" {
+            self.close_client_connection(&msg.roomid, &msg.clientid);
+        }
         Ok(())
     }
 
