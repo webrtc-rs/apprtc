@@ -60,6 +60,16 @@ pub struct AppControlReply {
     pub messages: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rooms: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clients: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_connections: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_websocket_connections: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_errors: Option<u64>,
 }
 
 /// A message sent to a client on behalf of another client. Both fields are

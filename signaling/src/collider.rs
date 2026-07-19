@@ -151,6 +151,10 @@ impl Collider {
                 return Ok(());
             }
         };
+        if matches!(self.sessions.get(&connection_id), Some(Session::App { .. })) {
+            let msg: AppControlMsg = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            return self.handle_app_message(connection_id, msg, now);
+        }
         if value.get("cmd").and_then(|v| v.as_str()) == Some("app") {
             let msg: AppControlMsg = serde_json::from_value(value).map_err(|e| e.to_string())?;
             return self.handle_app_message(connection_id, msg, now);
@@ -248,6 +252,11 @@ impl Collider {
             "status" => AppControlReply {
                 reply: "status".into(),
                 req: msg.req,
+                rooms: Some(self.rooms.room_count()),
+                clients: Some(self.rooms.client_count()),
+                websocket_connections: Some(self.rooms.ws_count()),
+                total_websocket_connections: Some(self.total_websocket_connections),
+                websocket_errors: Some(self.websocket_errors),
                 ..Default::default()
             },
             _ => AppControlReply {
@@ -521,6 +530,44 @@ mod tests {
         collider
             .handle_read(BrowserInput::Connected { connection_id })
             .unwrap();
+    }
+
+    #[test]
+    fn app_role_registers_and_handles_authority_commands() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+        connect(&mut collider, 99);
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"app","appid":"frontend-1"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("registered"))
+        );
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"admit","req":1,"roomid":"room","clientid":"client"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("admitted"))
+        );
+        text(
+            &mut collider,
+            99,
+            r#"{"cmd":"occupancy","req":2,"roomid":"room"}"#,
+            now,
+        );
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("occupancy") && text.contains("\"count\":1"))
+        );
+        text(&mut collider, 99, r#"{"cmd":"status","req":3}"#, now);
+        assert!(
+            matches!(collider.poll_write(), Some(BrowserOutput::Text { connection_id: 99, text }) if text.contains("\"reply\":\"status\"") && text.contains("\"rooms\":1"))
+        );
     }
 
     fn authority(
