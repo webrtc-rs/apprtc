@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
@@ -39,16 +40,40 @@ pub fn config(certificate: &str, private_key: &str) -> Result<Arc<ServerConfig>>
 }
 
 pub struct TlsListener {
-    listener: TcpListener,
-    acceptor: TlsAcceptor,
+    address: SocketAddr,
+    streams: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
 }
 
 impl TlsListener {
     pub fn new(listener: TcpListener, config: Arc<ServerConfig>) -> Self {
-        Self {
-            listener,
-            acceptor: TlsAcceptor::from(config),
-        }
+        let address = listener.local_addr().expect("TLS listener local address");
+        let acceptor = TlsAcceptor::from(config);
+        let (sender, streams) = mpsc::channel(1024);
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::error!("TCP accept failed: {error}");
+                        continue;
+                    }
+                };
+                let acceptor = acceptor.clone();
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream))
+                        .await
+                    {
+                        Ok(Ok(stream)) => {
+                            let _ = sender.send((stream, peer)).await;
+                        }
+                        Ok(Err(error)) => log::warn!("TLS handshake from {peer} failed: {error}"),
+                        Err(_) => log::warn!("TLS handshake from {peer} timed out"),
+                    }
+                });
+            }
+        });
+        Self { address, streams }
     }
 }
 
@@ -57,27 +82,10 @@ impl Listener for TlsListener {
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, address)) => match tokio::time::timeout(
-                    Duration::from_secs(10),
-                    self.acceptor.accept(stream),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => return (stream, address),
-                    Ok(Err(error)) => log::warn!("TLS handshake from {address} failed: {error}"),
-                    Err(_) => log::warn!("TLS handshake from {address} timed out"),
-                },
-                Err(error) => {
-                    log::error!("TCP accept failed: {error}");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
+        self.streams.recv().await.expect("TLS accept loop stopped")
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.listener.local_addr()
+        Ok(self.address)
     }
 }
