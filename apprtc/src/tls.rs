@@ -59,9 +59,15 @@ impl Listener for TlsListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.listener.accept().await {
-                Ok((stream, address)) => match self.acceptor.accept(stream).await {
-                    Ok(stream) => return (stream, address),
-                    Err(error) => log::warn!("TLS handshake from {address} failed: {error}"),
+                Ok((stream, address)) => match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.acceptor.accept(stream),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => return (stream, address),
+                    Ok(Err(error)) => log::warn!("TLS handshake from {address} failed: {error}"),
+                    Err(_) => log::warn!("TLS handshake from {address} timed out"),
                 },
                 Err(error) => {
                     log::error!("TCP accept failed: {error}");
