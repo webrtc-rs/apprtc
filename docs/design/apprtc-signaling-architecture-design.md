@@ -111,12 +111,12 @@ Browser connections and the future SFU worker role reach `wss://signaling/ws`. T
 or a rotated worker/app token and should normally be reachable only on a private listener. The currently implemented P2P
 V1 AppWeb control endpoint transports but does not validate its token (§8.4).
 
-| Role              | Endpoint | First frame                                                        | Direction after registration                                                         |
-|-------------------|----------|--------------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| Browser v1        | `/ws`    | JSON `{cmd:"register", roomid, clientid}`                          | Existing `{cmd:"send", msg}` and `{msg}` framing, no new required field              |
-| Browser v2        | `/ws`    | JSON `{cmd:"register", roomid, clientid, ver:2, token}`            | Same `send`/`msg` framing plus a required `epoch` on `send` and v2-only controls     |
-| AppRTC front door | `/app`   | Protobuf `Request{requestid, app:Register{appid, token}}`          | Protobuf `admit`, `remove`, `occupancy`, `inject`, and `status` requests and replies |
-| SFU worker        | `/app`   | Protobuf `Request{requestid, app:Register{sfuid, token, capacity}} | lifecycle and addressed SDP frames in both directions                                |
+| Role              | Endpoint | First frame                                                          | Direction after registration                                                         |
+|-------------------|----------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------|
+| Browser v1        | `/ws`    | JSON `{cmd:"register", roomid, clientid}`                            | Existing `{cmd:"send", msg}` and `{msg}` framing, no new required field              |
+| Browser v2        | `/ws`    | JSON `{cmd:"register", roomid, clientid, ver:2, token}`              | Same `send`/`msg` framing plus a required `epoch` on `send` and v2-only controls     |
+| AppRTC front door | `/app`   | Protobuf `Request{request_id, app:Register{app_id, token}}`          | Protobuf `admit`, `remove`, `occupancy`, `inject`, and `status` requests and replies |
+| SFU worker        | `/ws`    | JSON `{cmd:"sfu", sfuid, instance, token, capacity}`              | JSON lifecycle and addressed SDP frames in both directions                           |
 
 The hub validates a service role before processing any other command. A V2 browser may register only after an `admit`
 has created its member record; V2 `register` and `send` never lazily create rooms or clients. The V1 path preserves its
@@ -296,7 +296,7 @@ corresponding `SFUEvent::SessionDescription`.
 ### 4.1 P2P, one or two members
 
 1. Browser calls `POST /join/{room}` on `appweb`.
-2. `appweb` sends `admit(requestid, roomid, clientid, ver)` over its control WebSocket.
+2. `appweb` sends `admit(request_id, room_id, client_id, ver)` over its control WebSocket.
 3. `signaling` creates the member, elects the first member as initiator, and replies.
 4. Browser registers its own WebSocket with `signaling`.
 5. Every browser `{cmd:"send"}` is relayed to the other member; early messages queue and flush when that member
@@ -550,7 +550,7 @@ epoch          = U64Decimal on browser frames; the room's signal epoch (§3.1.2)
 AppMessage     = JSON string containing Offer | Answer | Candidate | Bye
 ```
 
-The spelling of signaling fields is deliberately `roomid`, `clientid`, `requestid`, and `lifecycleid`—not snake case.
+The spelling of browser and SFU-worker JSON fields is deliberately `roomid`, `clientid`, `requestid`, and `lifecycleid`—not snake case. The AppWeb Protobuf protocol is separate and uses `request_id`, `room_id`, `client_id`, and `app_id` as defined in §8.4.
 The adapter converts between wire `requestid` and the current Rust core's `SFUEvent::request_id`; `lifecycleid` is
 adapter/hub state and is never supplied to `Sfu`.
 
@@ -706,17 +706,15 @@ Protobuf messages; `/ws` remains browser JSON and rejects binary application fra
 steady-state control connection with the state `Connecting → Registered → Reconnecting → Registered → Closed`. Its first
 request after every connection or reconnection must select the `app` command.
 
-This protocol is the WebSocket binding of the `RoomAuthority` interface currently implemented for P2P V1: `admit`,
-`remove`, `occupancy`, `inject`, and `status`. Browser `send`/`msg` relay traffic terminates at signaling's `/ws`
-endpoint and never routes through AppWeb. The normative schema is maintained in `signaling-proto/proto/signaling.proto`;
-both processes compile against generated types from the shared `signaling-proto` crate.
+This protocol is the WebSocket binding of the `RoomAuthority` interface currently implemented for P2P V1: `admit`, `remove`, `occupancy`, `inject`, and `status`. Browser `send`/`msg` relay traffic terminates at signaling's `/ws` endpoint and never routes through AppWeb. The normative schema is maintained in `signaling-proto/proto/signaling.v1.proto`; both processes compile against generated types from the shared `signaling-proto` crate.
 
 ```proto
 syntax = "proto3";
 package signaling.v1;
 
 message Request {
-  uint64 requestid = 1;
+  uint64 request_id = 1;
+
   oneof command {
     Register app = 10;
     Admit admit = 11;
@@ -725,60 +723,89 @@ message Request {
     Inject inject = 14;
     StatusRequest status = 15;
   }
-}
 
-message Register { string appid = 1; string token = 2; }
-message Admit { string roomid = 1; string clientid = 2; bool is_loopback = 3; }
-message Remove { string roomid = 1; string clientid = 2; }
-message Occupancy { string roomid = 1; }
-message Inject { string roomid = 1; string clientid = 2; string msg = 3; }
-message StatusRequest {}
+  message Register {
+    string app_id = 1;
+    string token = 2;
+  }
+
+  message Admit {
+    string room_id = 1;
+    string client_id = 2;
+    bool is_loopback = 3;
+  }
+
+  message Remove {
+    string room_id = 1;
+    string client_id = 2;
+  }
+
+  message Occupancy {
+    string room_id = 1;
+  }
+
+  message Inject {
+    string room_id = 1;
+    string client_id = 2;
+    string msg = 3;
+  }
+
+  message StatusRequest {}
+}
 
 message Response {
-  uint64 requestid = 1;
-  Result result = 2;
-  string reason = 3;
-  oneof payload {
-    Admitted admitted = 10;
-    OccupancyResult occupancy = 11;
-    StatusResult status = 12;
-  }
-}
+  uint64 request_id = 1;
 
-enum Result { RESULT_UNSPECIFIED = 0; OK = 1; ERR = 2; }
-message Admitted { bool is_initiator = 1; repeated string messages = 2; }
-message OccupancyResult { uint64 count = 1; }
-message StatusResult {
-  uint64 rooms = 1;
-  uint64 clients = 2;
-  uint64 websocket_connections = 3;
-  uint64 total_websocket_connections = 4;
-  uint64 websocket_errors = 5;
+  oneof result {
+    Ok ok = 2;
+    Err err = 3;
+  }
+
+  message Ok {
+    oneof payload {
+      Admitted admitted = 10;
+      OccupancyResult occupancy = 11;
+      StatusResult status = 12;
+    }
+  }
+
+  message Err {
+    string reason = 1;
+  }
+
+  message Admitted {
+    bool is_initiator = 1;
+    repeated string messages = 2;
+  }
+
+  message OccupancyResult {
+    uint64 count = 1;
+  }
+
+  message StatusResult {
+    uint64 rooms = 1;
+    uint64 clients = 2;
+    uint64 websocket_connections = 3;
+    uint64 total_websocket_connections = 4;
+    uint64 websocket_errors = 5;
+  }
 }
 ```
 
-`requestid` is a nonzero Protobuf `uint64`, allocated monotonically within one AppWeb process. Every valid request
-selects exactly one `command`; every reply copies the corresponding `requestid`. AppWeb uses that ID to correlate
-replies, so no response-type discriminator is needed. `result` is `OK` or `ERR` to align with Rust's `Result`;
-`RESULT_UNSPECIFIED` is invalid on the wire. An `ERR` reply carries a non-empty `reason`. A successful `admit`,
-`occupancy`, or `status` reply selects its corresponding typed payload. Successful registration, removal, and injection
-need no payload because the correlated request already identifies the operation.
+`request_id` is a nonzero Protobuf `uint64`, allocated monotonically within one AppWeb process. Every valid request selects exactly one `command`; every reply copies the corresponding `request_id`. AppWeb uses that ID to correlate replies, so no response-type discriminator is needed. Every response selects exactly one `result`: `ok` contains an optional typed success payload, while `err` contains a non-empty `reason`. A successful `admit`, `occupancy`, or `status` reply selects its corresponding `Ok.payload`. Successful registration, removal, and injection use `Ok` without a payload because the correlated request already identifies the operation. A missing `result` is invalid.
+
+The nested `Response.result` representation is wire-incompatible with the earlier pre-release flat enum/reason/payload response. Deploy matching AppWeb and signaling versions together; a mixed-version pair rejects registration or responses and reconnects rather than silently misinterpreting them.
 
 | Command     | Required command fields                      | Successful response payload | Current P2P V1 semantics                                             |
 |-------------|----------------------------------------------|-----------------------------|----------------------------------------------------------------------|
-| `app`       | non-empty `appid`; optional `token`          | none                        | Register the AppWeb connection; must be the first request.           |
-| `admit`     | `roomid`, `clientid`; optional `is_loopback` | `Admitted`                  | Admit a room member, enforce capacity, and elect the initiator.      |
-| `remove`    | `roomid`, `clientid`                         | none                        | Remove a member and close its live browser WebSocket after replying. |
-| `occupancy` | `roomid`                                     | `OccupancyResult`           | Return current room occupancy.                                       |
-| `inject`    | `roomid`, `clientid`, `msg`                  | none                        | Implement legacy `/message` queue-or-relay behavior.                 |
+| `app`       | non-empty `app_id`; optional `token`         | none                        | Register the AppWeb connection; must be the first request.           |
+| `admit`     | `room_id`, `client_id`; optional `is_loopback` | `Admitted`                | Admit a room member, enforce capacity, and elect the initiator.      |
+| `remove`    | `room_id`, `client_id`                       | none                        | Remove a member and close its live browser WebSocket after replying. |
+| `occupancy` | `room_id`                                    | `OccupancyResult`           | Return current room occupancy.                                       |
+| `inject`    | `room_id`, `client_id`, `msg`                | none                        | Implement legacy `/message` queue-or-relay behavior.                 |
 | `status`    | none                                         | `StatusResult`              | Return signaling room, client, WebSocket, and error counters.        |
 
-Admission failures use `ERR` with a legacy reason such as `FULL` or `DUPLICATE_CLIENT`. V1 `roomid` and `clientid`
-remain opaque strings inside Protobuf. The optional registration token is transported but not yet validated. Unknown
-Protobuf fields are ignored for forward compatibility, while a missing command, zero `requestid`, undecodable frame,
-text frame on `/app`, or binary frame on `/ws` is a protocol violation and closes the socket without a reply
-because no valid request can be correlated. A valid registration with an empty `appid` receives a correlated `ERR`
-before closure.
+Admission failures select `Err` with a legacy reason such as `FULL` or `DUPLICATE_CLIENT`. V1 `room_id` and `client_id` remain opaque strings inside Protobuf. The optional registration token is transported but not yet validated. Unknown Protobuf fields are ignored for forward compatibility, while a missing command, zero `request_id`, undecodable frame, text frame on `/app`, or binary frame on `/ws` is a protocol violation and closes the socket without a reply because no valid request can be correlated. A valid registration with an empty `app_id` receives a correlated `Err` before closure.
 
 AppWeb sends a WebSocket Ping every 30 seconds and requires a Pong within 10 seconds. On connection loss it fails the
 in-flight request, reconnects with exponential backoff plus jitter (1–30 seconds), and re-registers the same configured
@@ -788,7 +815,7 @@ times out after 15 seconds. AppWeb startup does not depend on signaling availabi
 while the control worker attempts an immediate connection and then retries indefinitely with the same backoff until
 signaling becomes available. Authority requests accepted while disconnected remain subject to the bounded queue and
 15-second caller timeout. AppWeb and signaling log every valid control request and reply at INFO with its operation and
-`requestid`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect
+`request_id`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect
 lifecycle events are also logged, without tokens or signaling payloads.
 
 ### 8.5 SFU worker WebSocket

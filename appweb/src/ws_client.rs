@@ -95,7 +95,7 @@ impl WebSocketAuthority {
     }
 
     async fn request(&self, request: AppControlRequest) -> Result<AppControlResponse, String> {
-        let requestid = request.requestid;
+        let requestid = request.request_id;
         let operation = request.operation_name();
         let (response_tx, response_rx) = oneshot::channel();
         let started = Instant::now();
@@ -119,11 +119,11 @@ impl WebSocketAuthority {
         });
         match &result {
             Ok(_) => log::debug!(
-                "Signaling control request completed: operation={operation} requestid={requestid} elapsed_ms={}",
+                "Signaling control request completed: operation={operation} request_id={requestid} elapsed_ms={}",
                 started.elapsed().as_millis()
             ),
             Err(error) => log::warn!(
-                "Signaling control request failed: operation={operation} requestid={requestid} elapsed_ms={} error={error}",
+                "Signaling control request failed: operation={operation} request_id={requestid} elapsed_ms={} error={error}",
                 started.elapsed().as_millis()
             ),
         }
@@ -143,14 +143,14 @@ async fn run_control_worker(
         Ok(Ok(socket)) => socket,
         Ok(Err(error)) => {
             log::warn!(
-                "Signaling control unavailable at AppWeb startup; retrying: appid={} error={error}",
+                "Signaling control unavailable at AppWeb startup; retrying: app_id={} error={error}",
                 options.appid
             );
             reconnect(&options, &mut controller).await
         }
         Err(_) => {
             log::warn!(
-                "Signaling control connection timed out at AppWeb startup; retrying: appid={} timeout_secs={}",
+                "Signaling control connection timed out at AppWeb startup; retrying: app_id={} timeout_secs={}",
                 options.appid,
                 CONNECT_TIMEOUT.as_secs()
             );
@@ -185,7 +185,7 @@ async fn connect_control(
     attempt: u32,
 ) -> Result<ControlSocket, String> {
     log::info!(
-        "Connecting signaling control WebSocket: url={} appid={} attempt={} insecure_tls={}",
+        "Connecting signaling control WebSocket: url={} app_id={} attempt={} insecure_tls={}",
         options.url,
         options.appid,
         attempt,
@@ -197,7 +197,7 @@ async fn connect_control(
     let register =
         AppControlRequest::register(requestid, options.appid.clone(), options.token.clone());
     log::info!(
-        "Signaling control registration request: url={} requestid={} appid={}",
+        "Signaling control registration request: url={} request_id={} app_id={}",
         options.url,
         requestid,
         options.appid
@@ -211,7 +211,7 @@ async fn connect_control(
     };
     Controller::registration_ack(&frame, requestid)?;
     log::info!(
-        "Signaling control registration response: url={} requestid={} appid={} result=OK registered=true attempt={} elapsed_ms={}",
+        "Signaling control registration response: url={} request_id={} app_id={} result=OK registered=true attempt={} elapsed_ms={}",
         options.url,
         requestid,
         options.appid,
@@ -235,14 +235,14 @@ async fn run_connection(
         tokio::select! {
             request = requests.recv() => {
                 let Some(request) = request else {
-                    log::info!("Signaling control worker stopped: appid={}", options.appid);
+                    log::info!("Signaling control worker stopped: app_id={}", options.appid);
                     let _ = socket.close(None).await;
                     return;
                 };
                 if request.response.is_closed() {
                     continue;
                 }
-                let request_id = request.request.requestid;
+                let request_id = request.request.request_id;
                 let outcome = match tokio::time::timeout(HEARTBEAT_TIMEOUT, exchange(&mut socket, request.request, request_id)).await {
                     Ok(outcome) => outcome,
                     Err(_) => Err(format!("signaling control request {request_id} timed out waiting for response")),
@@ -250,7 +250,7 @@ async fn run_connection(
                 let failed = outcome.is_err();
                 let _ = request.response.send(outcome);
                 if failed {
-                    log::warn!("Signaling control connection lost during request: appid={} requestid={request_id}", options.appid);
+                    log::warn!("Signaling control connection lost during request: app_id={} request_id={request_id}", options.appid);
                     socket = reconnect(&options, &mut controller).await;
                     heartbeat.reset();
                 }
@@ -271,14 +271,14 @@ async fn run_connection(
                     }
                 };
                 match tokio::time::timeout(HEARTBEAT_TIMEOUT, heartbeat_result).await {
-                    Ok(Ok(())) => log::info!("Signaling control heartbeat succeeded: appid={} sequence={} latency_ms={}", options.appid, sequence, started.elapsed().as_millis()),
+                    Ok(Ok(())) => log::info!("Signaling control heartbeat succeeded: app_id={} sequence={} latency_ms={}", options.appid, sequence, started.elapsed().as_millis()),
                     Ok(Err(error)) => {
-                        log::warn!("Signaling control heartbeat failed: appid={} sequence={} error={error}", options.appid, sequence);
+                        log::warn!("Signaling control heartbeat failed: app_id={} sequence={} error={error}", options.appid, sequence);
                         socket = reconnect(&options, &mut controller).await;
                         heartbeat.reset();
                     }
                     Err(_) => {
-                        log::warn!("Signaling control heartbeat timed out: appid={} sequence={} timeout_secs={}", options.appid, sequence, HEARTBEAT_TIMEOUT.as_secs());
+                        log::warn!("Signaling control heartbeat timed out: app_id={} sequence={} timeout_secs={}", options.appid, sequence, HEARTBEAT_TIMEOUT.as_secs());
                         socket = reconnect(&options, &mut controller).await;
                         heartbeat.reset();
                     }
@@ -294,7 +294,7 @@ async fn exchange(
     request_id: u64,
 ) -> Result<AppControlResponse, String> {
     let operation = request.operation_name();
-    log::info!("Signaling control request: operation={operation} requestid={request_id}");
+    log::info!("Signaling control request: operation={operation} request_id={request_id}");
     socket
         .send(Message::binary(request.encode_wire()))
         .await
@@ -309,9 +309,9 @@ async fn exchange(
             FrameAction::Binary(bytes) => {
                 if let Some(response) = Controller::correlate_response(&bytes, request_id)? {
                     log::info!(
-                        "Signaling control response: operation={operation} requestid={request_id} result={} reason={}",
+                        "Signaling control response: operation={operation} request_id={request_id} result={} reason={}",
                         response.result_name(),
-                        response.reason
+                        response.reason()
                     );
                     return Ok(response);
                 }
@@ -331,7 +331,7 @@ async fn reconnect(options: &ConnectionOptions, controller: &mut Controller) -> 
         let jitter = Duration::from_millis(rand::random::<u64>() % RECONNECT_JITTER_MS);
         let (attempt, delay) = controller.schedule_reconnect(jitter);
         log::info!(
-            "Signaling control reconnect scheduled: appid={} attempt={} delay_ms={}",
+            "Signaling control reconnect scheduled: app_id={} attempt={} delay_ms={}",
             options.appid,
             attempt,
             delay.as_millis()
@@ -339,14 +339,14 @@ async fn reconnect(options: &ConnectionOptions, controller: &mut Controller) -> 
         tokio::time::sleep(delay).await;
         match tokio::time::timeout(CONNECT_TIMEOUT, connect_control(options, attempt)).await {
             Err(_) => log::warn!(
-                "Signaling control reconnect timed out: appid={} attempt={} timeout_secs={}",
+                "Signaling control reconnect timed out: app_id={} attempt={} timeout_secs={}",
                 options.appid,
                 attempt,
                 CONNECT_TIMEOUT.as_secs()
             ),
             Ok(Ok(socket)) => {
                 log::info!(
-                    "Signaling control reconnected: appid={} attempt={}",
+                    "Signaling control reconnected: app_id={} attempt={}",
                     options.appid,
                     attempt
                 );
@@ -354,7 +354,7 @@ async fn reconnect(options: &ConnectionOptions, controller: &mut Controller) -> 
                 return socket;
             }
             Ok(Err(error)) => log::warn!(
-                "Signaling control reconnect failed: appid={} attempt={} error={error}",
+                "Signaling control reconnect failed: app_id={} attempt={} error={error}",
                 options.appid,
                 attempt
             ),

@@ -8,8 +8,8 @@ use sansio::Protocol;
 use signaling_proto::{
     Request as AppControlRequest, Response as AppControlResponse,
     v1::{
-        Admitted, OccupancyResult, StatusResult, request::Command as AppCommand,
-        response::Payload as AppPayload,
+        request::Command as AppCommand,
+        response::{Admitted, OccupancyResult, StatusResult, ok::Payload as AppPayload},
     },
 };
 use std::collections::{HashMap, VecDeque};
@@ -191,11 +191,11 @@ impl Collider {
         msg: AppControlRequest,
         now: Instant,
     ) -> Result<(), String> {
-        let requestid = msg.requestid;
+        let requestid = msg.request_id;
         let operation = msg.operation_name();
         if requestid == 0 || msg.command.is_none() {
             log::warn!(
-                "AppWeb control request rejected: connection_id={connection_id} requestid={requestid} operation={operation} reason=invalid_protobuf_request"
+                "AppWeb control request rejected: connection_id={connection_id} request_id={requestid} operation={operation} reason=invalid_protobuf_request"
             );
             self.websocket_errors = self.websocket_errors.saturating_add(1);
             self.browser_outputs
@@ -216,16 +216,16 @@ impl Collider {
                 return Ok(());
             };
             log::info!(
-                "AppWeb control registration request: connection_id={connection_id} requestid={} appid={} token_present={}",
+                "AppWeb control registration request: connection_id={connection_id} request_id={} app_id={} token_present={}",
                 requestid,
-                register.appid,
+                register.app_id,
                 !register.token.is_empty()
             );
-            if register.appid.is_empty() {
+            if register.app_id.is_empty() {
                 log::warn!(
-                    "AppWeb control registration rejected: connection_id={connection_id} requestid={} appid={} reason=invalid_registration",
+                    "AppWeb control registration rejected: connection_id={connection_id} request_id={} app_id={} reason=invalid_registration",
                     requestid,
-                    register.appid
+                    register.app_id
                 );
                 self.websocket_errors = self.websocket_errors.saturating_add(1);
                 self.browser_outputs.push_back(BrowserOutput::AppControl {
@@ -238,13 +238,13 @@ impl Collider {
                 self.browser_outputs
                     .push_back(BrowserOutput::Close { connection_id });
                 log::info!(
-                    "AppWeb control registration response: connection_id={connection_id} requestid={} appid={} result=ERR reason=Invalid app control registration registered=false",
+                    "AppWeb control registration response: connection_id={connection_id} request_id={} app_id={} result=ERR reason=Invalid app control registration registered=false",
                     requestid,
-                    register.appid
+                    register.app_id
                 );
                 return Ok(());
             }
-            let appid = register.appid;
+            let appid = register.app_id;
             self.sessions.insert(
                 connection_id,
                 Session::App {
@@ -256,7 +256,7 @@ impl Collider {
                 response: AppControlResponse::ok(requestid),
             });
             log::info!(
-                "AppWeb control registration response: connection_id={connection_id} requestid={} appid={appid} result=OK registered=true",
+                "AppWeb control registration response: connection_id={connection_id} request_id={} app_id={appid} result=OK registered=true",
                 requestid
             );
             return Ok(());
@@ -269,91 +269,92 @@ impl Collider {
         let (response, close_client) = match command {
             AppCommand::Admit(admit) => {
                 log::info!(
-                    "AppWeb control command: connection_id={connection_id} appid={appid} operation=admit requestid={requestid} room_id={} client_id={}",
-                    admit.roomid,
-                    admit.clientid
+                    "AppWeb control command: connection_id={connection_id} app_id={appid} operation=admit request_id={requestid} room_id={} client_id={}",
+                    admit.room_id,
+                    admit.client_id
                 );
                 let response =
                     match self
                         .rooms
-                        .join(now, &admit.roomid, &admit.clientid, admit.is_loopback)
+                        .join(now, &admit.room_id, &admit.client_id, admit.is_loopback)
                     {
-                        Ok((is_initiator, messages)) => AppControlResponse {
-                            payload: Some(AppPayload::Admitted(Admitted {
+                        Ok((is_initiator, messages)) => AppControlResponse::ok_with_payload(
+                            requestid,
+                            AppPayload::Admitted(Admitted {
                                 is_initiator,
                                 messages,
-                            })),
-                            ..AppControlResponse::ok(requestid)
-                        },
+                            }),
+                        ),
                         Err(reason) => AppControlResponse::err(requestid, reason),
                     };
                 (response, None)
             }
             AppCommand::Remove(remove) => {
                 log::info!(
-                    "AppWeb control command: connection_id={connection_id} appid={appid} operation=remove requestid={requestid} room_id={} client_id={}",
-                    remove.roomid,
-                    remove.clientid
+                    "AppWeb control command: connection_id={connection_id} app_id={appid} operation=remove request_id={requestid} room_id={} client_id={}",
+                    remove.room_id,
+                    remove.client_id
                 );
                 // A control-plane leave must have the same wire behavior as the
                 // legacy HTTP leave: remove the room member and close its live
                 // browser WebSocket after the control response is delivered.
-                self.rooms.leave(&remove.roomid, &remove.clientid);
+                self.rooms.leave(&remove.room_id, &remove.client_id);
                 (
                     AppControlResponse::ok(requestid),
-                    Some((remove.roomid, remove.clientid)),
+                    Some((remove.room_id, remove.client_id)),
                 )
             }
             AppCommand::Occupancy(occupancy) => {
                 log::info!(
-                    "AppWeb control command: connection_id={connection_id} appid={appid} operation=occupancy requestid={requestid} room_id={}",
-                    occupancy.roomid
+                    "AppWeb control command: connection_id={connection_id} app_id={appid} operation=occupancy request_id={requestid} room_id={}",
+                    occupancy.room_id
                 );
                 let count =
-                    u64::try_from(self.rooms.occupancy(&occupancy.roomid)).unwrap_or(u64::MAX);
+                    u64::try_from(self.rooms.occupancy(&occupancy.room_id)).unwrap_or(u64::MAX);
                 (
-                    AppControlResponse {
-                        payload: Some(AppPayload::Occupancy(OccupancyResult { count })),
-                        ..AppControlResponse::ok(requestid)
-                    },
+                    AppControlResponse::ok_with_payload(
+                        requestid,
+                        AppPayload::Occupancy(OccupancyResult { count }),
+                    ),
                     None,
                 )
             }
             AppCommand::Inject(inject) => {
                 log::info!(
-                    "AppWeb control command: connection_id={connection_id} appid={appid} operation=inject requestid={requestid} room_id={} client_id={}",
-                    inject.roomid,
-                    inject.clientid
+                    "AppWeb control command: connection_id={connection_id} app_id={appid} operation=inject request_id={requestid} room_id={} client_id={}",
+                    inject.room_id,
+                    inject.client_id
                 );
-                let response =
-                    match self
-                        .rooms
-                        .save_or_send(now, &inject.roomid, &inject.clientid, inject.msg)
-                    {
-                        Ok(()) => {
-                            self.drain_room_writes();
-                            AppControlResponse::ok(requestid)
-                        }
-                        Err(reason) => AppControlResponse::err(requestid, reason),
-                    };
+                let response = match self.rooms.save_or_send(
+                    now,
+                    &inject.room_id,
+                    &inject.client_id,
+                    inject.msg,
+                ) {
+                    Ok(()) => {
+                        self.drain_room_writes();
+                        AppControlResponse::ok(requestid)
+                    }
+                    Err(reason) => AppControlResponse::err(requestid, reason),
+                };
                 (response, None)
             }
             AppCommand::Status(_) => {
                 log::info!(
-                    "AppWeb control command: connection_id={connection_id} appid={appid} operation=status requestid={requestid}"
+                    "AppWeb control command: connection_id={connection_id} app_id={appid} operation=status request_id={requestid}"
                 );
                 (
-                    AppControlResponse {
-                        payload: Some(AppPayload::Status(StatusResult {
+                    AppControlResponse::ok_with_payload(
+                        requestid,
+                        AppPayload::Status(StatusResult {
                             rooms: u64::try_from(self.rooms.room_count()).unwrap_or(u64::MAX),
                             clients: u64::try_from(self.rooms.client_count()).unwrap_or(u64::MAX),
                             websocket_connections: u64::try_from(self.rooms.ws_count())
                                 .unwrap_or(u64::MAX),
                             total_websocket_connections: self.total_websocket_connections,
                             websocket_errors: self.websocket_errors,
-                        })),
-                        ..AppControlResponse::ok(requestid)
-                    },
+                        }),
+                    ),
                     None,
                 )
             }
@@ -367,11 +368,11 @@ impl Collider {
             response: response.clone(),
         });
         log::info!(
-            "AppWeb control response: connection_id={connection_id} appid={appid} operation={} requestid={} result={} reason={}",
+            "AppWeb control response: connection_id={connection_id} app_id={appid} operation={} request_id={} result={} reason={}",
             operation,
             requestid,
             response.result_name(),
-            response.reason
+            response.reason()
         );
         if let Some((roomid, clientid)) = close_client {
             self.close_client_connection(&roomid, &clientid);
@@ -472,7 +473,7 @@ impl Collider {
                 }
             }
             Session::App { appid } => log::info!(
-                "AppWeb control disconnected: connection_id={connection_id} appid={appid}"
+                "AppWeb control disconnected: connection_id={connection_id} app_id={appid}"
             ),
             Session::Connected => {}
         }
@@ -632,7 +633,14 @@ impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use signaling_proto::ResultCode;
+    use signaling_proto::v1::response::Result as AppResult;
+
+    fn ok_payload(response: &AppControlResponse) -> Option<&AppPayload> {
+        match &response.result {
+            Some(AppResult::Ok(ok)) => ok.payload.as_ref(),
+            Some(AppResult::Err(_)) | None => None,
+        }
+    }
 
     fn text(collider: &mut Collider, connection_id: u64, value: &str, now: Instant) {
         collider
@@ -679,7 +687,7 @@ mod tests {
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 99, response })
-                if response.requestid == 500 && response.result == i32::from(ResultCode::Ok)
+                if response.request_id == 500 && response.is_ok()
         ));
         control(
             &mut collider,
@@ -690,8 +698,8 @@ mod tests {
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 99, response })
-                if response.requestid == 1
-                    && matches!(response.payload, Some(AppPayload::Admitted(Admitted { is_initiator: true, .. })))
+                if response.request_id == 1
+                    && matches!(ok_payload(&response), Some(AppPayload::Admitted(Admitted { is_initiator: true, .. })))
         ));
         control(
             &mut collider,
@@ -702,18 +710,18 @@ mod tests {
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 99, response })
-                if matches!(response.payload, Some(AppPayload::Occupancy(OccupancyResult { count: 1 })))
+                if matches!(ok_payload(&response), Some(AppPayload::Occupancy(OccupancyResult { count: 1 })))
         ));
         control(&mut collider, 99, AppControlRequest::status(3), now);
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 99, response })
-                if matches!(response.payload, Some(AppPayload::Status(StatusResult { rooms: 1, .. })))
+                if matches!(ok_payload(&response), Some(AppPayload::Status(StatusResult { rooms: 1, .. })))
         ));
     }
 
     #[test]
-    fn app_role_requires_requestid_for_registration_and_every_command() {
+    fn app_role_requires_request_id_for_registration_and_every_command() {
         let now = Instant::now();
         let mut collider = Collider::new(Duration::from_secs(10));
 
@@ -739,9 +747,9 @@ mod tests {
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 97, response })
-                if response.requestid == 499
-                    && response.result == i32::from(ResultCode::Err)
-                    && response.reason == "Invalid app control registration"
+                if response.request_id == 499
+                    && !response.is_ok()
+                    && response.reason() == "Invalid app control registration"
         ));
         assert_eq!(
             collider.poll_write(),
@@ -758,13 +766,13 @@ mod tests {
         assert!(matches!(
             collider.poll_write(),
             Some(BrowserOutput::AppControl { connection_id: 99, response })
-                if response.requestid == 500 && response.result == i32::from(ResultCode::Ok)
+                if response.request_id == 500 && response.is_ok()
         ));
         control(
             &mut collider,
             99,
             AppControlRequest {
-                requestid: 501,
+                request_id: 501,
                 command: None,
             },
             now,

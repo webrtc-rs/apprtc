@@ -14,7 +14,8 @@
 //! The I/O driver that moves the frames lives in [`crate::ws_client`].
 
 use signaling_proto::{
-    Response as AppControlResponse, ResultCode, v1::response::Payload as AppPayload,
+    Response as AppControlResponse,
+    v1::response::{Result as AppResult, ok::Payload as AppPayload},
 };
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
@@ -87,25 +88,24 @@ impl Controller {
         request_id: u64,
     ) -> Result<Option<AppControlResponse>, String> {
         let response = AppControlResponse::decode_wire(bytes)?;
-        if response.requestid == 0 {
-            return Err("signaling control response has zero requestid".into());
+        if response.request_id == 0 {
+            return Err("signaling control response has zero request_id".into());
         }
-        Ok((response.requestid == request_id).then_some(response))
+        Ok((response.request_id == request_id).then_some(response))
     }
 
     /// Registration uses the same response envelope as other control operations.
     pub(crate) fn registration_ack(frame: &[u8], expected_requestid: u64) -> Result<(), String> {
         let response = AppControlResponse::decode_wire(frame)?;
-        let registered = response.result == i32::from(ResultCode::Ok)
-            && response.requestid == expected_requestid;
+        let registered = response.is_ok() && response.request_id == expected_requestid;
         if registered {
             Ok(())
         } else {
             Err(format!(
-                "signaling control registration failed: requestid={} result={} reason={}",
-                response.requestid,
+                "signaling control registration failed: request_id={} result={} reason={}",
+                response.request_id,
                 response.result_name(),
-                response.reason
+                response.reason()
             ))
         }
     }
@@ -148,22 +148,23 @@ pub(crate) trait ControlResponseExt: Sized {
 
 impl ControlResponseExt for AppControlResponse {
     fn ack(self, fallback: &str) -> Result<Self, String> {
-        match ResultCode::try_from(self.result) {
-            Ok(ResultCode::Ok) => Ok(self),
-            Ok(ResultCode::Err) => Err(if self.reason.is_empty() {
+        match &self.result {
+            Some(AppResult::Ok(_)) => Ok(self),
+            Some(AppResult::Err(error)) => Err(if error.reason.is_empty() {
                 fallback.to_string()
             } else {
-                self.reason
+                error.reason.clone()
             }),
-            Ok(ResultCode::Unspecified) | Err(_) => {
-                Err(format!("invalid control result: {}", self.result))
-            }
+            None => Err("control response missing result".into()),
         }
     }
 
     fn admission(self) -> Result<Admission, String> {
         let response = self.ack("admission failed")?;
-        match response.payload {
+        let Some(AppResult::Ok(ok)) = response.result else {
+            unreachable!("ack accepted only an OK response")
+        };
+        match ok.payload {
             Some(AppPayload::Admitted(admitted)) => Ok(Admission {
                 is_initiator: admitted.is_initiator,
                 messages: admitted.messages,
@@ -174,7 +175,10 @@ impl ControlResponseExt for AppControlResponse {
 
     fn occupancy_count(self) -> Result<usize, String> {
         let response = self.ack("occupancy failed")?;
-        match response.payload {
+        let Some(AppResult::Ok(ok)) = response.result else {
+            unreachable!("ack accepted only an OK response")
+        };
+        match ok.payload {
             Some(AppPayload::Occupancy(occupancy)) => {
                 usize::try_from(occupancy.count).map_err(|_| "occupancy count exceeds usize".into())
             }
@@ -184,7 +188,10 @@ impl ControlResponseExt for AppControlResponse {
 
     fn status_snapshot(self) -> Result<StatusSnapshot, String> {
         let response = self.ack("status failed")?;
-        let Some(AppPayload::Status(status)) = response.payload else {
+        let Some(AppResult::Ok(ok)) = response.result else {
+            unreachable!("ack accepted only an OK response")
+        };
+        let Some(AppPayload::Status(status)) = ok.payload else {
             return Err("status response missing status payload".into());
         };
         Ok(StatusSnapshot {
@@ -201,7 +208,7 @@ impl ControlResponseExt for AppControlResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use signaling_proto::v1::{Admitted, OccupancyResult, StatusResult};
+    use signaling_proto::v1::response::{Admitted, OccupancyResult, StatusResult};
 
     fn wire(response: AppControlResponse) -> Vec<u8> {
         response.encode_wire()
@@ -257,7 +264,7 @@ mod tests {
     #[test]
     fn replies_are_correlated_by_request_id() {
         let matched = Controller::correlate_response(&wire(AppControlResponse::ok(5)), 5).unwrap();
-        assert_eq!(matched.unwrap().requestid, 5);
+        assert_eq!(matched.unwrap().request_id, 5);
         // A stale response for an earlier request is skipped, not an error.
         assert!(
             Controller::correlate_response(&wire(AppControlResponse::ok(4)), 5)
@@ -301,25 +308,28 @@ mod tests {
 
     #[test]
     fn error_replies_map_to_their_result_or_the_fallback() {
-        let error = AppControlResponse {
-            reason: "FULL".into(),
-            ..AppControlResponse::err(1, "FULL")
-        };
+        let error = AppControlResponse::err(1, "FULL");
         assert_eq!(error.admission().unwrap_err(), "FULL");
 
-        let bare_error = AppControlResponse {
-            reason: String::new(),
-            ..AppControlResponse::err(1, "")
-        };
+        let bare_error = AppControlResponse::err(1, "");
         assert_eq!(bare_error.admission().unwrap_err(), "admission failed");
 
-        let admitted = AppControlResponse {
-            payload: Some(AppPayload::Admitted(Admitted {
+        let missing_result = AppControlResponse {
+            request_id: 1,
+            result: None,
+        };
+        assert_eq!(
+            missing_result.admission().unwrap_err(),
+            "control response missing result"
+        );
+
+        let admitted = AppControlResponse::ok_with_payload(
+            1,
+            AppPayload::Admitted(Admitted {
                 is_initiator: true,
                 messages: vec!["offer".into()],
-            })),
-            ..AppControlResponse::ok(1)
-        };
+            }),
+        );
         assert_eq!(
             admitted.admission().unwrap(),
             Admission {
@@ -331,27 +341,25 @@ mod tests {
 
     #[test]
     fn occupancy_and_status_replies_convert_with_defaults() {
-        let counted = AppControlResponse {
-            payload: Some(AppPayload::Occupancy(OccupancyResult { count: 2 })),
-            ..AppControlResponse::ok(1)
-        };
+        let counted = AppControlResponse::ok_with_payload(
+            1,
+            AppPayload::Occupancy(OccupancyResult { count: 2 }),
+        );
         assert_eq!(counted.occupancy_count().unwrap(), 2);
-        let missing = AppControlResponse {
-            ..AppControlResponse::ok(1)
-        };
+        let missing = AppControlResponse::ok(1);
         assert_eq!(
             missing.occupancy_count().unwrap_err(),
             "occupancy response missing occupancy payload"
         );
 
-        let snapshot = AppControlResponse {
-            payload: Some(AppPayload::Status(StatusResult {
+        let snapshot = AppControlResponse::ok_with_payload(
+            1,
+            AppPayload::Status(StatusResult {
                 rooms: 1,
                 clients: 2,
                 ..Default::default()
-            })),
-            ..AppControlResponse::ok(1)
-        }
+            }),
+        )
         .status_snapshot()
         .unwrap();
         assert_eq!(snapshot.rooms, 1);

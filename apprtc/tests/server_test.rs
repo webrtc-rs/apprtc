@@ -15,8 +15,8 @@ use common::{
     ws_receive_binary, ws_receive_json, ws_register, ws_send, ws_send_binary,
 };
 use serde_json::{Value, json};
-use signaling_proto::v1::response::Payload as ControlPayload;
-use signaling_proto::{Request as ControlRequest, Response as ControlResponse, ResultCode};
+use signaling_proto::v1::response::{Result as ControlResult, ok::Payload as ControlPayload};
+use signaling_proto::{Request as ControlRequest, Response as ControlResponse};
 
 #[tokio::test]
 async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
@@ -65,15 +65,19 @@ async fn preserves_appweb_signaling_status_contract() -> Result<()> {
     .await?;
     let registered = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
         .map_err(anyhow::Error::msg)?;
-    assert_eq!(registered.requestid, 500);
-    assert_eq!(registered.result, i32::from(ResultCode::Ok));
+    assert_eq!(registered.request_id, 500);
+    assert!(registered.is_ok());
 
     ws_send_binary(&mut socket, ControlRequest::status(1).encode_wire()).await?;
     let status = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
         .map_err(anyhow::Error::msg)?;
-    assert_eq!(status.requestid, 1);
-    assert_eq!(status.result, i32::from(ResultCode::Ok));
-    assert!(matches!(status.payload, Some(ControlPayload::Status(_))));
+    assert_eq!(status.request_id, 1);
+    assert!(matches!(
+        status.result,
+        Some(ControlResult::Ok(signaling_proto::v1::response::Ok {
+            payload: Some(ControlPayload::Status(_))
+        }))
+    ));
     socket.close(None).await?;
     Ok(())
 }
@@ -94,7 +98,7 @@ async fn separates_browser_json_and_appweb_protobuf_endpoints() -> Result<()> {
     ws_send_binary(
         &mut malformed,
         ControlRequest {
-            requestid: 1,
+            request_id: 1,
             command: None,
         }
         .encode_wire(),
@@ -158,16 +162,24 @@ async fn accepts_opaque_string_room_and_client_ids_in_v1_websocket_protocol() ->
 async fn reports_websocket_lifecycle_counters() -> Result<()> {
     wait_for_server().await?;
     let before = http("GET", "/status", &[]).await?.json()?;
+    let closed_before = before["totalws"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(before["openws"].as_u64().unwrap_or(0));
     let room = unique_room("status");
     let first = join(&room).await?;
     let first_id = client_id(&first)?;
     let mut socket = ws_register(&room, first_id).await?;
     let during = http("GET", "/status", &[]).await?.json()?;
-    assert!(during["openws"].as_u64().unwrap_or(0) > before["openws"].as_u64().unwrap_or(0));
+    assert!(during["totalws"].as_u64().unwrap_or(0) > before["totalws"].as_u64().unwrap_or(0));
     socket.close(None).await?;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let after = http("GET", "/status", &[]).await?.json()?;
-    assert!(after["openws"].as_u64().unwrap_or(1) < during["openws"].as_u64().unwrap_or(1));
+    let closed_after = after["totalws"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(after["openws"].as_u64().unwrap_or(0));
+    assert!(closed_after > closed_before);
     cleanup(&room, first_id).await?;
     Ok(())
 }

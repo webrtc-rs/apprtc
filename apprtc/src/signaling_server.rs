@@ -356,9 +356,9 @@ async fn ws_session(
                         break;
                     }
                     let request = match AppControlRequest::decode_wire(&bytes) {
-                        Ok(request) if request.requestid != 0 && request.command.is_some() => request,
+                        Ok(request) if request.request_id != 0 && request.command.is_some() => request,
                         Ok(_) => {
-                            log::warn!("AppWeb control Protobuf request rejected: connection_id={connection_id} reason=missing_requestid_or_command");
+                            log::warn!("AppWeb control Protobuf request rejected: connection_id={connection_id} reason=missing_request_id_or_command");
                             break;
                         }
                         Err(error) => {
@@ -367,9 +367,9 @@ async fn ws_session(
                         }
                     };
                     log::info!(
-                        "AppWeb control WebSocket message: connection_id={connection_id} operation={} requestid={} bytes={}",
+                        "AppWeb control WebSocket message: connection_id={connection_id} operation={} request_id={} bytes={}",
                         request.operation_name(),
-                        request.requestid,
+                        request.request_id,
                         bytes.len()
                     );
                     if commands.send(DriverCommand::AppControl {
@@ -565,7 +565,7 @@ fn drain_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use signaling_proto::{Response as AppControlResponse, ResultCode};
+    use signaling_proto::Response as AppControlResponse;
 
     struct Harness {
         stop_tx: watch::Sender<()>,
@@ -692,13 +692,13 @@ mod tests {
             )
             .await;
         let registered = recv_control(&mut outputs).await;
-        assert_eq!(registered.requestid, 1);
-        assert_eq!(registered.result, i32::from(ResultCode::Ok));
+        assert_eq!(registered.request_id, 1);
+        assert!(registered.is_ok());
 
         harness.app_control(9, AppControlRequest::status(2)).await;
         let status = recv_control(&mut outputs).await;
-        assert_eq!(status.requestid, 2);
-        assert_eq!(status.result, i32::from(ResultCode::Ok));
+        assert_eq!(status.request_id, 2);
+        assert!(status.is_ok());
         harness.shutdown().await;
     }
 

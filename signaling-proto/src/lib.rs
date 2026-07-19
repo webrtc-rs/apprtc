@@ -6,7 +6,7 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/signaling.v1.rs"));
 }
 
-pub use v1::{Request, Response, Result as ResultCode};
+pub use v1::{Request, Response};
 
 impl Request {
     pub fn decode_wire(bytes: &[u8]) -> Result<Self, String> {
@@ -30,56 +30,61 @@ impl Request {
         }
     }
 
-    pub fn register(requestid: u64, appid: String, token: String) -> Self {
+    pub fn register(request_id: u64, app_id: String, token: String) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::App(v1::Register { appid, token })),
+            request_id,
+            command: Some(v1::request::Command::App(v1::request::Register {
+                app_id,
+                token,
+            })),
         }
     }
 
-    pub fn admit(requestid: u64, roomid: String, clientid: String, is_loopback: bool) -> Self {
+    pub fn admit(request_id: u64, room_id: String, client_id: String, is_loopback: bool) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::Admit(v1::Admit {
-                roomid,
-                clientid,
+            request_id,
+            command: Some(v1::request::Command::Admit(v1::request::Admit {
+                room_id,
+                client_id,
                 is_loopback,
             })),
         }
     }
 
-    pub fn remove(requestid: u64, roomid: String, clientid: String) -> Self {
+    pub fn remove(request_id: u64, room_id: String, client_id: String) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::Remove(v1::Remove {
-                roomid,
-                clientid,
+            request_id,
+            command: Some(v1::request::Command::Remove(v1::request::Remove {
+                room_id,
+                client_id,
             })),
         }
     }
 
-    pub fn occupancy(requestid: u64, roomid: String) -> Self {
+    pub fn occupancy(request_id: u64, room_id: String) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::Occupancy(v1::Occupancy { roomid })),
+            request_id,
+            command: Some(v1::request::Command::Occupancy(v1::request::Occupancy {
+                room_id,
+            })),
         }
     }
 
-    pub fn inject(requestid: u64, roomid: String, clientid: String, msg: String) -> Self {
+    pub fn inject(request_id: u64, room_id: String, client_id: String, msg: String) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::Inject(v1::Inject {
-                roomid,
-                clientid,
+            request_id,
+            command: Some(v1::request::Command::Inject(v1::request::Inject {
+                room_id,
+                client_id,
                 msg,
             })),
         }
     }
 
-    pub fn status(requestid: u64) -> Self {
+    pub fn status(request_id: u64) -> Self {
         Self {
-            requestid,
-            command: Some(v1::request::Command::Status(v1::StatusRequest {})),
+            request_id,
+            command: Some(v1::request::Command::Status(v1::request::StatusRequest {})),
         }
     }
 }
@@ -93,29 +98,47 @@ impl Response {
         self.encode_to_vec()
     }
 
-    pub fn ok(requestid: u64) -> Self {
+    pub fn ok(request_id: u64) -> Self {
         Self {
-            requestid,
-            result: ResultCode::Ok.into(),
-            reason: String::new(),
-            payload: None,
+            request_id,
+            result: Some(v1::response::Result::Ok(v1::response::Ok { payload: None })),
         }
     }
 
-    pub fn err(requestid: u64, reason: impl Into<String>) -> Self {
+    pub fn ok_with_payload(request_id: u64, payload: v1::response::ok::Payload) -> Self {
         Self {
-            requestid,
-            result: ResultCode::Err.into(),
-            reason: reason.into(),
-            payload: None,
+            request_id,
+            result: Some(v1::response::Result::Ok(v1::response::Ok {
+                payload: Some(payload),
+            })),
+        }
+    }
+
+    pub fn err(request_id: u64, reason: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            result: Some(v1::response::Result::Err(v1::response::Err {
+                reason: reason.into(),
+            })),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        matches!(self.result, Some(v1::response::Result::Ok(_)))
+    }
+
+    pub fn reason(&self) -> &str {
+        match &self.result {
+            Some(v1::response::Result::Err(err)) => &err.reason,
+            Some(v1::response::Result::Ok(_)) | None => "",
         }
     }
 
     pub fn result_name(&self) -> &'static str {
-        match ResultCode::try_from(self.result) {
-            Ok(ResultCode::Ok) => "OK",
-            Ok(ResultCode::Err) => "ERR",
-            Ok(ResultCode::Unspecified) | Err(_) => "UNSPECIFIED",
+        match self.result {
+            Some(v1::response::Result::Ok(_)) => "OK",
+            Some(v1::response::Result::Err(_)) => "ERR",
+            None => "MISSING",
         }
     }
 }
@@ -129,11 +152,36 @@ mod tests {
         let request = Request::admit(7, "room".into(), "client".into(), true);
         let decoded = Request::decode_wire(&request.encode_wire()).unwrap();
         assert_eq!(decoded, request);
+        assert_eq!(decoded.request_id, 7);
         assert_eq!(decoded.operation_name(), "admit");
+        assert!(matches!(
+            decoded.command,
+            Some(v1::request::Command::Admit(v1::request::Admit {
+                room_id,
+                client_id,
+                is_loopback: true,
+            })) if room_id == "room" && client_id == "client"
+        ));
 
         let response = Response::err(7, "FULL");
         let decoded = Response::decode_wire(&response.encode_wire()).unwrap();
         assert_eq!(decoded, response);
         assert_eq!(decoded.result_name(), "ERR");
+        assert_eq!(decoded.reason(), "FULL");
+
+        let response = Response::ok_with_payload(
+            8,
+            v1::response::ok::Payload::Occupancy(v1::response::OccupancyResult { count: 2 }),
+        );
+        let decoded = Response::decode_wire(&response.encode_wire()).unwrap();
+        assert!(decoded.is_ok());
+        assert!(matches!(
+            decoded.result,
+            Some(v1::response::Result::Ok(v1::response::Ok {
+                payload: Some(v1::response::ok::Payload::Occupancy(
+                    v1::response::OccupancyResult { count: 2 }
+                )),
+            }))
+        ));
     }
 }
