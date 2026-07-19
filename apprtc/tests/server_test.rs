@@ -32,7 +32,7 @@ async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
     let params = http("GET", "/params", &[]).await?;
     assert_eq!(params.status, 200);
     let params = params.json()?;
-    assert_eq!(params["wss_url"], "wss://127.0.0.1:8080/ws");
+    assert_eq!(params["wss_url"], "wss://127.0.0.1:8081/ws");
     assert_eq!(params["wss_post_url"], "https://127.0.0.1:8080");
 
     let ice = http("POST", "/v1alpha/iceconfig", &[]).await?;

@@ -12,10 +12,17 @@ use tokio_rustls::server::TlsStream;
 
 pub fn config(certificate: &str, private_key: &str) -> Result<Arc<ServerConfig>> {
     let (certificate, private_key) = if certificate.is_empty() && private_key.is_empty() {
-        (include_bytes!("../cert/cert.pem").to_vec(), include_bytes!("../cert/key.pem").to_vec())
+        (
+            include_bytes!("../cert/cert.pem").to_vec(),
+            include_bytes!("../cert/key.pem").to_vec(),
+        )
     } else if !certificate.is_empty() && !private_key.is_empty() {
-        (std::fs::read(certificate).with_context(|| format!("failed to read certificate {certificate}"))?,
-         std::fs::read(private_key).with_context(|| format!("failed to read private key {private_key}"))?)
+        (
+            std::fs::read(certificate)
+                .with_context(|| format!("failed to read certificate {certificate}"))?,
+            std::fs::read(private_key)
+                .with_context(|| format!("failed to read private key {private_key}"))?,
+        )
     } else {
         bail!("--certificate and --private-key must be supplied together");
     };
@@ -24,14 +31,24 @@ pub fn config(certificate: &str, private_key: &str) -> Result<Arc<ServerConfig>>
     let private_key = rustls_pemfile::private_key(&mut BufReader::new(&private_key[..]))?
         .ok_or_else(|| anyhow::anyhow!("no private key found in PEM input"))?;
     let _ = rustls::crypto::ring::default_provider().install_default();
-    Ok(Arc::new(ServerConfig::builder().with_no_client_auth().with_single_cert(certificates, private_key)?))
+    Ok(Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)?,
+    ))
 }
 
-pub struct TlsListener { listener: TcpListener, acceptor: TlsAcceptor }
+pub struct TlsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+}
 
 impl TlsListener {
     pub fn new(listener: TcpListener, config: Arc<ServerConfig>) -> Self {
-        Self { listener, acceptor: TlsAcceptor::from(config) }
+        Self {
+            listener,
+            acceptor: TlsAcceptor::from(config),
+        }
     }
 }
 
@@ -54,5 +71,7 @@ impl Listener for TlsListener {
         }
     }
 
-    fn local_addr(&self) -> std::io::Result<Self::Addr> { self.listener.local_addr() }
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
 }

@@ -30,6 +30,10 @@ pub struct Config {
     /// like plain HTTP (e.g. behind a TLS-terminating proxy).
     pub force_tls: bool,
 
+    /// Public signaling WebSocket origin (for split AppWeb/signaling
+    /// deployments). When empty, the AppWeb origin is used.
+    pub signaling_url: String,
+
     /// If non-empty, returned verbatim from `/v1alpha/iceconfig` and used as the
     /// `iceServers` of the peer connection config (was `constants.ICE_SERVER_OVERRIDE`).
     pub ice_server_override: Vec<IceServer>,

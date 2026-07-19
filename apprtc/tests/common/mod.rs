@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 pub const HOST: &str = "127.0.0.1";
 pub const PORT: u16 = 8080;
+pub const SIGNALING_PORT: u16 = 8081;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type WsStream =
@@ -121,7 +122,7 @@ pub async fn ws_register(room_id: &str, client_id: &str) -> Result<WsStream> {
 
 pub async fn ws_connect() -> Result<WsStream> {
     ensure_crypto_provider();
-    let request = format!("wss://{HOST}:{PORT}/ws").into_client_request()?;
+    let request = format!("wss://{HOST}:{SIGNALING_PORT}/ws").into_client_request()?;
     let connector = Connector::Rustls(tls_config()?);
     let (socket, response) = timeout(
         IO_TIMEOUT,

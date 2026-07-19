@@ -104,7 +104,11 @@ impl Config {
         let (http_scheme, ws_scheme, host) = self.self_origin(host);
 
         // Single, self-hosted server: the WSS server is this binary.
-        let wss_url = format!("{ws_scheme}://{host}/ws");
+        let wss_url = if self.signaling_url.is_empty() {
+            format!("{ws_scheme}://{host}/ws")
+        } else {
+            format!("{}/ws", self.signaling_url.trim_end_matches('/'))
+        };
         let wss_post_url = format!("{http_scheme}://{host}");
 
         // pc_config: iceServers filled in by the client via the TURN request, plus
