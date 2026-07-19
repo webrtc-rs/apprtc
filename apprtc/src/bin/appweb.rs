@@ -1,4 +1,6 @@
 //! Standalone AppWeb HTTP/API server using a remote signaling authority.
+#[path = "../tls.rs"]
+mod tls;
 use anyhow::{Result, bail};
 use appweb::config::Config;
 use appweb::room_server::RoomServer;
@@ -24,6 +26,12 @@ struct Cli {
     appid: String,
     #[arg(long, default_value = "")]
     signaling_token: String,
+    #[arg(long)]
+    tls: bool,
+    #[arg(long, default_value_t = String::new())]
+    certificate: String,
+    #[arg(long, default_value_t = String::new())]
+    private_key: String,
 }
 
 #[tokio::main]
@@ -58,10 +66,15 @@ async fn main() -> Result<()> {
     let address: SocketAddr = format!("{}:{}", cli.host_ip, cli.port).parse()?;
     let listener = TcpListener::bind(address).await?;
     println!("AppWeb listening on {public}");
-    axum::serve(listener, server.router())
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let app = server.router();
+    if cli.tls {
+        axum::serve(tls::TlsListener::new(listener, tls::config(&cli.certificate, &cli.private_key)?), app)
+            .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+            .await?;
+    } else {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+            .await?;
+    }
     Ok(())
 }
