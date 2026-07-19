@@ -48,11 +48,11 @@ repository's `go` branch.
 
 The workspace has three Rust crates:
 
-| Crate                    | Responsibility                                                                                                                                                  |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)       | Standalone `appweb` and `signaling` binaries, CLI parsing, TLS listeners, logging, and graceful shutdown.                                                         |
-| [`appweb`](appweb)       | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                      |
-| [`signaling`](signaling) | Authoritative room/client state, V1 browser protocol, message queueing and relay, reconnect deadlines, Sans-I/O protocol layers, and the Axum WebSocket driver. |
+| Crate                    | Responsibility                                                                                                                                                                          |
+|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [`apprtc`](apprtc)       | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, and the async WebSocket I/O driver that hosts the Sans-I/O signaling core.        |
+| [`appweb`](appweb)       | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                                              |
+| [`signaling`](signaling) | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
 
 AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses a
 control WebSocket to submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to signaling. Browser
@@ -67,9 +67,18 @@ Collider
         └── Client
 ```
 
-Tokio tasks own sockets and timers, while `Collider` owns deterministic signaling state. Successful V1 registration is
-intentionally silent, and a disconnected registered client remains eligible to reconnect for 10 seconds before its
-membership is removed.
+Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and
+testable in memory, without sockets or a wall clock.
+
+All I/O lives at the binary level, in [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs), keeping
+the SFU `chat` example's architecture in async form on Tokio: an accept loop (`accept_loop`) performs the optional TLS
+handshake and the `/ws` WebSocket upgrade, spawning one session task per connection, while a single event-loop task
+(`event_loop`) owns the `Collider` — serializing every browser input through it, firing its timeouts, and routing
+its outputs back to each session over channels. Sessions and the event loop sleep on `tokio::select!` and wake
+immediately on input, output, deadline, or shutdown — no blocking calls and no polling intervals.
+
+Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to
+reconnect for 10 seconds before its membership is removed.
 
 ## Current P2P V1 behavior
 
@@ -183,26 +192,26 @@ cargo run -p apprtc --bin appweb -- \
 Run `cargo run -p apprtc --bin appweb -- --help` or `cargo run -p apprtc --bin signaling -- --help` for the
 authoritative lists.
 
-| Option | Default | Description |
-|---|---:|---|
-| `--host-ip <HOST-IP>` | `127.0.0.1` | Local listener bind address (both binaries). |
-| `--public-url <URL>` | listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
-| `-p, --port <PORT>` | `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port. |
-| `--web-root <PATH>` | `appweb` | Static asset directory (`appweb`). |
-| `--tls` | off | Serve HTTPS/WSS instead of HTTP/WS. |
-| `--certificate <PATH>` | bundled certificate | PEM certificate chain used with `--tls`. |
-| `--private-key <PATH>` | bundled key | PEM private key used with `--tls`. |
-| `--signaling-url <URL>` | none | Signaling control/browser WebSocket URL, including `/ws` (`appweb`). |
-| `--signaling-insecure-tls` | off | Disable verification for local self-signed signaling TLS (`appweb`). |
-| `--appid`, `--signaling-token` | `appweb-1`, empty | AppWeb control identity and token (`appweb`). |
-| `--ice-server-url <URLS>` | empty | ICE server URLs (`appweb`). |
-| `--ice-server-base-url <URL>` | AppWeb origin | External ICE credential service origin (`appweb`). |
-| `--ice-server-api-key <KEY>` | empty | API key for the ICE credential service (`appweb`). |
-| `--header-message <TEXT>` | empty | Banner displayed by the web application (`appweb`). |
-| `--bypass-join-confirmation` | off | Skip the browser ready-to-join prompt (`appweb`). |
-| `-d, --debug` | off | Enable application logging (both binaries). |
-| `-l, --level <LEVEL>` | `info` | Log filter (both binaries). |
-| `-o, --output-log-file <PATH>` | stdout | Write formatted logs to a file (both binaries). |
+| Option                         |                 Default | Description                                                             |
+|--------------------------------|------------------------:|-------------------------------------------------------------------------|
+| `--host-ip <HOST-IP>`          |             `127.0.0.1` | Local listener bind address (both binaries).                            |
+| `--public-url <URL>`           | listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
+| `-p, --port <PORT>`            |           `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port.                       |
+| `--web-root <PATH>`            |                `appweb` | Static asset directory (`appweb`).                                      |
+| `--tls`                        |                     off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
+| `--certificate <PATH>`         |     bundled certificate | PEM certificate chain used with `--tls`.                                |
+| `--private-key <PATH>`         |             bundled key | PEM private key used with `--tls`.                                      |
+| `--signaling-url <URL>`        |                    none | Signaling control/browser WebSocket URL, including `/ws` (`appweb`).    |
+| `--signaling-insecure-tls`     |                     off | Disable verification for local self-signed signaling TLS (`appweb`).    |
+| `--appid`, `--signaling-token` |       `appweb-1`, empty | AppWeb control identity and token (`appweb`).                           |
+| `--ice-server-url <URLS>`      |                   empty | ICE server URLs (`appweb`).                                             |
+| `--ice-server-base-url <URL>`  |           AppWeb origin | External ICE credential service origin (`appweb`).                      |
+| `--ice-server-api-key <KEY>`   |                   empty | API key for the ICE credential service (`appweb`).                      |
+| `--header-message <TEXT>`      |                   empty | Banner displayed by the web application (`appweb`).                     |
+| `--bypass-join-confirmation`   |                     off | Skip the browser ready-to-join prompt (`appweb`).                       |
+| `-d, --debug`                  |                     off | Enable application logging (both binaries).                             |
+| `-l, --level <LEVEL>`          |                  `info` | Log filter (both binaries).                                             |
+| `-o, --output-log-file <PATH>` |                  stdout | Write formatted logs to a file (both binaries).                         |
 
 Example ICE configuration:
 
@@ -304,16 +313,6 @@ object. V1 signaling treats it as an opaque UTF-8 string.
   "wserrors": 0,
   "httperrors": 0
 }
-```
-
-## Repository layout
-
-```text
-apprtc/       Rust executable crate and development TLS certificate
-appweb/       Rust web/API crate plus AppRTC browser assets
-signaling/    Rust Sans-I/O signaling authority and WebSocket driver
-sfu/          Rust Sans-I/O selective-forwarding media server
-docs/design/  Signaling architecture and protocol design
 ```
 
 ## License

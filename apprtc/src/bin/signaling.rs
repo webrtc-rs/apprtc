@@ -1,6 +1,6 @@
 //! Standalone browser/AppWeb signaling endpoint.
 //!
-//! All I/O lives here (blocking threads + `tungstenite`, following the SFU `chat`
+//! All I/O lives here (async Tokio tasks + `tokio-tungstenite`, keeping the SFU `chat`
 //! example's architecture); the `signaling` crate is a pure Sans-I/O state machine.
 #[path = "../signaling_server.rs"]
 mod signaling_server;
@@ -13,9 +13,9 @@ use env_logger::Target;
 use log::LevelFilter;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::TcpListener;
-use std::sync::mpsc;
 use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, watch};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -62,7 +62,8 @@ impl From<Level> for LevelFilter {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.debug {
         env_logger::Builder::new()
@@ -97,7 +98,7 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port))?;
+    let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port)).await?;
     println!(
         "Signaling WebSocket listening on {}://{}:{}/ws",
         if cli.tls { "wss" } else { "ws" },
@@ -105,35 +106,28 @@ fn main() -> anyhow::Result<()> {
         cli.port
     );
 
-    let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
-    let (commands_tx, commands_rx) = mpsc::sync_channel(signaling_server::COMMAND_CAPACITY);
+    let (stop_tx, stop_rx) = watch::channel(());
+    let (commands_tx, commands_rx) = mpsc::channel(signaling_server::COMMAND_CAPACITY);
 
-    // The run loop that owns the Sans-I/O Collider is on a separate thread to the
-    // accept loop, exactly like the chat example's media run loops.
-    let event_loop_handle = {
-        let stop_rx = stop_rx.clone();
-        std::thread::spawn(move || {
-            signaling_server::event_loop(stop_rx, commands_rx, REGISTER_TIMEOUT)
-        })
-    };
-    let serve_io_handle = {
-        let stop_rx = stop_rx.clone();
-        std::thread::spawn(move || {
-            signaling_server::serve_io(stop_rx, listener, tls_config, commands_tx)
-        })
-    };
+    // The event loop that owns the Sans-I/O Collider is a separate task to the accept loop
+    let event_loop_handle = tokio::spawn(signaling_server::event_loop(
+        stop_rx.clone(),
+        commands_rx,
+        REGISTER_TIMEOUT,
+    ));
+    let accept_loop_handle = tokio::spawn(signaling_server::accept_loop(
+        stop_rx,
+        commands_tx,
+        listener,
+        tls_config,
+    ));
 
     println!("Press Ctrl-C to stop");
-    let mut stop_tx = Some(stop_tx);
-    ctrlc::set_handler(move || {
-        if let Some(stop_tx) = stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
-    })?;
-    let _ = stop_rx.recv();
+    let _ = tokio::signal::ctrl_c().await;
     println!("Wait for Signaling Server Gracefully Shutdown...");
-    let _ = serve_io_handle.join();
-    let _ = event_loop_handle.join();
+    let _ = stop_tx.send(());
+    let _ = accept_loop_handle.await;
+    let _ = event_loop_handle.await;
     println!("signaling server is gracefully down");
     Ok(())
 }

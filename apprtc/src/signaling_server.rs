@@ -1,27 +1,35 @@
-//! Blocking-thread I/O driver for the Sans-I/O [`signaling::collider::Collider`].
+//! Async (Tokio) I/O driver for the Sans-I/O [`signaling::collider::Collider`].
 //!
-//! Mirrors the architecture of the SFU `chat` example: the binary owns the TCP + TLS
-//! listener, per-connection WebSocket threads, and the run loop that owns the state
-//! machine — the `signaling` crate itself contains no sockets, no threads, and no clock.
+//! Keeps the architecture of the SFU `chat` example — the binary owns the TCP + TLS
+//! listener, per-connection WebSocket sessions, and the event loop that owns the state
+//! machine — but every blocking call is replaced with an async task, so sessions and the
+//! event loop sleep on `tokio::select!` instead of polling with read timeouts: inputs,
+//! outputs, deadlines, and the stop signal all wake their task immediately.
 //!
 //! Each browser opens **one** WebSocket on `/ws`. A hand-rolled HTTP layer completes the
-//! RFC 6455 upgrade (so the raw stream keeps a read timeout), then a `tungstenite`
-//! session thread shuttles frames to the run loop over channels. The run loop serializes
-//! every [`BrowserInput`] through the single `Collider` and routes every
-//! [`BrowserOutput`] back to the owning session's channel.
+//! RFC 6455 upgrade, then a `tokio-tungstenite` session task shuttles frames to the
+//! event loop over channels. The event loop serializes every [`BrowserInput`] through
+//! the single `Collider` and routes every [`BrowserOutput`] back to the owning session's
+//! channel.
 
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use futures_util::{SinkExt, StreamExt};
+use rustls::ServerConfig;
 use sansio::Protocol;
 use signaling::collider::{BrowserInput, BrowserOutput, Collider, ConnectionId};
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tungstenite::handshake::derive_accept_key;
-use tungstenite::protocol::{Role, WebSocketConfig};
-use tungstenite::{Message, WebSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 pub const COMMAND_CAPACITY: usize = 1024;
 const SOCKET_OUTPUT_CAPACITY: usize = 1024;
@@ -31,26 +39,21 @@ const SOCKET_OUTPUT_CAPACITY: usize = 1024;
 /// limit leaves room for larger browser-generated descriptions without
 /// allowing an unbounded allocation on the dedicated signaling host.
 const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
-/// A WebSocket `read()` blocks at most this long, so the session thread can interleave
-/// run-loop→browser writes (a relayed message or control reply reaches the peer within
-/// one interval). Kept short because AppWeb serializes its control requests over one
-/// WebSocket: every interval of reply latency directly caps control throughput.
-const WS_POLL_TIMEOUT: Duration = Duration::from_millis(5);
 /// An idle socket (no text, no ping) is closed after this long.
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
-/// The run loop notices a stop signal within this interval even with no traffic.
-const STOP_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+/// The TLS handshake and HTTP request head must complete within this long.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum SocketOutput {
     Text(String),
     Close,
 }
 
-/// Commands a session thread hands to the run loop that owns the `Collider`.
+/// Commands a session task hands to the event loop that owns the `Collider`.
 pub enum DriverCommand {
     Connected {
         connection_id: ConnectionId,
-        output: SyncSender<SocketOutput>,
+        output: mpsc::Sender<SocketOutput>,
     },
     Text {
         connection_id: ConnectionId,
@@ -66,39 +69,45 @@ pub enum DriverCommand {
 /// A plain or TLS stream over one accepted `TcpStream`.
 enum Stream {
     Plain(TcpStream),
-    Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
-impl Stream {
-    fn socket(&self) -> &TcpStream {
-        match self {
-            Stream::Plain(tcp) => tcp,
-            Stream::Tls(tls) => &tls.sock,
+impl AsyncRead for Stream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Plain(tcp) => Pin::new(tcp).poll_read(cx, buf),
+            Stream::Tls(tls) => Pin::new(tls).poll_read(cx, buf),
         }
     }
 }
 
-impl Read for Stream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(tcp) => tcp.read(buf),
-            Stream::Tls(tls) => tls.read(buf),
-        }
-    }
-}
-
-impl Write for Stream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Plain(tcp) => tcp.write(buf),
-            Stream::Tls(tls) => tls.write(buf),
+impl AsyncWrite for Stream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Stream::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
+            Stream::Tls(tls) => Pin::new(tls).poll_write(cx, buf),
         }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Stream::Plain(tcp) => tcp.flush(),
-            Stream::Tls(tls) => tls.flush(),
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Plain(tcp) => Pin::new(tcp).poll_flush(cx),
+            Stream::Tls(tls) => Pin::new(tls).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match &mut *self {
+            Stream::Plain(tcp) => Pin::new(tcp).poll_shutdown(cx),
+            Stream::Tls(tls) => Pin::new(tls).poll_shutdown(cx),
         }
     }
 }
@@ -106,41 +115,34 @@ impl Write for Stream {
 // ───────────────────────────── TLS + HTTP + WebSocket ──────────────────────────────
 
 /// Accept connections until `stop_rx` fires; upgrade `/ws` to a WebSocket session.
-pub fn serve_io(
-    stop_rx: crossbeam_channel::Receiver<()>,
+pub async fn accept_loop(
+    mut stop_rx: watch::Receiver<()>,
+    commands: mpsc::Sender<DriverCommand>,
     listener: TcpListener,
     tls_config: Option<Arc<ServerConfig>>,
-    commands: SyncSender<DriverCommand>,
 ) {
-    listener
-        .set_nonblocking(true)
-        .expect("set signaling listener non-blocking");
-
+    let tls_acceptor = tls_config.map(TlsAcceptor::from);
     let mut next_connection_id: ConnectionId = 1;
     loop {
-        // Stop on an explicit signal *or* when the sender drops (the single `()` is
-        // consumed by one receiver, so everyone else sees disconnect on shutdown).
-        match stop_rx.try_recv() {
-            Ok(_) => break,
-            Err(err) if err.is_disconnected() => break,
-            Err(_) => {}
-        }
-        match listener.accept() {
-            Ok((tcp, _peer)) => {
-                let connection_id = next_connection_id;
-                next_connection_id += 1;
-                let tls_config = tls_config.clone();
-                let commands = commands.clone();
-                std::thread::spawn(move || {
-                    if let Err(err) = handle_connection(tcp, tls_config, connection_id, commands) {
-                        log::trace!("connection ended: {err}");
-                    }
-                });
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(err) => log::warn!("accept error: {err}"),
+        // Stop on an explicit signal *or* when the sender drops.
+        tokio::select! {
+            _ = stop_rx.changed() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((tcp, _peer)) => {
+                    let connection_id = next_connection_id;
+                    next_connection_id += 1;
+                    let tls_acceptor = tls_acceptor.clone();
+                    let commands = commands.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) =
+                            handle_connection(tcp, tls_acceptor, connection_id, commands).await
+                        {
+                            log::trace!("connection ended: {err}");
+                        }
+                    });
+                }
+                Err(err) => log::warn!("accept error: {err}"),
+            },
         }
     }
     log::info!("signaling accept loop stopped");
@@ -148,25 +150,22 @@ pub fn serve_io(
 
 /// One accepted connection: optional TLS handshake, read the HTTP request head, then
 /// either upgrade `/ws` to a WebSocket or answer with a plain HTTP status.
-fn handle_connection(
+async fn handle_connection(
     tcp: TcpStream,
-    tls_config: Option<Arc<ServerConfig>>,
+    tls_acceptor: Option<TlsAcceptor>,
     connection_id: ConnectionId,
-    commands: SyncSender<DriverCommand>,
+    commands: mpsc::Sender<DriverCommand>,
 ) -> anyhow::Result<()> {
-    // The accepted stream can inherit the listener's non-blocking flag; the TLS handshake
-    // and request-head read need blocking I/O (the per-frame read timeout is set later,
-    // only for the WebSocket poll loop).
-    tcp.set_nonblocking(false)?;
-    let mut stream = match tls_config {
-        Some(config) => {
-            // rustls performs the handshake lazily on the first read/write.
-            let conn = ServerConnection::new(config)?;
-            Stream::Tls(Box::new(StreamOwned::new(conn, tcp)))
-        }
-        None => Stream::Plain(tcp),
-    };
-    let head = read_http_head(&mut stream)?;
+    let (mut stream, head) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut stream = match tls_acceptor {
+            Some(acceptor) => Stream::Tls(Box::new(acceptor.accept(tcp).await?)),
+            None => Stream::Plain(tcp),
+        };
+        let head = read_http_head(&mut stream).await?;
+        anyhow::Ok((stream, head))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("TLS/HTTP handshake timed out"))??;
     let request = HttpRequest::parse(&head);
     log::trace!(
         "HTTP request: connection_id={connection_id} method={} path={}",
@@ -180,14 +179,14 @@ fn handle_connection(
         && request.header("sec-websocket-key").is_some();
 
     if request.path != "/ws" && request.path != "/ws/" {
-        return respond(&mut stream, "404 Not Found", "not found");
+        return respond(&mut stream, "404 Not Found", "not found").await;
     }
     if !is_upgrade {
-        return respond(&mut stream, "426 Upgrade Required", "upgrade required");
+        return respond(&mut stream, "426 Upgrade Required", "upgrade required").await;
     }
 
     // Complete the RFC 6455 handshake ourselves, then hand the raw stream to
-    // tungstenite with the read timeout that drives the session poll loop.
+    // tokio-tungstenite.
     let key = request.header("sec-websocket-key").unwrap();
     let accept = derive_accept_key(key.as_bytes());
     let response = format!(
@@ -196,25 +195,24 @@ fn handle_connection(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
 
-    stream.socket().set_read_timeout(Some(WS_POLL_TIMEOUT))?;
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
-    let ws = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
-    ws_session(ws, connection_id, commands);
+    let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
+    ws_session(ws, connection_id, commands).await;
     Ok(())
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`). WebSocket clients send
 /// nothing after the head until they receive the `101`, so this consumes exactly the head.
-fn read_http_head(stream: &mut Stream) -> anyhow::Result<Vec<u8>> {
+async fn read_http_head(stream: &mut Stream) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
-        let n = stream.read(&mut chunk)?;
+        let n = stream.read(&mut chunk).await?;
         if n == 0 {
             anyhow::bail!("connection closed before request head");
         }
@@ -262,7 +260,7 @@ impl HttpRequest {
     }
 }
 
-fn respond(stream: &mut Stream, status: &str, body: &str) -> anyhow::Result<()> {
+async fn respond(stream: &mut Stream, status: &str, body: &str) -> anyhow::Result<()> {
     let response = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
@@ -270,144 +268,125 @@ fn respond(stream: &mut Stream, status: &str, body: &str) -> anyhow::Result<()> 
          Connection: close\r\n\r\n{body}",
         body.len()
     );
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
     Ok(())
 }
 
-/// Drive one browser's WebSocket for its lifetime: read client frames → run loop, and
-/// drain run-loop→browser outputs → client.
-fn ws_session(
-    mut ws: WebSocket<Stream>,
+/// Drive one browser's WebSocket for its lifetime: forward client frames to the event
+/// loop, and push event-loop→browser outputs to the client — each side wakes the task
+/// the moment it is ready, with no polling interval in between.
+async fn ws_session(
+    ws: WebSocketStream<Stream>,
     connection_id: ConnectionId,
-    commands: SyncSender<DriverCommand>,
+    commands: mpsc::Sender<DriverCommand>,
 ) {
     log::info!("WebSocket connected: connection_id={connection_id}");
-    // Run-loop→browser channel; its sender is owned by the run loop for routing.
-    let (output, outputs) = std::sync::mpsc::sync_channel::<SocketOutput>(SOCKET_OUTPUT_CAPACITY);
+    // Event-loop→browser channel; its sender is owned by the event loop for routing.
+    let (output, mut outputs) = mpsc::channel::<SocketOutput>(SOCKET_OUTPUT_CAPACITY);
     if commands
         .send(DriverCommand::Connected {
             connection_id,
             output,
         })
+        .await
         .is_err()
     {
         return;
     }
 
-    let mut last_activity = Instant::now();
-    'session: loop {
-        // 1. Read one client frame (blocks up to WS_POLL_TIMEOUT).
-        match ws.read() {
-            Ok(Message::Text(text)) => {
-                log::info!(
-                    "WebSocket message: connection_id={connection_id} bytes={}",
-                    text.len()
-                );
-                if commands
-                    .send(DriverCommand::Text {
+    let (mut writer, mut reader) = ws.split();
+    let mut idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
+    loop {
+        tokio::select! {
+            output = outputs.recv() => match output {
+                Some(SocketOutput::Text(text)) => {
+                    if writer.send(Message::text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(SocketOutput::Close) | None => {
+                    let _ = writer.send(Message::Close(None)).await;
+                    break;
+                }
+            },
+            incoming = reader.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    log::info!(
+                        "WebSocket message: connection_id={connection_id} bytes={}",
+                        text.len()
+                    );
+                    if commands.send(DriverCommand::Text {
                         connection_id,
                         text: text.to_string(),
                         now: Instant::now(),
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-                last_activity = Instant::now();
-            }
-            Ok(Message::Ping(payload)) => {
-                log::info!(
-                    "WebSocket keep-alive ping received: connection_id={connection_id} bytes={}",
-                    payload.len()
-                );
-                let _ = ws.send(Message::Pong(payload));
-                last_activity = Instant::now();
-            }
-            Ok(Message::Pong(_)) => {}
-            Ok(Message::Binary(_)) => break,
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Frame(_)) => {}
-            Err(tungstenite::Error::Io(err))
-                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::TimedOut => {}
-            Err(err) => {
-                log::trace!("ws read ended: {err}");
-                break;
-            }
-        }
-        if last_activity.elapsed() >= WS_IDLE_TIMEOUT {
-            break;
-        }
-
-        // 2. Flush run-loop→browser outputs (relayed messages, errors, closes).
-        loop {
-            match outputs.try_recv() {
-                Ok(SocketOutput::Text(text)) => {
-                    if ws.send(Message::text(text)).is_err() {
-                        break 'session;
+                    }).await.is_err() {
+                        break;
                     }
+                    idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
                 }
-                Ok(SocketOutput::Close) => {
-                    let _ = ws.close(None);
-                    let _ = ws.flush();
-                    break 'session;
+                Some(Ok(Message::Ping(payload))) => {
+                    // tokio-tungstenite queues the pong reply automatically.
+                    log::info!(
+                        "WebSocket keep-alive ping received: connection_id={connection_id} bytes={}",
+                        payload.len()
+                    );
+                    idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break 'session,
-            }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_))) => break,
+                Some(Ok(Message::Frame(_))) => {}
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+            },
+            _ = tokio::time::sleep_until(idle_deadline) => break,
         }
     }
 
-    let _ = commands.send(DriverCommand::Disconnected {
-        connection_id,
-        now: Instant::now(),
-    });
+    let _ = commands
+        .send(DriverCommand::Disconnected {
+            connection_id,
+            now: Instant::now(),
+        })
+        .await;
     log::info!("WebSocket disconnected: connection_id={connection_id}");
 }
 
-// ──────────────────────────────────── run loop ─────────────────────────────────────
+// ──────────────────────────────────── event loop ────────────────────────────────────
 
-/// The run loop that owns the Sans-I/O `Collider`: serializes every browser input,
+/// The event loop that owns the Sans-I/O `Collider`: serializes every browser input,
 /// fires the state machine's timeouts, and routes outputs to each session's channel.
-pub fn event_loop(
-    stop_rx: crossbeam_channel::Receiver<()>,
-    commands: Receiver<DriverCommand>,
+pub async fn event_loop(
+    mut stop_rx: watch::Receiver<()>,
+    mut commands: mpsc::Receiver<DriverCommand>,
     register_timeout: Duration,
 ) {
     let mut collider = Collider::new(register_timeout);
-    let mut sockets: HashMap<ConnectionId, SyncSender<SocketOutput>> = HashMap::new();
+    let mut sockets: HashMap<ConnectionId, mpsc::Sender<SocketOutput>> = HashMap::new();
     loop {
-        match stop_rx.try_recv() {
-            Ok(_) => break,
-            Err(err) if err.is_disconnected() => break,
-            Err(_) => {}
-        }
-
-        // Wait for the next command, capped by the state machine's own deadline (and by
-        // the stop-poll interval so a shutdown signal is noticed without traffic).
-        let wait = match collider.poll_timeout() {
-            Some(deadline) => {
-                let until_deadline = deadline.saturating_duration_since(Instant::now());
-                if until_deadline.is_zero() {
+        // Sleep until the next command, the state machine's own deadline, or the stop
+        // signal — whichever wakes first.
+        let command = if let Some(deadline) = collider.poll_timeout() {
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                command = commands.recv() => command,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                     if collider.handle_timeout(Instant::now()).is_err() {
                         break;
                     }
                     drain_outputs(&mut collider, &mut sockets);
                     continue;
                 }
-                until_deadline.min(STOP_POLL_TIMEOUT)
             }
-            None => STOP_POLL_TIMEOUT,
+        } else {
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                command = commands.recv() => command,
+            }
         };
 
-        match commands.recv_timeout(wait) {
-            Ok(command) => {
-                handle_command(&mut collider, command, &mut sockets);
-                drain_outputs(&mut collider, &mut sockets);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
+        let Some(command) = command else { break };
+        handle_command(&mut collider, command, &mut sockets);
+        drain_outputs(&mut collider, &mut sockets);
     }
 
     // Graceful stop: apply commands already queued before the signal, then close every
@@ -417,13 +396,13 @@ pub fn event_loop(
     }
     let _ = collider.close();
     drain_outputs(&mut collider, &mut sockets);
-    log::info!("signaling run loop stopped");
+    log::info!("signaling event loop stopped");
 }
 
 fn handle_command(
     collider: &mut Collider,
     command: DriverCommand,
-    sockets: &mut HashMap<ConnectionId, SyncSender<SocketOutput>>,
+    sockets: &mut HashMap<ConnectionId, mpsc::Sender<SocketOutput>>,
 ) {
     match command {
         DriverCommand::Connected {
@@ -464,7 +443,7 @@ fn handle_command(
 
 fn drain_outputs(
     collider: &mut Collider,
-    sockets: &mut HashMap<ConnectionId, SyncSender<SocketOutput>>,
+    sockets: &mut HashMap<ConnectionId, mpsc::Sender<SocketOutput>>,
 ) {
     let mut disconnected = Vec::new();
     while let Some(output) = collider.poll_write() {
@@ -502,21 +481,18 @@ fn drain_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::sync_channel;
 
     struct Harness {
-        stop_tx: crossbeam_channel::Sender<()>,
-        commands: SyncSender<DriverCommand>,
-        run: std::thread::JoinHandle<()>,
+        stop_tx: watch::Sender<()>,
+        commands: mpsc::Sender<DriverCommand>,
+        run: tokio::task::JoinHandle<()>,
     }
 
     impl Harness {
         fn spawn() -> Self {
-            let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
-            let (commands, commands_rx) = sync_channel(COMMAND_CAPACITY);
-            let run = std::thread::spawn(move || {
-                event_loop(stop_rx, commands_rx, Duration::from_secs(10))
-            });
+            let (stop_tx, stop_rx) = watch::channel(());
+            let (commands, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+            let run = tokio::spawn(event_loop(stop_rx, commands_rx, Duration::from_secs(10)));
             Self {
                 stop_tx,
                 commands,
@@ -524,81 +500,101 @@ mod tests {
             }
         }
 
-        fn connect(&self, connection_id: ConnectionId) -> Receiver<SocketOutput> {
-            let (output, outputs) = sync_channel(SOCKET_OUTPUT_CAPACITY);
+        async fn connect(&self, connection_id: ConnectionId) -> mpsc::Receiver<SocketOutput> {
+            let (output, outputs) = mpsc::channel(SOCKET_OUTPUT_CAPACITY);
             self.commands
                 .send(DriverCommand::Connected {
                     connection_id,
                     output,
                 })
+                .await
                 .unwrap();
             outputs
         }
 
-        fn text(&self, connection_id: ConnectionId, text: &str) {
+        async fn text(&self, connection_id: ConnectionId, text: &str) {
             self.commands
                 .send(DriverCommand::Text {
                     connection_id,
                     text: text.to_string(),
                     now: Instant::now(),
                 })
+                .await
                 .unwrap();
         }
 
-        fn shutdown(self) {
+        async fn shutdown(self) {
             self.stop_tx.send(()).unwrap();
-            self.run.join().unwrap();
+            self.run.await.unwrap();
         }
     }
 
-    fn recv_text(outputs: &Receiver<SocketOutput>) -> String {
-        match outputs.recv_timeout(Duration::from_secs(5)).unwrap() {
+    async fn recv_text(outputs: &mut mpsc::Receiver<SocketOutput>) -> String {
+        match tokio::time::timeout(Duration::from_secs(5), outputs.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
             SocketOutput::Text(text) => text,
             SocketOutput::Close => panic!("expected a text frame, got a close"),
         }
     }
 
-    fn recv_close(outputs: &Receiver<SocketOutput>) {
-        match outputs.recv_timeout(Duration::from_secs(5)).unwrap() {
+    async fn recv_close(outputs: &mut mpsc::Receiver<SocketOutput>) {
+        match tokio::time::timeout(Duration::from_secs(5), outputs.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
             SocketOutput::Close => {}
             SocketOutput::Text(text) => panic!("expected a close, got text: {text}"),
         }
     }
 
-    #[test]
-    fn v1_send_relays_between_registered_sessions() {
+    #[tokio::test]
+    async fn v1_send_relays_between_registered_sessions() {
         let harness = Harness::spawn();
-        let outputs_1 = harness.connect(1);
-        let outputs_2 = harness.connect(2);
-        harness.text(1, r#"{"cmd":"register","roomid":"room","clientid":"1"}"#);
-        harness.text(2, r#"{"cmd":"register","roomid":"room","clientid":"2"}"#);
-        harness.text(1, r#"{"cmd":"send","msg":"candidate"}"#);
+        let mut outputs_1 = harness.connect(1).await;
+        let mut outputs_2 = harness.connect(2).await;
+        harness
+            .text(1, r#"{"cmd":"register","roomid":"room","clientid":"1"}"#)
+            .await;
+        harness
+            .text(2, r#"{"cmd":"register","roomid":"room","clientid":"2"}"#)
+            .await;
+        harness.text(1, r#"{"cmd":"send","msg":"candidate"}"#).await;
         assert_eq!(
-            recv_text(&outputs_2),
+            recv_text(&mut outputs_2).await,
             r#"{"msg":"candidate","error":""}"#.to_string()
         );
         assert!(outputs_1.try_recv().is_err(), "registration is silent");
-        harness.shutdown();
+        harness.shutdown().await;
     }
 
-    #[test]
-    fn protocol_errors_are_framed_then_close_the_socket() {
+    #[tokio::test]
+    async fn protocol_errors_are_framed_then_close_the_socket() {
         let harness = Harness::spawn();
-        let outputs = harness.connect(1);
-        harness.text(1, r#"{"cmd":"send","msg":"offer"}"#);
-        assert!(recv_text(&outputs).contains("Client not registered"));
-        recv_close(&outputs);
-        harness.shutdown();
+        let mut outputs = harness.connect(1).await;
+        harness.text(1, r#"{"cmd":"send","msg":"offer"}"#).await;
+        assert!(
+            recv_text(&mut outputs)
+                .await
+                .contains("Client not registered")
+        );
+        recv_close(&mut outputs).await;
+        harness.shutdown().await;
     }
 
-    #[test]
-    fn shutdown_closes_every_connected_socket() {
+    #[tokio::test]
+    async fn shutdown_closes_every_connected_socket() {
         let harness = Harness::spawn();
-        let outputs_1 = harness.connect(1);
-        let outputs_2 = harness.connect(2);
-        harness.text(1, r#"{"cmd":"register","roomid":"room","clientid":"1"}"#);
-        harness.shutdown();
-        recv_close(&outputs_1);
-        recv_close(&outputs_2);
+        let mut outputs_1 = harness.connect(1).await;
+        let mut outputs_2 = harness.connect(2).await;
+        harness
+            .text(1, r#"{"cmd":"register","roomid":"room","clientid":"1"}"#)
+            .await;
+        harness.shutdown().await;
+        recv_close(&mut outputs_1).await;
+        recv_close(&mut outputs_2).await;
     }
 }
