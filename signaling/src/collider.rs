@@ -247,7 +247,7 @@ impl Collider {
                         req: msg.req,
                         ..Default::default()
                     }
-                },
+                }
                 Err(result) => AppControlReply {
                     reply: "error".into(),
                     req: msg.req,

@@ -32,24 +32,43 @@ jobs:
       - name: Create logs directory
         run: mkdir -p logs
 
-      - name: Build AppRTC server and tests
-        run: cargo build --release --package apprtc --bin apprtc --tests
+      - name: Build AppWeb, signaling, and tests
+        run: cargo build --release --package apprtc --bins --tests
 
-      - name: Start AppRTC server in background
+      - name: Start signaling and AppWeb servers
         run: |
-          ./target/release/apprtc --host-ip 127.0.0.1 --port 8080 --web-root appweb --tls --debug --level info > ./logs/apprtc.log 2>&1 &
-          sleep 3
+          ./target/release/signaling \
+            --host-ip 127.0.0.1 --port 8081 --tls \
+            --debug --level info > ./logs/signaling.log 2>&1 &
+          ./target/release/appweb \
+            --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+            --public-url https://127.0.0.1:8080 \
+            --signaling-url wss://127.0.0.1:8081/ws \
+            --signaling-insecure-tls --tls \
+            --debug --level info > ./logs/appweb.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --silent --fail --insecure https://127.0.0.1:8080/status >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "AppWeb failed to become ready"
+          cat ./logs/signaling.log
+          cat ./logs/appweb.log
+          exit 1
 
       - name: Run tests
         run: cargo test --package apprtc --no-fail-fast --test '*' -- --nocapture
 
-      - name: Stop AppRTC server
+      - name: Stop signaling and AppWeb servers
         if: always()
-        run: kill $(pgrep -f "target/release/apprtc") || true
+        run: |
+          pkill -f "target/release/signaling" || true
+          pkill -f "target/release/appweb" || true
 
       - name: Upload logs as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: logs
-          path: logs/apprtc.log
+          path: logs/

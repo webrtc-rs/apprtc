@@ -118,16 +118,24 @@ async fn main() -> Result<()> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    let authority =
-        WebSocketAuthority::connect_with_options(&cli.signaling_url, &cli.appid, &cli.signaling_token, cli.signaling_insecure_tls)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+    let authority = WebSocketAuthority::connect_with_options(
+        &cli.signaling_url,
+        &cli.appid,
+        &cli.signaling_token,
+        cli.signaling_insecure_tls,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
     let server = RoomServer::new(
         Config {
             web_root: cli.web_root,
             host: public_host,
             force_tls: scheme == "https",
-            signaling_url: cli.signaling_url.trim_end_matches('/').trim_end_matches("/ws").to_string(),
+            signaling_url: cli
+                .signaling_url
+                .trim_end_matches('/')
+                .trim_end_matches("/ws")
+                .to_string(),
             ice_server_urls: cli.ice_server_urls,
             ice_server_base_url: cli.ice_server_base_url,
             ice_server_api_key: cli.ice_server_api_key,
