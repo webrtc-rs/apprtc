@@ -7,7 +7,6 @@
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use signaling::collider::StatusSnapshot;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
@@ -19,6 +18,15 @@ use tokio_tungstenite::{
 pub struct Admission {
     pub is_initiator: bool,
     pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusSnapshot {
+    pub rooms: usize,
+    pub clients: usize,
+    pub websocket_connections: usize,
+    pub total_websocket_connections: u64,
+    pub websocket_errors: u64,
 }
 
 #[async_trait]

@@ -53,6 +53,39 @@ async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
 }
 
 #[tokio::test]
+async fn preserves_appweb_signaling_status_contract() -> Result<()> {
+    wait_for_server().await?;
+    let mut socket = ws_connect().await?;
+    ws_send(
+        &mut socket,
+        json!({"cmd":"app", "appid":"contract-test", "token":""}),
+    )
+    .await?;
+    assert_eq!(
+        ws_receive_json(&mut socket).await?,
+        json!({"control":"registered"})
+    );
+    ws_send(&mut socket, json!({"cmd":"status", "req":1})).await?;
+    let status = ws_receive_json(&mut socket).await?;
+    assert_eq!(status["reply"], "status");
+    assert_eq!(status["req"], 1);
+    for field in [
+        "rooms",
+        "clients",
+        "websocket_connections",
+        "total_websocket_connections",
+        "websocket_errors",
+    ] {
+        assert!(
+            status[field].is_u64(),
+            "status field {field} must be an unsigned integer"
+        );
+    }
+    socket.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn serves_room_page_and_full_room_page_like_legacy_apprtc() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("room-page");

@@ -317,12 +317,12 @@ fn cors(mut response: Response, methods: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ws_client::StatusSnapshot;
     use crate::ws_client::{Admission, RoomAuthority};
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
     use serde_json::Value;
-    use signaling::collider::StatusSnapshot;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
