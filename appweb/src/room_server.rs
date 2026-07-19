@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::dashboard::StatusReport;
 use crate::params::{RoomParameters, generate_random};
 use crate::templates::Templates;
-use crate::ws_client::WsClient;
+use crate::ws_client::RoomAuthority;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -28,7 +28,7 @@ const MAX_ROOM_CAPACITY: usize = 2;
 struct Inner {
     config: Config,
     templates: Templates,
-    authority: WsClient,
+    authority: Arc<dyn RoomAuthority>,
     started: Instant,
     http_errors: AtomicU64,
 }
@@ -45,13 +45,16 @@ struct JoinResponse {
 }
 
 impl RoomServer {
-    pub fn new(config: Config, authority: WsClient) -> Result<Self, Box<dyn Error + Send + Sync>> {
+    pub fn new<A: RoomAuthority + 'static>(
+        config: Config,
+        authority: A,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let templates = Templates::load(&config.web_root)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 templates,
-                authority,
+                authority: Arc::new(authority),
                 started: Instant::now(),
                 http_errors: AtomicU64::new(0),
             }),

@@ -4,9 +4,15 @@
 //! Collider owner task directly. Its operation/result boundary is transport
 //! independent and can later be carried by the control WebSocket unchanged.
 
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use signaling::collider::{AuthorityOperation, AuthorityResult, StatusSnapshot};
 use signaling::ws_server::ColliderHandle;
 use std::time::Instant;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
@@ -104,6 +110,182 @@ impl WsClient {
             AuthorityResult::Error { result } => Err(result),
             _ => Err("unexpected signaling authority response to status".to_string()),
         }
+    }
+}
+
+#[async_trait]
+pub trait RoomAuthority: Send + Sync {
+    async fn admit(
+        &self,
+        roomid: String,
+        clientid: String,
+        is_loopback: bool,
+    ) -> Result<Admission, String>;
+    async fn remove(&self, roomid: String, clientid: String) -> Result<(), String>;
+    async fn occupancy(&self, roomid: String) -> Result<usize, String>;
+    async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String>;
+    async fn status(&self) -> Result<StatusSnapshot, String>;
+}
+
+#[async_trait]
+impl RoomAuthority for WsClient {
+    async fn admit(
+        &self,
+        roomid: String,
+        clientid: String,
+        is_loopback: bool,
+    ) -> Result<Admission, String> {
+        self.admit(roomid, clientid, is_loopback).await
+    }
+    async fn remove(&self, roomid: String, clientid: String) -> Result<(), String> {
+        self.remove(roomid, clientid).await
+    }
+    async fn occupancy(&self, roomid: String) -> Result<usize, String> {
+        self.occupancy(roomid).await
+    }
+    async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String> {
+        self.inject(roomid, clientid, msg).await
+    }
+    async fn status(&self) -> Result<StatusSnapshot, String> {
+        self.status().await
+    }
+}
+
+#[derive(Clone)]
+pub struct WebSocketAuthority {
+    socket: std::sync::Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
+    next_req: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlReply {
+    reply: String,
+    req: u64,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    is_initiator: Option<bool>,
+    #[serde(default)]
+    messages: Option<Vec<String>>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    rooms: Option<usize>,
+    #[serde(default)]
+    clients: Option<usize>,
+    #[serde(default)]
+    websocket_connections: Option<usize>,
+    #[serde(default)]
+    total_websocket_connections: Option<u64>,
+    #[serde(default)]
+    websocket_errors: Option<u64>,
+}
+
+impl WebSocketAuthority {
+    pub async fn connect(url: &str, appid: &str, token: &str) -> Result<Self, String> {
+        let (mut socket, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+        socket
+            .send(Message::Text(
+                serde_json::json!({"cmd":"app","appid":appid,"token":token})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(Ok(Message::Text(frame))) = socket.next().await else {
+            return Err("signaling control socket closed during registration".into());
+        };
+        if serde_json::from_str::<serde_json::Value>(&frame)
+            .ok()
+            .and_then(|v| v.get("control").and_then(|v| v.as_str()).map(str::to_owned))
+            .as_deref()
+            != Some("registered")
+        {
+            return Err(format!("signaling control registration failed: {frame}"));
+        }
+        Ok(Self {
+            socket: std::sync::Arc::new(Mutex::new(socket)),
+            next_req: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        })
+    }
+
+    async fn request(&self, value: serde_json::Value) -> Result<ControlReply, String> {
+        let req = value["req"].as_u64().unwrap_or_default();
+        let mut socket = self.socket.lock().await;
+        socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .map_err(|e| e.to_string())?;
+        loop {
+            let Some(frame) = socket.next().await else {
+                return Err("signaling control socket closed".into());
+            };
+            let Message::Text(text) = frame.map_err(|e| e.to_string())? else {
+                continue;
+            };
+            let reply: ControlReply = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            if reply.req == req {
+                return Ok(reply);
+            }
+        }
+    }
+    fn req(&self) -> u64 {
+        self.next_req
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl RoomAuthority for WebSocketAuthority {
+    async fn admit(
+        &self,
+        roomid: String,
+        clientid: String,
+        is_loopback: bool,
+    ) -> Result<Admission, String> {
+        let r = self.request(serde_json::json!({"cmd":"admit","req":self.req(),"roomid":roomid,"clientid":clientid,"is_loopback":is_loopback})).await?;
+        if r.reply == "error" {
+            return Err(r.result.unwrap_or_else(|| "admission failed".into()));
+        }
+        Ok(Admission {
+            is_initiator: r.is_initiator.unwrap_or(false),
+            messages: r.messages.unwrap_or_default(),
+        })
+    }
+    async fn remove(&self, roomid: String, clientid: String) -> Result<(), String> {
+        let r = self.request(serde_json::json!({"cmd":"remove","req":self.req(),"roomid":roomid,"clientid":clientid})).await?;
+        if r.reply == "error" {
+            Err(r.result.unwrap_or_else(|| "remove failed".into()))
+        } else {
+            Ok(())
+        }
+    }
+    async fn occupancy(&self, roomid: String) -> Result<usize, String> {
+        let r = self
+            .request(serde_json::json!({"cmd":"occupancy","req":self.req(),"roomid":roomid}))
+            .await?;
+        r.count
+            .ok_or_else(|| r.result.unwrap_or_else(|| "occupancy failed".into()))
+    }
+    async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String> {
+        let r = self.request(serde_json::json!({"cmd":"inject","req":self.req(),"roomid":roomid,"clientid":clientid,"msg":msg})).await?;
+        if r.reply == "error" {
+            Err(r.result.unwrap_or_else(|| "inject failed".into()))
+        } else {
+            Ok(())
+        }
+    }
+    async fn status(&self) -> Result<StatusSnapshot, String> {
+        let r = self
+            .request(serde_json::json!({"cmd":"status","req":self.req()}))
+            .await?;
+        Ok(StatusSnapshot {
+            rooms: r.rooms.unwrap_or(0),
+            clients: r.clients.unwrap_or(0),
+            websocket_connections: r.websocket_connections.unwrap_or(0),
+            total_websocket_connections: r.total_websocket_connections.unwrap_or(0),
+            websocket_errors: r.websocket_errors.unwrap_or(0),
+        })
     }
 }
 
