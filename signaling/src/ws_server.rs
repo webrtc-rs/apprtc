@@ -185,6 +185,7 @@ async fn serve_socket(handle: ColliderHandle, socket: WebSocket) {
                     if writer.send(Message::Pong(payload)).await.is_err() {
                         break;
                     }
+                    read_deadline = tokio::time::Instant::now() + WS_READ_TIMEOUT;
                 }
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Binary(_))) => break,

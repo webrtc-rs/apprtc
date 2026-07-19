@@ -57,14 +57,32 @@ jobs:
           cat ./logs/appweb.log
           exit 1
 
+      - name: Verify AppWeb reconnects after signaling restart
+        run: |
+          pkill -x signaling || true
+          curl --silent --insecure https://127.0.0.1:8080/status >/dev/null || true
+          ./target/release/signaling \
+            --host-ip 127.0.0.1 --port 8081 --tls \
+            --debug --level info >> ./logs/signaling.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --silent --fail --insecure https://127.0.0.1:8080/status >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "AppWeb failed to reconnect to signaling"
+          cat ./logs/signaling.log
+          cat ./logs/appweb.log
+          exit 1
+
       - name: Run tests
         run: cargo test --package apprtc --no-fail-fast --test '*' -- --nocapture
 
       - name: Stop signaling and AppWeb servers
         if: always()
         run: |
-          pkill -f "target/release/signaling" || true
-          pkill -f "target/release/appweb" || true
+          pkill -x signaling || true
+          pkill -x appweb || true
 
       - name: Upload logs as artifact
         if: always()
