@@ -66,6 +66,11 @@ chmod +x /opt/apprtc/target/release/appweb
 chmod +x /opt/apprtc/target/release/signaling
 ```
 
+```bash
+sudo systemctl restart apprtc-signaling apprtc-appweb
+sudo systemctl status apprtc-signaling apprtc-appweb
+```
+
 ## Production services
 
 Run signaling on the same host, bound to port `8443`:
