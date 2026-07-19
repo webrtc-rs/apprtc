@@ -31,6 +31,8 @@ struct Cli {
     #[arg(long, default_value = "")]
     signaling_token: String,
     #[arg(long)]
+    signaling_insecure_tls: bool,
+    #[arg(long)]
     tls: bool,
     #[arg(long, default_value_t = String::new())]
     certificate: String,
@@ -117,7 +119,7 @@ async fn main() -> Result<()> {
         None => host.to_string(),
     };
     let authority =
-        WebSocketAuthority::connect(&cli.signaling_url, &cli.appid, &cli.signaling_token)
+        WebSocketAuthority::connect_with_options(&cli.signaling_url, &cli.appid, &cli.signaling_token, cli.signaling_insecure_tls)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
     let server = RoomServer::new(

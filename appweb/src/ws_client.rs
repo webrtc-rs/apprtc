@@ -12,7 +12,7 @@ use signaling::ws_server::ColliderHandle;
 use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, connect_async_tls_with_config, Connector, tungstenite::Message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
@@ -183,7 +183,18 @@ struct ControlReply {
 
 impl WebSocketAuthority {
     pub async fn connect(url: &str, appid: &str, token: &str) -> Result<Self, String> {
-        let (mut socket, _) = connect_async(url).await.map_err(|e| e.to_string())?;
+        Self::connect_with_options(url, appid, token, false).await
+    }
+
+    pub async fn connect_with_options(url: &str, appid: &str, token: &str, insecure_tls: bool) -> Result<Self, String> {
+        let (mut socket, _) = if insecure_tls && url.starts_with("wss://") {
+            let config = rustls::ClientConfig::builder().dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
+                .with_no_client_auth();
+            connect_async_tls_with_config(url, None, false, Some(Connector::Rustls(std::sync::Arc::new(config)))).await
+        } else {
+            connect_async(url).await
+        }.map_err(|e| e.to_string())?;
         socket
             .send(Message::Text(
                 serde_json::json!({"cmd":"app","appid":appid,"token":token})
@@ -233,6 +244,15 @@ impl WebSocketAuthority {
         self.next_req
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerification;
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> { Ok(rustls::client::danger::ServerCertVerified::assertion()) }
+    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer<'_>, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> { Ok(rustls::client::danger::HandshakeSignatureValid::assertion()) }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> { rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes().to_vec() }
 }
 
 #[async_trait]
