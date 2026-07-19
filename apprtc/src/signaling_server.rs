@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 use tokio_tungstenite::WebSocketStream;
@@ -44,6 +45,8 @@ const MAX_WS_MESSAGE_SIZE: usize = 1024 * 1024;
 const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 /// The TLS handshake and HTTP request head must complete within this long.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound the graceful WebSocket close flush so one stalled peer cannot block shutdown.
+const WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub enum SocketOutput {
     Text(String),
@@ -136,19 +139,33 @@ pub async fn accept_loop(
 ) {
     let tls_acceptor = tls_config.map(TlsAcceptor::from);
     let mut next_connection_id: ConnectionId = 1;
+    let mut connections = JoinSet::new();
     loop {
         // Stop on an explicit signal *or* when the sender drops.
         tokio::select! {
             _ = stop_rx.changed() => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    log::warn!("signaling connection task failed: {error}");
+                }
+            }
             accepted = listener.accept() => match accepted {
                 Ok((tcp, _peer)) => {
                     let connection_id = next_connection_id;
                     next_connection_id += 1;
                     let tls_acceptor = tls_acceptor.clone();
                     let commands = commands.clone();
-                    tokio::spawn(async move {
+                    let connection_stop_rx = stop_rx.clone();
+                    connections.spawn(async move {
                         if let Err(err) =
-                            handle_connection(tcp, tls_acceptor, connection_id, commands).await
+                            handle_connection(
+                                connection_stop_rx,
+                                tcp,
+                                tls_acceptor,
+                                connection_id,
+                                commands,
+                            )
+                            .await
                         {
                             log::trace!("connection ended: {err}");
                         }
@@ -158,27 +175,39 @@ pub async fn accept_loop(
             },
         }
     }
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            log::warn!("signaling connection task failed during shutdown: {error}");
+        }
+    }
     log::info!("signaling accept loop stopped");
 }
 
 /// One accepted connection: optional TLS handshake, read the HTTP request head, then
 /// either upgrade `/ws` or `/app` to a WebSocket or answer with HTTP status.
 async fn handle_connection(
+    mut stop_rx: watch::Receiver<()>,
     tcp: TcpStream,
     tls_acceptor: Option<TlsAcceptor>,
     connection_id: ConnectionId,
     commands: mpsc::Sender<DriverCommand>,
 ) -> anyhow::Result<()> {
-    let (mut stream, head) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut stream = match tls_acceptor {
             Some(acceptor) => Stream::Tls(Box::new(acceptor.accept(tcp).await?)),
             None => Stream::Plain(tcp),
         };
         let head = read_http_head(&mut stream).await?;
         anyhow::Ok((stream, head))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("TLS/HTTP handshake timed out"))??;
+    });
+    let (mut stream, head) = tokio::select! {
+        _ = stop_rx.changed() => {
+            log::debug!("connection stopped during TLS/HTTP handshake: connection_id={connection_id}");
+            return Ok(());
+        }
+        result = handshake => result
+            .map_err(|_| anyhow::anyhow!("TLS/HTTP handshake timed out"))??,
+    };
     let request = HttpRequest::parse(&head);
     log::trace!(
         "HTTP request: connection_id={connection_id} method={} path={}",
@@ -217,7 +246,7 @@ async fn handle_connection(
         .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_WS_MESSAGE_SIZE));
     let ws = WebSocketStream::from_raw_socket(stream, Role::Server, Some(config)).await;
-    ws_session(ws, endpoint, connection_id, commands).await;
+    ws_session(stop_rx, ws, endpoint, connection_id, commands).await;
     Ok(())
 }
 
@@ -291,12 +320,15 @@ async fn respond(stream: &mut Stream, status: &str, body: &str) -> anyhow::Resul
 /// Drive one browser's WebSocket for its lifetime: forward client frames to the event
 /// loop, and push event-loop→browser outputs to the client — each side wakes the task
 /// the moment it is ready, with no polling interval in between.
-async fn ws_session(
-    ws: WebSocketStream<Stream>,
+async fn ws_session<S>(
+    mut stop_rx: watch::Receiver<()>,
+    ws: WebSocketStream<S>,
     endpoint: Endpoint,
     connection_id: ConnectionId,
     commands: mpsc::Sender<DriverCommand>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     log::info!("WebSocket connected: connection_id={connection_id} endpoint={endpoint:?}");
     // Event-loop→browser channel; its sender is owned by the event loop for routing.
     let (output, mut outputs) = mpsc::channel::<SocketOutput>(SOCKET_OUTPUT_CAPACITY);
@@ -315,6 +347,14 @@ async fn ws_session(
     let mut idle_deadline = tokio::time::Instant::now() + WS_IDLE_TIMEOUT;
     loop {
         tokio::select! {
+            _ = stop_rx.changed() => {
+                log::info!("WebSocket shutdown requested: connection_id={connection_id} endpoint={endpoint:?}");
+                let _ = tokio::time::timeout(WS_CLOSE_TIMEOUT, async {
+                    writer.send(Message::Close(None)).await?;
+                    writer.close().await
+                }).await;
+                break;
+            }
             output = outputs.recv() => match output {
                 Some(SocketOutput::Text(text)) => {
                     if writer.send(Message::text(text)).await.is_err() {
@@ -727,5 +767,51 @@ mod tests {
         harness.shutdown().await;
         recv_close(&mut outputs_1).await;
         recv_close(&mut outputs_2).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_session_sends_close_when_stop_signal_fires() {
+        let (stop_tx, stop_rx) = watch::channel(());
+        let (commands, mut command_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server_ws, mut client_ws) = tokio::join!(
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None),
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None),
+        );
+
+        let session = tokio::spawn(ws_session(
+            stop_rx,
+            server_ws,
+            Endpoint::Browser,
+            42,
+            commands,
+        ));
+        let output = match command_rx.recv().await.unwrap() {
+            DriverCommand::Connected {
+                connection_id: 42,
+                output,
+            } => output,
+            _ => panic!("expected connected command"),
+        };
+
+        stop_tx.send(()).unwrap();
+        let close = tokio::time::timeout(Duration::from_secs(5), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(close, Message::Close(_)));
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            command_rx.recv().await,
+            Some(DriverCommand::Disconnected {
+                connection_id: 42,
+                ..
+            })
+        ));
+        drop(output);
     }
 }
