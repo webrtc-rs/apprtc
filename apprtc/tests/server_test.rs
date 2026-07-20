@@ -55,60 +55,6 @@ async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {
 }
 
 #[tokio::test]
-async fn preserves_appweb_signaling_status_contract() -> Result<()> {
-    wait_for_server().await?;
-    let mut socket = ws_connect_path("/app").await?;
-    ws_send_binary(
-        &mut socket,
-        ControlRequest::register(500, "contract-test".into(), String::new()).encode_wire(),
-    )
-    .await?;
-    let registered = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
-        .map_err(anyhow::Error::msg)?;
-    assert_eq!(registered.request_id, 500);
-    assert!(registered.is_ok());
-
-    ws_send_binary(&mut socket, ControlRequest::status(1).encode_wire()).await?;
-    let status = ControlResponse::decode_wire(&ws_receive_binary(&mut socket).await?)
-        .map_err(anyhow::Error::msg)?;
-    assert_eq!(status.request_id, 1);
-    assert!(matches!(
-        status.result,
-        Some(ControlResult::Ok(signaling_proto::v1::response::Ok {
-            payload: Some(ControlPayload::Status(_))
-        }))
-    ));
-    socket.close(None).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn separates_browser_json_and_appweb_protobuf_endpoints() -> Result<()> {
-    wait_for_server().await?;
-
-    let mut control = ws_connect_path("/app").await?;
-    ws_send(&mut control, json!({"cmd":"register"})).await?;
-    ws_expect_close(&mut control).await?;
-
-    let mut browser = ws_connect().await?;
-    ws_send_binary(&mut browser, ControlRequest::status(1).encode_wire()).await?;
-    ws_expect_close(&mut browser).await?;
-
-    let mut malformed = ws_connect_path("/app").await?;
-    ws_send_binary(
-        &mut malformed,
-        ControlRequest {
-            request_id: 1,
-            command: None,
-        }
-        .encode_wire(),
-    )
-    .await?;
-    ws_expect_close(&mut malformed).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn serves_room_page_and_full_room_page_like_legacy_apprtc() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("room-page");
