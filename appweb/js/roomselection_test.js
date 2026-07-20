@@ -58,11 +58,16 @@ describe('Room selection Test', function() {
     this.recentList_ = document.createElement('ul');
     this.recentList_.id = UI_CONSTANTS.roomSelectionRecentList.substring(1);
 
+    this.v2Checkbox_ = document.createElement('input');
+    this.v2Checkbox_.id = UI_CONSTANTS.roomSelectionV2Checkbox.substring(1);
+    this.v2Checkbox_.type = 'checkbox';
+
     this.targetDiv_.appendChild(this.inputBox_);
     this.targetDiv_.appendChild(this.inputBoxLabel_);
     this.targetDiv_.appendChild(this.randomButton_);
     this.targetDiv_.appendChild(this.joinButton_);
     this.targetDiv_.appendChild(this.recentList_);
+    this.targetDiv_.appendChild(this.v2Checkbox_);
 
     this.roomSelectionSetupCompletedPromise_ = new Promise(function(resolve) {
       this.roomSelection_ = new RoomSelection(this.targetDiv_, UI_CONSTANTS,
@@ -135,6 +140,31 @@ describe('Room selection Test', function() {
     this.joinButton_.click();
 
     expect(joinedRoom).toEqual('12345');
+  });
+
+  it('selects V1 by default and V2 when checked', function() {
+    this.inputBox_.value = '12345';
+    var selectedVersion = null;
+    this.roomSelection_.onRoomSelected = function(room, version) {
+      selectedVersion = version;
+    };
+    this.joinButton_.click();
+    expect(selectedVersion).toEqual(1);
+
+    this.v2Checkbox_.checked = true;
+    this.v2Checkbox_.dispatchEvent(createUIEvent('change'));
+    this.joinButton_.click();
+    expect(selectedVersion).toEqual(2);
+  });
+
+  it('rejects leading zeros only in V2 mode', function() {
+    this.inputBox_.value = '001';
+    this.inputBox_.dispatchEvent(createUIEvent('input'));
+    expect(this.joinButton_.disabled).toBeFalsy();
+
+    this.v2Checkbox_.checked = true;
+    this.v2Checkbox_.dispatchEvent(createUIEvent('change'));
+    expect(this.joinButton_.disabled).toBeTruthy();
   });
 
   it('make click handler', function(done) {

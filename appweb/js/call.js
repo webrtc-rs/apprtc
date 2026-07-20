@@ -20,10 +20,14 @@ var Call = function(params) {
   this.params_ = params;
   this.roomServer_ = params.roomServer || '';
 
-  this.channel_ = new SignalingChannel(params.wssUrl, params.wssPostUrl);
+  this.channel_ = new SignalingChannel(
+      params.wssUrl, params.wssPostUrl, params.signalingVersion || 1);
   this.channel_.onmessage = this.onRecvSignalingChannelMessage_.bind(this);
+  this.channel_.oncontrol = this.onRecvSignalingControl_.bind(this);
+  this.channel_.onerror = this.onError_.bind(this);
 
   this.pcClient_ = null;
+  this.createPcClientPromise_ = null;
   this.localStream_ = null;
   this.errorMessageQueue_ = [];
   this.startTime = null;
@@ -90,12 +94,11 @@ Call.prototype.hangup = function(async) {
   if (this.pcClient_) {
     this.pcClient_.close();
     this.pcClient_ = null;
+    this.createPcClientPromise_ = null;
   }
 
-  // Send 'leave' to GAE. This must complete before saying BYE to other client.
-  // When the other client sees BYE it attempts to post offer and candidates to
-  // GAE. GAE needs to know that we're disconnected at that point otherwise
-  // it will forward messages to this client instead of storing them.
+  // Remove membership before closing signaling. V1 then sends its legacy BYE;
+  // V2 relies on the authority's p2p-promote control to notify the survivor.
 
   // This section of code is executed in both sync and async depending on
   // where it is called from. When the browser is closed, the requests must
@@ -107,17 +110,22 @@ Call.prototype.hangup = function(async) {
     step: function() {
       // Send POST request to /leave.
       var path = this.getLeaveUrl_();
-      return sendUrlRequest('POST', path, async);
+      var headers = this.params_.signalingVersion === 2 ? {
+        Authorization: 'Bearer ' + this.params_.admissionToken
+      } : null;
+      return sendUrlRequest('POST', path, async, undefined, headers);
     }.bind(this),
     errorString: 'Error sending /leave:'
   });
-  steps.push({
-    step: function() {
-      // Send bye to the other client.
-      this.channel_.send(JSON.stringify({type: 'bye'}));
-    }.bind(this),
-    errorString: 'Error sending bye:'
-  });
+  if (this.params_.signalingVersion !== 2) {
+    steps.push({
+      step: function() {
+        // Send bye to the other V1 client.
+        this.channel_.send(JSON.stringify({type: 'bye'}));
+      }.bind(this),
+      errorString: 'Error sending bye:'
+    });
+  }
   steps.push({
     step: function() {
       // Close signaling channel.
@@ -168,7 +176,9 @@ Call.prototype.hangup = function(async) {
 };
 
 Call.prototype.getLeaveUrl_ = function() {
-  return this.roomServer_ + '/leave/' + this.params_.roomId +
+  return this.roomServer_ +
+      (this.params_.signalingVersion === 2 ? '/v2/leave/' : '/leave/') +
+      this.params_.roomId +
       '/' + this.params_.clientId;
 };
 
@@ -181,6 +191,7 @@ Call.prototype.onRemoteHangup = function() {
   if (this.pcClient_) {
     this.pcClient_.close();
     this.pcClient_ = null;
+    this.createPcClientPromise_ = null;
   }
 
   this.startSignaling_();
@@ -232,7 +243,7 @@ Call.prototype.toggleAudioMute = function() {
 // media, requesting turn, and join the room. Once all three of those
 // tasks is complete, the signaling process begins. At the same time, a
 // WebSocket connection is opened using |wss_url| followed by a subsequent
-// registration once GAE registration completes.
+// registration once HTTP admission completes.
 Call.prototype.connectToRoom_ = function(roomId) {
   this.params_.roomId = roomId;
   // Asynchronously open a WebSocket connection to WSS.
@@ -253,29 +264,37 @@ Call.prototype.connectToRoom_ = function(roomId) {
         this.params_.clientId = roomParams.client_id;
         this.params_.roomId = roomParams.room_id;
         this.params_.roomLink = roomParams.room_link;
-        this.params_.isInitiator = roomParams.is_initiator === 'true';
+        this.params_.isInitiator = roomParams.is_initiator === true ||
+            roomParams.is_initiator === 'true';
 
-        this.params_.messages = roomParams.messages;
+        this.params_.messages = roomParams.messages || [];
+        if (this.params_.signalingVersion === 2) {
+          this.params_.mode = roomParams.mode;
+          this.params_.signalEpoch = roomParams.epoch;
+          this.params_.admissionToken = roomParams.admission_token;
+          this.channel_.configureV2(
+              this.params_.admissionToken, this.params_.signalEpoch);
+        }
       }.bind(this)).catch(function(error) {
         this.onError_('Room server join error: ' + error.message);
         return Promise.reject(error);
       }.bind(this));
 
-  // We only register with WSS if the web socket connection is open and if we're
-  // already registered with GAE.
+  // Register only after both the WebSocket and HTTP admission are ready.
   Promise.all([channelPromise, joinPromise]).then(function() {
-    this.channel_.register(this.params_.roomId, this.params_.clientId);
-
-    // We only start signaling after we have registered the signaling channel
-    // and have media and TURN. Since we send candidates as soon as the peer
-    // connection generates them we need to wait for the signaling channel to be
-    // ready.
-    Promise.all([this.getIceServersPromise_, this.getMediaPromise_])
-        .then(function() {
-          this.startSignaling_();
-        }.bind(this)).catch(function(error) {
-          this.onError_('Failed to start signaling: ' + error.message);
-        }.bind(this));
+    return this.channel_.register(
+        this.params_.roomId, this.params_.clientId).then(function(control) {
+      if (control && control.control === 'registered') {
+        this.params_.signalEpoch = control.epoch;
+        this.params_.isInitiator = control.is_initiator === true;
+      }
+      // V2 waits for the authoritative registered snapshot before allowing
+      // offer/answer/candidate production.
+      return Promise.all([this.getIceServersPromise_, this.getMediaPromise_])
+          .then(function() {
+            this.startSignaling_();
+          }.bind(this));
+    }.bind(this));
   }.bind(this)).catch(function(error) {
     this.onError_('WebSocket register error: ' + error.message);
   }.bind(this));
@@ -379,12 +398,13 @@ Call.prototype.onUserMediaError_ = function(error) {
 };
 
 Call.prototype.maybeCreatePcClientAsync_ = function() {
-  return new Promise(function(resolve, reject) {
-    if (this.pcClient_) {
-      resolve();
-      return;
-    }
-
+  if (this.pcClient_) {
+    return Promise.resolve();
+  }
+  if (this.createPcClientPromise_) {
+    return this.createPcClientPromise_;
+  }
+  this.createPcClientPromise_ = new Promise(function(resolve, reject) {
     if (typeof RTCPeerConnection.generateCertificate === 'function') {
       var certParams = {name: 'ECDSA', namedCurve: 'P-256'};
       RTCPeerConnection.generateCertificate(certParams)
@@ -403,6 +423,7 @@ Call.prototype.maybeCreatePcClientAsync_ = function() {
       resolve();
     }
   }.bind(this));
+  return this.createPcClientPromise_;
 };
 
 Call.prototype.createPcClient_ = function() {
@@ -450,7 +471,8 @@ Call.prototype.joinRoom_ = function() {
     if (!this.params_.roomId) {
       reject(Error('Missing room id.'));
     }
-    var path = this.roomServer_ + '/join/' +
+    var path = this.roomServer_ +
+        (this.params_.signalingVersion === 2 ? '/v2/join/' : '/join/') +
         this.params_.roomId + window.location.search;
 
     sendAsyncUrlRequest('POST', path).then(function(response) {
@@ -465,7 +487,8 @@ Call.prototype.joinRoom_ = function() {
         // When room is full, responseObj.result === 'FULL'
         reject(Error('Registration error: ' + responseObj.result));
         if (responseObj.result === 'FULL') {
-          var getPath = this.roomServer_ + '/r/' +
+          var getPath = this.roomServer_ +
+              (this.params_.signalingVersion === 2 ? '/v2/r/' : '/r/') +
               this.params_.roomId + window.location.search;
           window.location.assign(getPath);
         }
@@ -482,11 +505,31 @@ Call.prototype.joinRoom_ = function() {
 
 Call.prototype.onRecvSignalingChannelMessage_ = function(msg) {
   this.maybeCreatePcClientAsync_()
-      .then(this.pcClient_.receiveSignalingMessage(msg));
+      .then(function() {
+        this.pcClient_.receiveSignalingMessage(msg);
+      }.bind(this));
+};
+
+Call.prototype.onRecvSignalingControl_ = function(control) {
+  if (control.epoch !== undefined) {
+    this.params_.signalEpoch = control.epoch;
+  }
+  if (control.control === 'p2p-promote') {
+    this.params_.isInitiator = control.is_initiator === true;
+    if (this.onremotehangup) {
+      this.onremotehangup();
+    } else {
+      this.onRemoteHangup();
+    }
+  }
 };
 
 Call.prototype.sendSignalingMessage_ = function(message) {
   var msgString = JSON.stringify(message);
+  if (this.params_.signalingVersion === 2) {
+    this.channel_.send(msgString);
+    return;
+  }
   if (this.params_.isInitiator) {
     // Initiator posts all messages to GAE. GAE will either store the messages
     // until the other client connects, or forward the message to Collider if

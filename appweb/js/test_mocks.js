@@ -128,8 +128,12 @@ var MockXMLHttpRequest = function() {
   this.body = null;
   this.readyState = 0;
   this.status = 0;
+  this.headers = {};
 
   xhrs.push(this);
+};
+MockXMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+  this.headers[name] = value;
 };
 MockXMLHttpRequest.prototype.open = function(method, path, async) {
   this.url = path;

@@ -386,6 +386,8 @@ the seam a later multi-hub design would shard along.
 
 ## 6. Browser and API work
 
+The implemented room-selection page exposes an unchecked **Use signaling V2** checkbox, so V1 remains the default. An unchecked selection navigates through `/r/{roomid}` and `/join/{roomid}`; a checked selection uses `/v2/r/{roomid}` and `/v2/join/{roomid}`. The V2 namespace is preserved in the returned room link and embedded page parameters, so a shared or directly opened V2 room link does not depend on local checkbox state. The current V2 browser implementation supports the P2P state only; the transition and grid-layout work below begins with the later SFU milestone.
+
 ### 6.1 One browser application, two layouts
 
 `web_app` and its `html/full_template.html` are the browser baseline. They remain the P2P layout: one remote participant
@@ -609,7 +611,7 @@ join pins `Room.version = V2`.
 | Method and path                        | Request                              | Response/behavior                                                                                                           |
 |----------------------------------------|--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------|
 | `POST /v2/join/{roomid}`               | empty; path must be `RoomIdV2`       | `{result:"SUCCESS", params:{client_id, room_id, room_link, mode:"p2p"                                                       |"sfu", epoch, wss_url, admission_token, ...}}`; `is_initiator` is present only for `mode:"p2p"`; `{result:"INVALID_ROOM_ID"}`, `FULL`, or `ERROR` |
-| `POST /v2/leave/{roomid}/{clientid}`   | empty; both IDs must be `U64Decimal` | `{result:"SUCCESS"}` or an ID/authorization error                                                                           |
+| `POST /v2/leave/{roomid}/{clientid}`   | empty body; both IDs must be `U64Decimal`; `Authorization: Bearer <admission_token>` | `{result:"SUCCESS"}` or an ID/authorization error                                                                           |
 | `GET /v2/params`, `GET /v2/r/{roomid}` | v2 validation                        | v2 configuration and room-page response; `/v2/params` carries the ICE/TURN server list — v2 has no separate iceconfig route |
 
 There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `appweb` as a random `u64`, returned

@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use signaling_proto::v2::signaling_service_client::SignalingServiceClient;
 use signaling_proto::v2::{
-    self, AdmitV1Request, AppId, InjectV1Request, OccupancyV1Request, RemoveV1Request,
-    RequestContext, StatusRequest,
+    self, AdmitV1Request, AdmitV2Request, AppId, InjectV1Request, OccupancyV1Request,
+    OccupancyV2Request, RemoveV1Request, RemoveV2Request, RequestContext, RoomMode, StatusRequest,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +29,14 @@ pub trait RoomAuthority: Send + Sync {
     async fn remove(&self, roomid: String, clientid: String) -> Result<(), String>;
     async fn occupancy(&self, roomid: String) -> Result<usize, String>;
     async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String>;
+    async fn admit_v2(&self, room_id: u64, client_id: u64) -> Result<V2Admission, String>;
+    async fn remove_v2(
+        &self,
+        room_id: u64,
+        client_id: u64,
+        admission_token: String,
+    ) -> Result<(), String>;
+    async fn occupancy_v2(&self, room_id: u64) -> Result<usize, String>;
     async fn status(&self) -> Result<StatusSnapshot, String>;
 }
 
@@ -36,6 +44,13 @@ pub trait RoomAuthority: Send + Sync {
 pub struct Admission {
     pub is_initiator: bool,
     pub messages: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Admission {
+    pub signal_epoch: u64,
+    pub admission_token: String,
+    pub is_initiator: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +272,113 @@ impl RoomAuthority for GrpcAuthority {
             .into_inner();
         response_request_id(response.context, request_id)?;
         operation_result(response.result, "inject_v1", request_id, started)
+    }
+
+    async fn admit_v2(&self, room_id: u64, client_id: u64) -> Result<V2Admission, String> {
+        let context = self.context();
+        let request_id = context.request_id;
+        let started = Instant::now();
+        log::info!(
+            "Signaling gRPC request: operation=admit_v2 request_id={request_id} room_id={room_id} client_id={client_id}"
+        );
+        let mut client = self.client.clone();
+        let response = client
+            .admit_v2(AdmitV2Request {
+                context: Some(context),
+                room_id,
+                client_id,
+            })
+            .await
+            .map_err(|error| Self::grpc_error("admit_v2", request_id, error, started))?
+            .into_inner();
+        response_request_id(response.context, request_id)?;
+        match response.result {
+            Some(v2::admit_v2_response::Result::Admitted(admitted)) => {
+                if admitted.mode != RoomMode::P2p as i32 {
+                    return Err("UNSUPPORTED_ROOM_MODE".into());
+                }
+                let is_initiator = admitted
+                    .is_initiator
+                    .ok_or_else(|| "P2P admission missing is_initiator".to_string())?;
+                if admitted.admission_token.is_empty() {
+                    return Err("P2P admission missing admission_token".into());
+                }
+                log_response("admit_v2", request_id, "OK", "", started);
+                Ok(V2Admission {
+                    signal_epoch: admitted.signal_epoch,
+                    admission_token: admitted.admission_token,
+                    is_initiator,
+                })
+            }
+            Some(v2::admit_v2_response::Result::Error(error)) => {
+                let reason = domain_error(error);
+                log_response("admit_v2", request_id, "ERR", &reason, started);
+                Err(reason)
+            }
+            None => Err("signaling V2 admission response missing result".into()),
+        }
+    }
+
+    async fn remove_v2(
+        &self,
+        room_id: u64,
+        client_id: u64,
+        admission_token: String,
+    ) -> Result<(), String> {
+        let context = self.context();
+        let request_id = context.request_id;
+        let started = Instant::now();
+        log::info!(
+            "Signaling gRPC request: operation=remove_v2 request_id={request_id} room_id={room_id} client_id={client_id}"
+        );
+        let mut client = self.client.clone();
+        let response = client
+            .remove_v2(RemoveV2Request {
+                context: Some(context),
+                room_id,
+                client_id,
+                admission_token,
+            })
+            .await
+            .map_err(|error| Self::grpc_error("remove_v2", request_id, error, started))?
+            .into_inner();
+        response_request_id(response.context, request_id)?;
+        operation_result(response.result, "remove_v2", request_id, started)
+    }
+
+    async fn occupancy_v2(&self, room_id: u64) -> Result<usize, String> {
+        let context = self.context();
+        let request_id = context.request_id;
+        let started = Instant::now();
+        log::info!(
+            "Signaling gRPC request: operation=occupancy_v2 request_id={request_id} room_id={room_id}"
+        );
+        let mut client = self.client.clone();
+        let response = client
+            .occupancy_v2(OccupancyV2Request {
+                context: Some(context),
+                room_id,
+            })
+            .await
+            .map_err(|error| Self::grpc_error("occupancy_v2", request_id, error, started))?
+            .into_inner();
+        response_request_id(response.context, request_id)?;
+        match response.result {
+            Some(v2::occupancy_response::Result::Occupancy(occupancy)) => {
+                if occupancy.mode != RoomMode::P2p as i32 {
+                    return Err("UNSUPPORTED_ROOM_MODE".into());
+                }
+                log_response("occupancy_v2", request_id, "OK", "", started);
+                usize::try_from(occupancy.member_count)
+                    .map_err(|_| "occupancy count exceeds usize".into())
+            }
+            Some(v2::occupancy_response::Result::Error(error)) => {
+                let reason = domain_error(error);
+                log_response("occupancy_v2", request_id, "ERR", &reason, started);
+                Err(reason)
+            }
+            None => Err("signaling V2 occupancy response missing result".into()),
+        }
     }
 
     async fn status(&self) -> Result<StatusSnapshot, String> {

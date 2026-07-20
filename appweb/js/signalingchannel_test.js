@@ -168,4 +168,48 @@ describe('Signaling Channel Test', function() {
     this.channel.close();
     expect(xhrs.length).toEqual(0);
   });
+
+  it('V2 register waits for acknowledgement and sends epoch', function(done) {
+    this.channel = new SignalingChannel(FAKE_WSS_URL, FAKE_WSS_POST_URL, 2);
+    this.channel.configureV2('admission-token', '0');
+    this.channel.open();
+    var socket = webSockets[0];
+    socket.simulateOpenResult(true);
+    var registered = this.channel.register(FAKE_ROOM_ID, FAKE_CLIENT_ID);
+    expect(JSON.parse(socket.messages[0])).toEqual({
+      cmd: 'register',
+      roomid: FAKE_ROOM_ID,
+      clientid: FAKE_CLIENT_ID,
+      ver: 2,
+      token: 'admission-token'
+    });
+
+    socket.onmessage({data: JSON.stringify({
+      control: 'registered',
+      roomid: FAKE_ROOM_ID,
+      epoch: '0',
+      mode: 'p2p',
+      is_initiator: true
+    })});
+    registered.then(function() {
+      this.channel.send('candidate');
+      expect(JSON.parse(socket.messages[1])).toEqual({
+        cmd: 'send',
+        epoch: '0',
+        msg: 'candidate'
+      });
+      done();
+    }.bind(this));
+  });
+
+  it('V2 close does not use the V1 HTTP fallback', function() {
+    this.channel = new SignalingChannel(FAKE_WSS_URL, FAKE_WSS_POST_URL, 2);
+    this.channel.configureV2('admission-token', '0');
+    this.channel.open();
+    var socket = webSockets[0];
+    socket.simulateOpenResult(true);
+    this.channel.register(FAKE_ROOM_ID, FAKE_CLIENT_ID);
+    this.channel.close();
+    expect(xhrs.length).toEqual(0);
+  });
 });

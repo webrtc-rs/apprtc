@@ -29,6 +29,8 @@ var RoomSelection = function(roomSelectionDiv,
       uiConstants.roomSelectionRandomButton);
   this.roomRecentList_ = this.roomSelectionDiv_.querySelector(
       uiConstants.roomSelectionRecentList);
+  this.signalingV2Checkbox_ = this.roomSelectionDiv_.querySelector(
+      uiConstants.roomSelectionV2Checkbox);
 
   this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
   // Call onRoomIdInput_ now to validate initial state of input box.
@@ -36,6 +38,10 @@ var RoomSelection = function(roomSelectionDiv,
 
   this.roomIdInputListener_ = this.onRoomIdInput_.bind(this);
   this.roomIdInput_.addEventListener('input', this.roomIdInputListener_, false);
+
+  this.signalingVersionListener_ = this.onSignalingVersionChange_.bind(this);
+  this.signalingV2Checkbox_.addEventListener(
+      'change', this.signalingVersionListener_, false);
 
   this.roomIdKeyupListener_ = this.onRoomIdKeyPress_.bind(this);
   this.roomIdInput_.addEventListener('keyup', this.roomIdKeyupListener_, false);
@@ -62,6 +68,8 @@ RoomSelection.matchRandomRoomPattern = function(input) {
 RoomSelection.prototype.removeEventListeners = function() {
   this.roomIdInput_.removeEventListener('input', this.roomIdInputListener_);
   this.roomIdInput_.removeEventListener('keyup', this.roomIdKeyupListener_);
+  this.signalingV2Checkbox_.removeEventListener(
+      'change', this.signalingVersionListener_);
   this.roomRandomButton_.removeEventListener(
       'click', this.roomRandomButtonListener_);
   this.roomJoinButton_.removeEventListener(
@@ -92,7 +100,7 @@ RoomSelection.prototype.buildRecentRoomList_ = function(recentRooms) {
     var href = document.createElement('a');
     var linkText = document.createTextNode(recentRooms[i]);
     href.appendChild(linkText);
-    href.href = location.origin + '/r/' + encodeURIComponent(recentRooms[i]);
+    href.href = location.origin + this.roomPath_(recentRooms[i]);
     li.appendChild(href);
     this.roomRecentList_.appendChild(li);
 
@@ -112,6 +120,9 @@ RoomSelection.prototype.onRoomIdInput_ = function() {
     try {
       var val = BigInt(room);
       valid = val >= 0n && val <= 18446744073709551615n;
+      if (this.signalingV2Checkbox_.checked && room !== '0' && room[0] === '0') {
+        valid = false;
+      }
     } catch (e) {
       valid = false;
     }
@@ -126,6 +137,13 @@ RoomSelection.prototype.onRoomIdInput_ = function() {
     this.roomIdInput_.classList.add('invalid');
     this.roomIdInputLabel_.classList.remove('hidden');
   }
+};
+
+RoomSelection.prototype.onSignalingVersionChange_ = function() {
+  this.onRoomIdInput_();
+  this.recentlyUsedList_.getRecentRooms().then(function(recentRooms) {
+    this.buildRecentRoomList_(recentRooms);
+  }.bind(this));
 };
 
 RoomSelection.prototype.onRoomIdKeyPress_ = function(event) {
@@ -154,8 +172,13 @@ RoomSelection.prototype.makeRecentlyUsedClickHandler_ = function(roomName) {
 RoomSelection.prototype.loadRoom_ = function(roomName) {
   this.recentlyUsedList_.pushRecentRoom(roomName);
   if (this.onRoomSelected) {
-    this.onRoomSelected(roomName);
+    this.onRoomSelected(roomName, this.signalingV2Checkbox_.checked ? 2 : 1);
   }
+};
+
+RoomSelection.prototype.roomPath_ = function(roomName) {
+  return (this.signalingV2Checkbox_.checked ? '/v2/r/' : '/r/') +
+      encodeURIComponent(roomName);
 };
 
 RoomSelection.RecentlyUsedList = function(key) {

@@ -60,6 +60,15 @@ pub async fn wait_for_server() -> Result<()> {
 }
 
 pub async fn http(method: &str, path: &str, body: &[u8]) -> Result<HttpResponse> {
+    http_with_headers(method, path, body, &[]).await
+}
+
+pub async fn http_with_headers(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> Result<HttpResponse> {
     ensure_crypto_provider();
     let stream = timeout(IO_TIMEOUT, TcpStream::connect((HOST, PORT)))
         .await
@@ -74,10 +83,17 @@ pub async fn http(method: &str, path: &str, body: &[u8]) -> Result<HttpResponse>
     )
     .await
     .context("timed out during AppRTC TLS handshake")??;
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n");
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
-    );
+    ));
     timeout(IO_TIMEOUT, stream.write_all(request.as_bytes()))
         .await
         .context("timed out writing HTTP headers")??;
@@ -89,6 +105,18 @@ pub async fn http(method: &str, path: &str, body: &[u8]) -> Result<HttpResponse>
         .await
         .context("timed out reading HTTP response")??;
     parse_http_response(&bytes)
+}
+
+pub async fn join_v2(room_id: u64) -> Result<Value> {
+    let response = http("POST", &format!("/v2/join/{room_id}"), &[]).await?;
+    if response.status != 200 {
+        bail!(
+            "V2 join returned HTTP {}: {}",
+            response.status,
+            response.text()?
+        );
+    }
+    response.json()
 }
 
 pub async fn join(room_id: &str) -> Result<Value> {
@@ -119,6 +147,27 @@ pub async fn ws_register(room_id: &str, client_id: &str) -> Result<WsStream> {
     // another independent HTTP or WebSocket client acts on the same room.
     sleep(Duration::from_millis(50)).await;
     Ok(socket)
+}
+
+pub async fn ws_register_v2(
+    room_id: u64,
+    client_id: u64,
+    admission_token: &str,
+) -> Result<(WsStream, Value)> {
+    let mut socket = ws_connect().await?;
+    ws_send(
+        &mut socket,
+        serde_json::json!({
+            "cmd": "register",
+            "roomid": room_id.to_string(),
+            "clientid": client_id.to_string(),
+            "ver": 2,
+            "token": admission_token,
+        }),
+    )
+    .await?;
+    let registered = ws_receive_json(&mut socket).await?;
+    Ok((socket, registered))
 }
 
 pub async fn ws_connect() -> Result<WsStream> {

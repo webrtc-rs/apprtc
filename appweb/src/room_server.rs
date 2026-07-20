@@ -9,7 +9,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE, HOST,
+    ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN, AUTHORIZATION, CONTENT_TYPE, HOST,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
@@ -44,6 +44,25 @@ struct JoinResponse {
     params: RoomParameters,
 }
 
+#[derive(Debug, Serialize)]
+struct V2JoinResponse {
+    result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<V2JoinParameters>,
+}
+
+#[derive(Debug, Serialize)]
+struct V2JoinParameters {
+    client_id: String,
+    room_id: String,
+    room_link: String,
+    mode: &'static str,
+    epoch: String,
+    wss_url: String,
+    admission_token: String,
+    is_initiator: bool,
+}
+
 impl RoomServer {
     pub fn new<A: RoomAuthority + 'static>(
         config: Config,
@@ -66,10 +85,14 @@ impl RoomServer {
         Router::new()
             .route("/", get(main_page))
             .route("/r/{roomid}", get(room_page))
+            .route("/v2/r/{roomid}", get(v2_room_page))
             .route("/join/{roomid}", post(join))
+            .route("/v2/join/{roomid}", post(v2_join))
             .route("/leave/{roomid}/{clientid}", post(leave))
+            .route("/v2/leave/{roomid}/{clientid}", post(v2_leave))
             .route("/message/{roomid}/{clientid}", post(message))
             .route("/params", get(params))
+            .route("/v2/params", get(v2_params))
             .route("/v1alpha/iceconfig", get(ice_config).post(ice_config))
             .route("/status", get(status))
             // V1 call.js posts to wss_post_url + /{roomid}/{clientid}.
@@ -155,6 +178,39 @@ async fn room_page(
     }
 }
 
+async fn v2_room_page(
+    State(server): State<RoomServer>,
+    Path(roomid): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let room_id = match canonical_u64(&roomid) {
+        Some(room_id) => room_id,
+        None => return axum::Json(json!({ "result": "INVALID_ROOM_ID" })).into_response(),
+    };
+    let (host, url) = match server.request_context(&headers, &uri) {
+        Ok(context) => context,
+        Err(error) => return server.http_error(error),
+    };
+    let occupancy = match server.inner.authority.occupancy_v2(room_id).await {
+        Ok(occupancy) => occupancy,
+        Err(error) => return server.http_error(error),
+    };
+    let params = server
+        .inner
+        .config
+        .build_v2_room_parameters(host, &url, &roomid);
+    let rendered = if occupancy >= MAX_ROOM_CAPACITY {
+        server.inner.templates.render_full(&params)
+    } else {
+        server.inner.templates.render_index(&params)
+    };
+    match rendered {
+        Ok(body) => Html(body).into_response(),
+        Err(error) => server.http_error(format!("Failed to render V2 page: {error}")),
+    }
+}
+
 async fn params(State(server): State<RoomServer>, headers: HeaderMap, uri: Uri) -> Response {
     let (host, url) = match server.request_context(&headers, &uri) {
         Ok(context) => context,
@@ -167,6 +223,14 @@ async fn params(State(server): State<RoomServer>, headers: HeaderMap, uri: Uri) 
             .build_room_parameters(host, &url, "", "", None),
     )
     .into_response()
+}
+
+async fn v2_params(State(server): State<RoomServer>, headers: HeaderMap, uri: Uri) -> Response {
+    let (host, url) = match server.request_context(&headers, &uri) {
+        Ok(context) => context,
+        Err(error) => return server.http_error(error),
+    };
+    axum::Json(server.inner.config.build_v2_room_parameters(host, &url, "")).into_response()
 }
 
 async fn ice_config(State(server): State<RoomServer>) -> impl IntoResponse {
@@ -217,6 +281,69 @@ async fn join(
     }
 }
 
+async fn v2_join(
+    State(server): State<RoomServer>,
+    Path(roomid): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    const CLIENT_ID_ATTEMPTS: usize = 8;
+
+    let room_id = match canonical_u64(&roomid) {
+        Some(room_id) => room_id,
+        None => {
+            return axum::Json(V2JoinResponse {
+                result: "INVALID_ROOM_ID".into(),
+                params: None,
+            })
+            .into_response();
+        }
+    };
+    let (host, url) = match server.request_context(&headers, &uri) {
+        Ok(context) => context,
+        Err(error) => return server.http_error(error),
+    };
+    for attempt in 1..=CLIENT_ID_ATTEMPTS {
+        let client_id = rand::random::<u64>();
+        log::info!("HTTP V2 join: room_id={room_id} client_id={client_id} attempt={attempt}");
+        match server.inner.authority.admit_v2(room_id, client_id).await {
+            Ok(admission) => {
+                let params = server
+                    .inner
+                    .config
+                    .build_v2_room_parameters(host, &url, &roomid);
+                return axum::Json(V2JoinResponse {
+                    result: "SUCCESS".into(),
+                    params: Some(V2JoinParameters {
+                        client_id: client_id.to_string(),
+                        room_id: roomid,
+                        room_link: params.room_link,
+                        mode: "p2p",
+                        epoch: admission.signal_epoch.to_string(),
+                        wss_url: params.wss_url,
+                        admission_token: admission.admission_token,
+                        is_initiator: admission.is_initiator,
+                    }),
+                })
+                .into_response();
+            }
+            Err(error) if error == "DUPLICATE_CLIENT" && attempt < CLIENT_ID_ATTEMPTS => continue,
+            Err(result) => {
+                return axum::Json(V2JoinResponse {
+                    result,
+                    params: None,
+                })
+                .into_response();
+            }
+        }
+    }
+    axum::Json(V2JoinResponse {
+        result: "RESOURCE_EXHAUSTED".into(),
+        params: None,
+    })
+    .into_response()
+}
+
 async fn leave(
     State(server): State<RoomServer>,
     Path((roomid, clientid)): Path<(String, String)>,
@@ -226,6 +353,55 @@ async fn leave(
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => server.http_error(error),
     }
+}
+
+async fn v2_leave(
+    State(server): State<RoomServer>,
+    Path((roomid, clientid)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(room_id) = canonical_u64(&roomid) else {
+        return axum::Json(json!({ "result": "INVALID_ROOM_ID" })).into_response();
+    };
+    let Some(client_id) = canonical_u64(&clientid) else {
+        return axum::Json(json!({ "result": "INVALID_CLIENT_ID" })).into_response();
+    };
+    let Some(admission_token) = bearer_token(&headers) else {
+        return axum::Json(json!({ "result": "UNAUTHORIZED" })).into_response();
+    };
+    log::info!("HTTP V2 leave: room_id={room_id} client_id={client_id}");
+    match server
+        .inner
+        .authority
+        .remove_v2(room_id, client_id, admission_token)
+        .await
+    {
+        Ok(()) => axum::Json(json!({ "result": "SUCCESS" })).into_response(),
+        Err(result) => axum::Json(json!({ "result": result })).into_response(),
+    }
+}
+
+fn canonical_u64(value: &str) -> Option<u64> {
+    if value == "0" {
+        return Some(0);
+    }
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
 }
 
 async fn message(
@@ -318,7 +494,7 @@ fn cors(mut response: Response, methods: &'static str) -> Response {
 mod tests {
     use super::*;
     use crate::grpc_client::StatusSnapshot;
-    use crate::grpc_client::{Admission, RoomAuthority};
+    use crate::grpc_client::{Admission, RoomAuthority, V2Admission};
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::{Method, Request};
@@ -379,6 +555,38 @@ mod tests {
                 clients.push((clientid, vec![msg]));
             }
             Ok(())
+        }
+        async fn admit_v2(&self, room_id: u64, client_id: u64) -> Result<V2Admission, String> {
+            let mut rooms = self.0.lock().unwrap();
+            let clients = rooms.entry(format!("v2:{room_id}")).or_default();
+            let client_id = client_id.to_string();
+            if clients.iter().any(|(id, _)| id == &client_id) {
+                return Err("DUPLICATE_CLIENT".into());
+            }
+            if clients.len() >= 2 {
+                return Err("NO_SFU_AVAILABLE".into());
+            }
+            let is_initiator = clients.is_empty();
+            clients.push((client_id.clone(), Vec::new()));
+            Ok(V2Admission {
+                signal_epoch: 0,
+                admission_token: format!("token-{room_id}-{client_id}"),
+                is_initiator,
+            })
+        }
+        async fn remove_v2(&self, room_id: u64, client_id: u64, _: String) -> Result<(), String> {
+            if let Some(clients) = self.0.lock().unwrap().get_mut(&format!("v2:{room_id}")) {
+                clients.retain(|(id, _)| id != &client_id.to_string());
+            }
+            Ok(())
+        }
+        async fn occupancy_v2(&self, room_id: u64) -> Result<usize, String> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(&format!("v2:{room_id}"))
+                .map_or(0, Vec::len))
         }
         async fn status(&self) -> Result<StatusSnapshot, String> {
             let rooms = self.0.lock().unwrap();
@@ -459,6 +667,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_join_uses_numeric_ids_token_epoch_and_authenticated_leave() {
+        let app = app();
+        let first = json_body(request(&app, Method::POST, "/v2/join/42", "").await).await;
+        assert_eq!(first["result"], "SUCCESS");
+        assert_eq!(first["params"]["room_id"], "42");
+        assert_eq!(first["params"]["room_link"], "http://example.test/v2/r/42");
+        assert_eq!(first["params"]["mode"], "p2p");
+        assert_eq!(first["params"]["epoch"], "0");
+        assert_eq!(first["params"]["is_initiator"], true);
+        assert!(
+            first["params"]["admission_token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        );
+        let client_id = first["params"]["client_id"].as_str().unwrap();
+        assert!(canonical_u64(client_id).is_some());
+
+        let unauthorized =
+            request(&app, Method::POST, &format!("/v2/leave/42/{client_id}"), "").await;
+        assert_eq!(json_body(unauthorized).await["result"], "UNAUTHORIZED");
+
+        let leave = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v2/leave/42/{client_id}"))
+                    .header(HOST, "example.test")
+                    .header(
+                        AUTHORIZATION,
+                        format!(
+                            "Bearer {}",
+                            first["params"]["admission_token"].as_str().unwrap()
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_body(leave).await["result"], "SUCCESS");
+    }
+
+    #[tokio::test]
+    async fn v2_routes_reject_noncanonical_ids_and_expose_v2_page_configuration() {
+        let app = app();
+        for room_id in ["", "01", "+1", "18446744073709551616"] {
+            if room_id.is_empty() {
+                continue;
+            }
+            let response =
+                json_body(request(&app, Method::POST, &format!("/v2/join/{room_id}"), "").await)
+                    .await;
+            assert_eq!(response["result"], "INVALID_ROOM_ID", "room={room_id}");
+        }
+
+        let page = request(&app, Method::GET, "/v2/r/42", "").await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("signalingVersion: 2"));
+        assert!(body.contains("id=\"signaling-v2-checkbox\""));
+        assert!(!body.contains("id=\"signaling-v2-checkbox\" checked"));
+
+        let params = json_body(request(&app, Method::GET, "/v2/params", "").await).await;
+        assert!(params.get("wss_post_url").is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_third_join_reports_no_sfu_available_without_affecting_v1() {
+        let app = app();
+        for expected_initiator in [true, false] {
+            let joined = json_body(request(&app, Method::POST, "/v2/join/99", "").await).await;
+            assert_eq!(joined["result"], "SUCCESS");
+            assert_eq!(joined["params"]["is_initiator"], expected_initiator);
+        }
+        let third = json_body(request(&app, Method::POST, "/v2/join/99", "").await).await;
+        assert_eq!(third["result"], "NO_SFU_AVAILABLE");
+        assert!(third.get("params").is_none());
+
+        let v1 = json_body(request(&app, Method::POST, "/join/99", "").await).await;
+        assert_eq!(v1["result"], "SUCCESS");
+        assert_eq!(v1["params"]["is_initiator"], "true");
+    }
+
+    #[tokio::test]
     async fn v1_pages_static_assets_bridge_and_status_are_served() {
         let app = app();
         let root = request(&app, Method::GET, "/", "").await;
@@ -469,6 +763,11 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html")
         );
+        let root_body = to_bytes(root.into_body(), usize::MAX).await.unwrap();
+        let root_body = String::from_utf8_lossy(&root_body);
+        assert!(root_body.contains("signalingVersion: 1"));
+        assert!(root_body.contains("id=\"signaling-v2-checkbox\""));
+        assert!(!root_body.contains("id=\"signaling-v2-checkbox\" checked"));
 
         let script = request(&app, Method::GET, "/js/call.js", "").await;
         assert_eq!(script.status(), StatusCode::OK);

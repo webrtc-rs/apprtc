@@ -91,6 +91,7 @@ fn context_for(p: &RoomParameters) -> minijinja::Value {
         header_message => escape(&p.header_message),
         wss_url => escape(&p.wss_url),
         wss_post_url => escape(&p.wss_post_url),
+        signaling_version => p.signaling_version,
         ice_server_url => escape(&p.ice_server_url),
         ice_server_transports => escape(&p.ice_server_transports),
 

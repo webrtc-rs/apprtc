@@ -32,14 +32,9 @@
  <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
 </p>
 
-AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The current Rust
-implementation provides the complete AppRTC-compatible P2P V1 room and signaling flow: HTTP join/message/leave APIs,
-initiator election, two-member rooms, queued signaling messages, tokenless browser WebSocket registration, reconnect
-grace, fallback POST/DELETE signaling, HTML templates, static web assets, ICE configuration, and HTTP/HTTPS plus WS/WSS
-serving.
+AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation supports both the AppRTC-compatible P2P V1 flow and the token-authenticated P2P V2 flow. The room-selection page defaults to V1 and provides an unchecked **Use signaling V2** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes, signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-The current binaries support P2P V1. The repository also contains the Sans-I/O SFU implementation and the architecture
-for P2P/SFU call modes, but V2 mode transitions and SFU worker integration are not yet enabled.
+V2 currently remains P2P-only. P2P→SFU upgrading, SFU operation, and SFU→P2P downgrading are not yet enabled; a V2 third join returns `NO_SFU_AVAILABLE`.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -52,13 +47,11 @@ The workspace has four Rust crates:
 |--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, and the private gRPC server.   |
 | [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                             |
-| [`signaling`](signaling)             | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
+| [`signaling`](signaling)             | Authoritative V1 and P2P V2 room/client state, browser protocols, message queueing and relay, token/epoch validation, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock or entropy source of its own. |
 | [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and future SFU workers.                                                                                              |
 
 AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent
-unary gRPC calls over one reusable HTTP/2 channel to submit `AdmitV1`, `RemoveV1`, `OccupancyV1`, `InjectV1`, and
-`GetStatus` operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through
-AppWeb.
+unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1 injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -91,7 +84,9 @@ outputs back to the WebSocket or gRPC caller. Tasks sleep on async I/O, deadline
 Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to
 reconnect for 10 seconds before its membership is removed.
 
-## Current P2P V1 behavior
+## Current P2P behavior
+
+V1 preserves the legacy AppRTC contract:
 
 - Room and client IDs are opaque non-empty strings.
 - A room contains at most two clients; a third join returns `FULL`.
@@ -103,7 +98,18 @@ reconnect for 10 seconds before its membership is removed.
   the callee normally sends through WebSocket.
 - A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately.
 - Root-path and `/_internal` POST/DELETE fallback routes are both supported.
-- V1 identifiers are not restricted to numeric values. Numeric `u64` validation belongs to the future V2 protocol.
+- V1 identifiers are not restricted to numeric values.
+
+P2P V2 adds:
+
+- An unchecked **Use signaling V2** room-selection checkbox; V1 remains the default.
+- `/v2/r/{roomid}`, `/v2/join/{roomid}`, `/v2/leave/{roomid}/{clientid}`, and `/v2/params` routes.
+- Canonical decimal `u64` room and client IDs.
+- A signaling-issued admission token bound to the room/client pair.
+- Explicit `{control:"registered"}` acknowledgement before signaling starts.
+- An `epoch` on every browser `send` frame; stale or malformed epochs are dropped.
+- Symmetric WebSocket relay for offers, answers, and trickle-ICE candidates; V2 does not use `/message` or the V1 WebSocket POST fallback.
+- Authenticated leave using `Authorization: Bearer <admission_token>` and `p2p-promote` for the surviving participant.
 
 ## Build and test
 

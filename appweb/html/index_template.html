@@ -69,6 +69,11 @@
         <div id="room-id-input-buttons">
           <button id="join-button">JOIN</button>
           <button id="random-button">RANDOM</button>
+          <label class="protocol-option" for="signaling-v2-checkbox">
+            <input type="checkbox" id="signaling-v2-checkbox"/>
+            <span>V2</span>
+            <span class="protocol-badge">P2P/SFU</span>
+          </label>
         </div>
       </div>
     </div>
@@ -176,6 +181,7 @@
       iceServerTransports: '{{ ice_server_transports }}',
       wssUrl: '{{ wss_url }}',
       wssPostUrl: '{{ wss_post_url }}',
+      signalingVersion: {{ signaling_version }},
       bypassJoinConfirmation: {{ bypass_join_confirmation }},
       versionInfo: {{ version_info }},
     };

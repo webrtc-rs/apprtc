@@ -11,6 +11,8 @@ use crate::config::Config;
 /// Jinja `| safe` filter), so the JS literals parse correctly.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct RoomParameters {
+    #[serde(skip_serializing)]
+    pub signaling_version: u8,
     // Plain string params (default-escaped in templates).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_id: String,
@@ -19,6 +21,7 @@ pub struct RoomParameters {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub room_link: String,
     pub wss_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub wss_post_url: String,
     pub ice_server_url: String,
     pub ice_server_transports: String,
@@ -150,6 +153,7 @@ impl Config {
         };
 
         let mut params = RoomParameters {
+            signaling_version: 1,
             wss_url,
             wss_post_url,
             ice_server_url,
@@ -186,6 +190,24 @@ impl Config {
         }
         if let Some(is_initiator) = is_initiator {
             params.is_initiator = bool_str(is_initiator).to_string();
+        }
+        params
+    }
+
+    /// Build the configuration embedded in a V2 room-selection or room page.
+    pub fn build_v2_room_parameters(
+        &self,
+        host: String,
+        url: &Url,
+        room_id: &str,
+    ) -> RoomParameters {
+        let mut params = self.build_room_parameters(host, url, room_id, "", None);
+        params.signaling_version = 2;
+        params.wss_post_url.clear();
+        params.is_loopback = "false".into();
+        params.include_loopback_js.clear();
+        if !room_id.is_empty() {
+            params.room_link = params.room_link.replacen("/r/", "/v2/r/", 1);
         }
         params
     }
@@ -267,6 +289,19 @@ mod tests {
             None,
         );
         assert_eq!(params.wss_url, "wss://signaling.example/ws");
+    }
+
+    #[test]
+    fn v2_parameters_use_v2_room_links_without_v1_post_fallback() {
+        let config = Config::default();
+        let params = config.build_v2_room_parameters(
+            "localhost:8080".into(),
+            &url("http://localhost/v2/r/42?it=relay"),
+            "42",
+        );
+        assert_eq!(params.signaling_version, 2);
+        assert_eq!(params.room_link, "http://localhost:8080/v2/r/42?it=relay");
+        assert!(params.wss_post_url.is_empty());
     }
 
     #[test]

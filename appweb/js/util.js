@@ -42,7 +42,7 @@ function sendAsyncUrlRequest(method, url, body) {
 // If async is true, returns a Promise and executes the xhr request
 // async. If async is false, the xhr will be executed sync and a
 // resolved promise is returned.
-function sendUrlRequest(method, url, async, body) {
+function sendUrlRequest(method, url, async, body, headers) {
   return new Promise(function(resolve, reject) {
     var xhr;
     var reportResults = function() {
@@ -65,6 +65,11 @@ function sendUrlRequest(method, url, async, body) {
       };
     }
     xhr.open(method, url, async);
+    if (headers) {
+      Object.keys(headers).forEach(function(name) {
+        xhr.setRequestHeader(name, headers[name]);
+      });
+    }
     xhr.send(body);
 
     if (!async) {

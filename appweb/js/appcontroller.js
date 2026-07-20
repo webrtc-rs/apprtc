@@ -44,6 +44,7 @@ var UI_CONSTANTS = {
   roomSelectionJoinButton: '#join-button',
   roomSelectionRandomButton: '#random-button',
   roomSelectionRecentList: '#recent-rooms-list',
+  roomSelectionV2Checkbox: '#signaling-v2-checkbox',
   sharingDiv: '#sharing-div',
   statusDiv: '#status-div',
   turnInfoDiv: '#turn-info-div',
@@ -179,8 +180,9 @@ AppController.prototype.showRoomSelection_ = function() {
   this.roomSelection_ = new RoomSelection(roomSelectionDiv, UI_CONSTANTS);
 
   this.show_(roomSelectionDiv);
-  this.roomSelection_.onRoomSelected = function(roomName) {
+  this.roomSelection_.onRoomSelected = function(roomName, signalingVersion) {
     this.hide_(roomSelectionDiv);
+    this.loadingParams_.signalingVersion = signalingVersion;
     this.createCall_();
     this.finishCallSetup_(roomName);
 

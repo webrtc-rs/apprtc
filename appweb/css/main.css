@@ -349,6 +349,34 @@ label.error-label {
   margin: 0;
 }
 
+.protocol-option {
+  align-items: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  font-size: 0.9rem;
+  gap: 0.65rem;
+  margin-left: auto;
+  width: fit-content;
+}
+
+.protocol-option input {
+  accent-color: var(--accent-blue);
+  height: 1rem;
+  margin: 0;
+  width: 1rem;
+}
+
+.protocol-badge {
+  background: rgba(59, 130, 246, 0.14);
+  border: 1px solid rgba(59, 130, 246, 0.32);
+  border-radius: 999px;
+  color: #93c5fd;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  padding: 0.15rem 0.45rem;
+}
+
 #room-id-input-buttons {
   display: flex;
   gap: 0.75rem;
@@ -575,4 +603,3 @@ svg:hover {
 }
 
 /*////// icons CSS end /////////////////////////*/
-
