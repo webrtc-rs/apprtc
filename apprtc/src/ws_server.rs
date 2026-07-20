@@ -89,7 +89,7 @@ impl AsyncWrite for Stream {
 }
 
 /// Accept connections until `stop_rx` fires; upgrade the supported WebSocket endpoint.
-pub async fn accept_loop(
+pub async fn run(
     mut stop_rx: watch::Receiver<()>,
     commands: mpsc::Sender<DriverCommand>,
     listener: TcpListener,

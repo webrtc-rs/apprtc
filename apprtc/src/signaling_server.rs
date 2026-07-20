@@ -38,7 +38,7 @@ pub enum DriverCommand {
 
 /// The event loop that owns the Sans-I/O `Collider`: serializes every browser input,
 /// fires the state machine's timeouts, and routes outputs to each session's channel.
-pub async fn event_loop(
+pub async fn run(
     mut stop_rx: watch::Receiver<()>,
     mut commands: mpsc::Receiver<DriverCommand>,
     register_timeout: Duration,
@@ -184,7 +184,7 @@ mod tests {
         fn spawn() -> Self {
             let (stop_tx, stop_rx) = watch::channel(());
             let (commands, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
-            let run = tokio::spawn(event_loop(stop_rx, commands_rx, Duration::from_secs(10)));
+            let run = tokio::spawn(run(stop_rx, commands_rx, Duration::from_secs(10)));
             Self {
                 stop_tx,
                 commands,

@@ -7,14 +7,11 @@ use apprtc::{grpc_server, signaling_server, tls, ws_server};
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;
-use signaling_proto::v2::signaling_service_server::SignalingServiceServer;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -103,10 +100,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let listener = TcpListener::bind((cli.host_ip.as_str(), cli.port)).await?;
+    let ws_listener = TcpListener::bind((cli.host_ip.as_str(), cli.port)).await?;
     let grpc_listener = TcpListener::bind((cli.host_ip.as_str(), cli.grpc_port)).await?;
     println!(
-        "Signaling browser WebSocket listening on {}://{}:{}/ws",
+        "Signaling WebSocket listening on {}://{}:{}/ws",
         if cli.tls { "wss" } else { "ws" },
         cli.host_ip,
         cli.port
@@ -118,55 +115,43 @@ async fn main() -> anyhow::Result<()> {
         cli.grpc_port
     );
 
-    let (io_stop_tx, io_stop_rx) = watch::channel(());
-    let (event_stop_tx, event_stop_rx) = watch::channel(());
     let (commands_tx, commands_rx) = mpsc::channel(signaling_server::COMMAND_CAPACITY);
 
-    // The event loop that owns the Sans-I/O Collider is a separate task to the accept loop
-    let event_loop_handle = tokio::spawn(signaling_server::event_loop(
-        event_stop_rx,
+    let (transport_stop_tx, transport_stop_rx) = watch::channel(());
+    let (collider_stop_tx, collider_stop_rx) = watch::channel(());
+
+    let collider_handle = tokio::spawn(signaling_server::run(
+        collider_stop_rx,
         commands_rx,
         REGISTER_TIMEOUT,
     ));
-    let accept_loop_handle = tokio::spawn(ws_server::accept_loop(
-        io_stop_rx.clone(),
+    let ws_handle = tokio::spawn(ws_server::run(
+        transport_stop_rx.clone(),
         commands_tx.clone(),
-        listener,
+        ws_listener,
         tls_config,
     ));
-    let grpc_service = grpc_server::GrpcSignalingService::new(commands_tx, cli.grpc_token);
-    let mut grpc_server = Server::builder()
-        .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .tcp_keepalive(Some(Duration::from_secs(30)));
-    if cli.tls {
-        let (certificate, private_key) = tls::pem(&cli.certificate, &cli.private_key)?;
-        grpc_server = grpc_server.tls_config(
-            ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key)),
-        )?;
-    }
-    let mut grpc_stop_rx = io_stop_rx;
-    let grpc_handle = tokio::spawn(async move {
-        grpc_server
-            .add_service(SignalingServiceServer::new(grpc_service))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), async move {
-                let _ = grpc_stop_rx.changed().await;
-            })
-            .await
-    });
+    let grpc_handle = tokio::spawn(grpc_server::run(
+        transport_stop_rx,
+        commands_tx,
+        grpc_listener,
+        cli.tls.then_some((cli.certificate, cli.private_key)),
+        cli.grpc_token,
+    ));
 
     println!("Press Ctrl-C to stop");
     let _ = tokio::signal::ctrl_c().await;
+
     println!("Wait for Signaling Server Gracefully Shutdown...");
-    let _ = io_stop_tx.send(());
-    let _ = accept_loop_handle.await;
-    match grpc_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => log::error!("signaling gRPC server failed: {error}"),
-        Err(error) => log::error!("signaling gRPC task failed: {error}"),
-    }
-    let _ = event_stop_tx.send(());
-    let _ = event_loop_handle.await;
-    println!("signaling server is gracefully down");
+    // Stop command producers first and allow in-flight WebSocket/gRPC work to finish.
+    let _ = transport_stop_tx.send(());
+    let _ = ws_handle.await;
+    let _ = grpc_handle.await;
+
+    // The Collider can now drain the final queued commands and release its state.
+    let _ = collider_stop_tx.send(());
+    let _ = collider_handle.await;
+    println!("Signaling Server is gracefully down");
+
     Ok(())
 }

@@ -1,10 +1,10 @@
 //! Private gRPC adapter for AppWeb and future SFU workers.
 
-use crate::signaling_server::DriverCommand;
+use crate::{signaling_server::DriverCommand, tls};
 use signaling::collider::{
     AuthorityCommand, AuthorityOperation, AuthorityResponse, AuthorityResult,
 };
-use signaling_proto::v2::signaling_service_server::SignalingService;
+use signaling_proto::v2::signaling_service_server::{SignalingService, SignalingServiceServer};
 use signaling_proto::v2::{
     self, AdmitV1Request, AdmitV1Response, AdmitV2Request, AdmitV2Response, AppId, Empty, Error,
     ErrorCode, InjectV1Request, Occupancy, OccupancyResponse, OccupancyV1Request,
@@ -17,11 +17,43 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::net::TcpListener;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status as GrpcStatus};
 
 const AUTHORITY_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_CACHE_CAPACITY: usize = 4096;
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub async fn run(
+    mut stop_rx: watch::Receiver<()>,
+    commands: mpsc::Sender<DriverCommand>,
+    listener: TcpListener,
+    tls_files: Option<(String, String)>,
+    token: String,
+) -> anyhow::Result<()> {
+    let service = GrpcSignalingService::new(commands, token);
+    let mut server = Server::builder()
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+        .tcp_keepalive(Some(KEEPALIVE_INTERVAL));
+    if let Some((certificate, private_key)) = tls_files {
+        let (certificate, private_key) = tls::pem(&certificate, &private_key)?;
+        server = server.tls_config(
+            ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key)),
+        )?;
+    }
+    server
+        .add_service(SignalingServiceServer::new(service))
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+            let _ = stop_rx.changed().await;
+        })
+        .await?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestKey {
@@ -491,7 +523,7 @@ mod tests {
         fn spawn(token: &str) -> Self {
             let (stop, stop_rx) = watch::channel(());
             let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
-            let run = tokio::spawn(signaling_server::event_loop(
+            let run = tokio::spawn(signaling_server::run(
                 stop_rx,
                 receiver,
                 Duration::from_secs(10),
