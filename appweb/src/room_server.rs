@@ -2,9 +2,9 @@
 
 use crate::config::Config;
 use crate::dashboard::StatusReport;
+use crate::grpc_client::RoomAuthority;
 use crate::params::{RoomParameters, generate_random};
 use crate::templates::Templates;
-use crate::ws_client::RoomAuthority;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -317,8 +317,8 @@ fn cors(mut response: Response, methods: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ws_client::StatusSnapshot;
-    use crate::ws_client::{Admission, RoomAuthority};
+    use crate::grpc_client::StatusSnapshot;
+    use crate::grpc_client::{Admission, RoomAuthority};
     use async_trait::async_trait;
     use axum::body::to_bytes;
     use axum::http::{Method, Request};

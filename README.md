@@ -50,15 +50,12 @@ The workspace has four Rust crates:
 
 | Crate                                | Responsibility                                                                                                                                                                          |
 |--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, and the async WebSocket I/O driver that hosts the Sans-I/O signaling core.        |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf contract shared by AppWeb and signaling for their private control WebSocket.                                                                                         |
-| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and the in-process client for the signaling authority.                                              |
+| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, and the private gRPC server adapter.                        |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and future SFU workers.                                                                                              |
+| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                             |
 | [`signaling`](signaling)             | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
 
-AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses a
-Protobuf control WebSocket at `/app` to submit `admit`, `remove`, `occupancy`, `inject`, and `status` operations to
-signaling. Browser
-WebSocket traffic connects directly to signaling and never passes through AppWeb.
+AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent unary gRPC calls over one reusable HTTP/2 channel to submit `AdmitV1`, `RemoveV1`, `OccupancyV1`, `InjectV1`, and `GetStatus` operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -72,13 +69,7 @@ Collider
 Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and
 testable in memory, without sockets or a wall clock.
 
-All I/O lives at the binary level, in [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs), keeping
-the SFU `chat` example's architecture in async form on Tokio: an accept loop (`accept_loop`) performs the optional TLS
-handshake and the browser `/ws` or private `/app` WebSocket upgrade, spawning one session task per connection,
-while a single event-loop task
-(`event_loop`) owns the `Collider` — serializing every browser input through it, firing its timeouts, and routing
-its outputs back to each session over channels. Sessions and the event loop sleep on `tokio::select!` and wake
-immediately on input, output, deadline, or shutdown — no blocking calls and no polling intervals.
+All I/O lives at the binary level. [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs) accepts browser `/ws` connections, while [`apprtc/src/grpc_server.rs`](apprtc/src/grpc_server.rs) adapts private gRPC requests to the same authority command channel. A single event-loop task owns the `Collider`, serializes every browser and authority operation through it, fires its timeouts, and routes outputs back to callers. Tasks sleep on async I/O, deadlines, or shutdown without polling.
 
 Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to
 reconnect for 10 seconds before its membership is removed.
@@ -113,12 +104,13 @@ The integration tests are black-box clients of real standalone AppWeb and signal
 
 ```bash
 # 1. Start signaling.
-cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --tls &
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
+  --grpc-port 50051 --tls &
 
 # 2. Start AppWeb.
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
   --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws \
-  --signaling-insecure-tls --tls &
+  --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls &
 
 # 3. Run the integration tests.
 cargo test -p apprtc --test '*' -- --nocapture
@@ -135,9 +127,11 @@ job finishes.
 Run signaling and AppWeb separately from the repository root:
 
 ```bash
-cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
+  --grpc-port 50051
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
-  --public-url http://127.0.0.1:8080 --signaling-url ws://127.0.0.1:8081/ws
+  --public-url http://127.0.0.1:8080 --signaling-url ws://127.0.0.1:8081/ws \
+  --signaling-grpc-url http://127.0.0.1:50051
 ```
 
 AppWeb prints:
@@ -148,9 +142,7 @@ AppWeb listening on http://127.0.0.1:8080/
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
-`--host-ip` and `--port` control each local listener. AppWeb's `--public-url` controls the browser-facing HTTP origin;
-`--signaling-url` controls the browser-facing WebSocket URL and must include `/ws`. AppWeb derives the same signaling
-origin's private `/app` endpoint for its Protobuf control connection.
+`--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's `--public-url` controls the browser-facing HTTP origin, `--signaling-url` controls the browser-facing WebSocket URL and must include `/ws`, and `--signaling-grpc-url` independently selects the private signaling gRPC origin.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -158,13 +150,15 @@ Add `--tls` to serve real HTTPS and WSS from the same listener:
 
 ```bash
 cargo run -p apprtc --bin signaling -- \
-  --host-ip 127.0.0.1 --port 8081 --tls
+  --host-ip 127.0.0.1 --port 8081 --tls \
+  --grpc-port 50051
 cargo run -p apprtc --bin appweb -- \
   --host-ip 127.0.0.1 \
   --port 8080 \
   --web-root appweb \
   --public-url https://127.0.0.1:8080 \
   --signaling-url wss://127.0.0.1:8081/ws \
+  --signaling-grpc-url https://127.0.0.1:50051 \
   --signaling-insecure-tls \
   --tls \
   --debug \
@@ -182,12 +176,13 @@ For a deployment, supply a certificate issued by a trusted authority. Both optio
 ```bash
 cargo run -p apprtc --bin signaling -- \
   --host-ip 0.0.0.0 --public-url wss://sfu.example.com --port 443 --tls \
+  --grpc-port 50051 \
   --certificate /path/to/fullchain.pem \
   --private-key /path/to/privkey.pem
 
 cargo run -p apprtc --bin appweb -- \
   --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
-  --signaling-url wss://sfu.example.com/ws --tls \
+  --signaling-url wss://sfu.example.com/ws --signaling-grpc-url https://sfu.example.com:50051 --tls \
   --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
 ```
 
@@ -205,9 +200,12 @@ authoritative lists.
 | `--tls`                        |                     off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
 | `--certificate <PATH>`         |     bundled certificate | PEM certificate chain used with `--tls`.                                |
 | `--private-key <PATH>`         |             bundled key | PEM private key used with `--tls`.                                      |
-| `--signaling-url <URL>`        |                    none | Browser signaling URL ending in `/ws`; AppWeb derives `/app`.           |
-| `--signaling-insecure-tls`     |                     off | Disable verification for local self-signed signaling TLS (`appweb`).    |
-| `--appid`, `--signaling-token` |       `appweb-1`, empty | AppWeb control identity and token (`appweb`).                           |
+| `--signaling-url <URL>`        |                    none | Public browser signaling URL ending in `/ws` (`appweb`).                |
+| `--signaling-grpc-url <URL>`   | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb`).                               |
+| `--signaling-insecure-tls`     |                     off | Disable verification for local self-signed signaling gRPC TLS.          |
+| `--signaling-token <TOKEN>`    |                   empty | Optional bearer token sent by AppWeb to private gRPC methods.           |
+| `--grpc-port <PORT>`           |                 `50051` | Private gRPC listener port (`signaling`).                               |
+| `--grpc-token <TOKEN>`         |                   empty | Require this bearer token on private gRPC methods (`signaling`).        |
 | `--ice-server-url <URLS>`      |                   empty | ICE server URLs (`appweb`).                                             |
 | `--ice-server-base-url <URL>`  |           AppWeb origin | External ICE credential service origin (`appweb`).                      |
 | `--ice-server-api-key <KEY>`   |                   empty | API key for the ICE credential service (`appweb`).                      |
@@ -220,7 +218,7 @@ authoritative lists.
 Example ICE configuration:
 
 ```bash
-cargo run -p apprtc -- \
+cargo run -p apprtc --bin appweb -- \
   --ice-server-url stun:stun.l.google.com:19302 \
   --ice-server-url turn:turn.example.com:3478
 ```

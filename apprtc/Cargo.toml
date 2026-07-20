@@ -32,6 +32,8 @@ tokio-rustls.workspace = true
 url.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
 
 [dev-dependencies]
 webrtc.workspace = true

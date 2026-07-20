@@ -1,21 +1,18 @@
 # AppRTC Deployment
 
-This guide deploys the Rust AppRTC P2P V1 implementation as two services. AppWeb serves the browser application and HTTP
-room APIs. Signaling owns room state and exposes separate browser and AppWeb-control WebSocket endpoints. They may run
-on separate machines.
+This guide deploys the Rust AppRTC P2P V1 implementation as two services on separate machines. AppWeb serves the browser application and HTTP room APIs. Signaling owns room state, exposes the public browser WebSocket endpoint, and exposes a private TLS-protected gRPC listener to AppWeb.
 
 ```text
 Browser ── HTTPS ──> AppWeb (https://appr.tc)
 Browser ── WSS ────> Signaling (wss://sfu.rs/ws)
-AppWeb  ── WSS/Protobuf ──> Signaling (wss://sfu.rs/app)
+AppWeb  ── gRPC/HTTP2/TLS ──> Signaling (https://sfu.rs:50051)
 ```
 
 V2/SFU call-mode transitions are not enabled yet.
 
 ## DNS and firewall
 
-Point `appr.tc` at the AppWeb host and `sfu.rs` at the signaling host. Allow TCP `443` on both hosts. Port `80` is only
-needed for Certbot standalone validation.
+Point `appr.tc` at the AppWeb host and `sfu.rs` at the signaling host. Allow TCP `443` on both hosts. Allow signaling TCP `50051` only from the AppWeb host's source address; do not expose the private gRPC listener to the general Internet. Port `80` is only needed for Certbot standalone validation.
 
 * **A Record** pointing `@` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
 * **A Record** pointing `www` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
@@ -82,7 +79,7 @@ Run signaling on the signaling host:
 
 ```ini
 [Unit]
-Description=AppRTC Signaling WebSocket
+Description=AppRTC Signaling WebSocket and gRPC server
 After=network-online.target
 Wants=network-online.target
 
@@ -90,7 +87,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/apprtc
 ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/signaling.log ]; then mv /opt/logs/signaling.log /opt/logs/signaling-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-ExecStart=/opt/apprtc/target/release/signaling --host-ip 0.0.0.0 --public-url wss://sfu.rs --port 443 --tls --certificate /etc/letsencrypt/live/sfu.rs/fullchain.pem --private-key /etc/letsencrypt/live/sfu.rs/privkey.pem -d -l info -o /opt/logs/signaling.log
+ExecStart=/opt/apprtc/target/release/signaling --host-ip 0.0.0.0 --public-url wss://sfu.rs --port 443 --grpc-port 50051 --tls --certificate /etc/letsencrypt/live/sfu.rs/fullchain.pem --private-key /etc/letsencrypt/live/sfu.rs/privkey.pem -d -l info -o /opt/logs/signaling.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -112,7 +109,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/apprtc
 ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/appweb.log ]; then mv /opt/logs/appweb.log /opt/logs/appweb-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-ExecStart=/opt/apprtc/target/release/appweb --host-ip 0.0.0.0 --public-url https://appr.tc --signaling-url wss://sfu.rs/ws --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/logs/appweb.log
+ExecStart=/opt/apprtc/target/release/appweb --host-ip 0.0.0.0 --public-url https://appr.tc --signaling-url wss://sfu.rs/ws --signaling-grpc-url https://sfu.rs:50051 --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/logs/appweb.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -131,15 +128,15 @@ sudo systemctl enable --now apprtc-appweb
 sudo systemctl status apprtc-signaling apprtc-appweb
 ```
 
-The services handle SIGINT gracefully by closing WebSocket connections and releasing signaling state.
+The services handle SIGINT gracefully by draining HTTP/gRPC requests, closing WebSocket connections, and releasing signaling state.
 
 ## Local two-process test
 
 The bundled certificate is self-signed. Start signaling and AppWeb on separate local ports:
 
 ```bash
-cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --tls
-cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws --signaling-insecure-tls --tls
+cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --grpc-port 50051 --tls
+cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls
 ```
 
 Then run:
@@ -148,7 +145,7 @@ Then run:
 cargo test -p apprtc --test '*' -- --nocapture
 ```
 
-`--signaling-insecure-tls` is for local development only; browser clients still need to trust the bundled certificate.
+Browser clients still need to trust the bundled certificate. The signaling `--tls` flag protects both WSS and gRPC, and AppWeb's `--signaling-insecure-tls` accepts that self-signed certificate only for local development.
 
 ## Verify production
 
@@ -157,8 +154,7 @@ curl -fsS https://appr.tc/status
 curl -fsS https://appr.tc/params
 ```
 
-The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`. AppWeb derives `wss://sfu.rs/app` from that
-browser URL for its private Protobuf connection.
+The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`. AppWeb uses the independent `--signaling-grpc-url https://sfu.rs:50051` setting for its private unary gRPC calls.
 
 ## Certificate renewal
 
@@ -176,7 +172,4 @@ sudo certbot renew --dry-run
 
 ## CLI reference
 
-Run `appweb --help` and `signaling --help` for the authoritative options. Both support `--host-ip`, `--port`, `--tls`,
-`--certificate`, `--private-key`, `--debug`, `--level`, and `--output-log-file`. AppWeb additionally supports
-`--public-url`, `--signaling-url`, `--signaling-insecure-tls`, `--web-root`, ICE options, banner configuration, and
-`--bypass-join-confirmation`. Signaling supports `--public-url` for its advertised WS origin.
+Run `appweb --help` and `signaling --help` for the authoritative options. AppWeb uses `--signaling-url` for the public browser WebSocket and `--signaling-grpc-url` for the private service channel. Signaling uses `--host-ip` for both listener bind addresses and `--grpc-port` for the private listener's port, while its shared `--tls` setting protects both listeners. Both sides support an optional shared bearer credential with AppWeb `--signaling-token` and signaling `--grpc-token`; mTLS should replace a shared token when service identities are available.

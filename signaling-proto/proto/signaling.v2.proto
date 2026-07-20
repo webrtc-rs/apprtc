@@ -4,7 +4,7 @@ package signaling.v2;
 
 // Private gRPC API exposed by the signaling service.
 //
-// AppWeb uses unary RPCs. An SFU process owns one ConnectSfu stream for its
+// AppWeb uses unary RPCs. An SFU process owns one OpenSfuSession stream for its
 // process lifetime and reconnects that stream with the same instance_id after
 // a transient transport failure.
 service SignalingService {
@@ -400,12 +400,13 @@ message MemberLeft {
 message SfuSignal {
   uint64 room_id = 1;
   uint64 client_id = 2;
-  uint64 assignment_epoch = 3;
-  string message_json = 4;
+  uint64 lifecycle_id = 3;
+  uint64 assignment_epoch = 4;
+  string message_json = 5;
 
   // Optional outer diagnostic correlation for SDP transactions. The browser's
   // subscribe-answer requestid remains inside message_json for compatibility.
-  optional uint64 sdp_request_id = 5;
+  optional uint64 sdp_request_id = 6;
 }
 
 message DrainSfu {

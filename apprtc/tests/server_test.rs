@@ -11,12 +11,10 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::{
-    http, join, unique_room, wait_for_server, ws_connect, ws_connect_path, ws_expect_close,
-    ws_receive_binary, ws_receive_json, ws_register, ws_send, ws_send_binary,
+    http, join, unique_room, wait_for_server, ws_connect, ws_expect_close, ws_receive_json,
+    ws_register, ws_send,
 };
 use serde_json::{Value, json};
-use signaling_proto::v1::response::{Result as ControlResult, ok::Payload as ControlPayload};
-use signaling_proto::{Request as ControlRequest, Response as ControlResponse};
 
 #[tokio::test]
 async fn serves_pages_configuration_static_assets_and_status() -> Result<()> {

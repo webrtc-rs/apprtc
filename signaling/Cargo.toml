@@ -13,8 +13,6 @@ categories.workspace = true
 readme = "../README.md"
 
 [dependencies]
-signaling-proto.workspace = true
-
 sansio.workspace = true
 
 serde.workspace = true

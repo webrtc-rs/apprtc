@@ -22,16 +22,12 @@ The implementation is organized as four core Rust crates plus the SFU crate:
 | Component         | Network role                                              | Owns                                                                                                                 |
 |-------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
 | `apprtc`          | TCP/TLS listeners                                         | Standalone appweb and signaling binaries, CLI parsing, TLS listeners, logging, and graceful shutdown.                |
-| `appweb`          | HTTP server; Protobuf WebSocket **client** of `signaling` | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
-| `signaling`       | WebSocket **server**                                      | authoritative room model, browser sockets, queue/reconnect grace, P2P relay, SFU worker registry and room assignment |
-| `signaling-proto` | no network role; shared Protobuf schema                   | generated AppWeb/signaling request, response, command, result, and payload types                                     |
-| `sfu`             | WebSocket **client** of `signaling`; WebRTC media server  | current `Sfu` engine, its driver, per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding                  |
+| `appweb`          | HTTP server; gRPC **client** of `signaling`               | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
+| `signaling`       | Browser WebSocket authority and Sans-I/O room core        | authoritative room model, browser sockets, queue/reconnect grace, P2P relay, SFU worker registry and room assignment |
+| `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated AppWeb/signaling/SFU gRPC request, response, command, result, and event types                              |
+| `sfu`             | gRPC **client** of `signaling`; WebRTC media server       | current `Sfu` engine, its driver, per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding                  |
 
-`appweb` and `signaling` are separate crates and standalone processes connected through the `RoomAuthority` boundary
-defined by the §8.4 Protobuf protocol. `signaling-proto` owns that shared contract without depending on either
-implementation. The worker boundary (§8.5) similarly keeps the `Sfu` engine independent from its WebSocket driver.
-Browser protocols (§8.2 and §8.3), AppWeb control (§8.4), and worker control (§8.5) are distinct wire protocols even
-when they share a signaling listener.
+`appweb` and `signaling` are separate crates and standalone processes connected through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol. `signaling-proto` owns that shared contract without depending on either implementation. The SFU session boundary (§8.5) similarly keeps the `Sfu` engine independent from its gRPC driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while AppWeb and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
 ## 1. Topology and authority
 
@@ -39,10 +35,10 @@ when they share a signaling listener.
 flowchart LR
     B[Browser] <-- HTTP --> A[appweb - HTTP server]
     B <-- WebSocket register/send --> S[signaling - WS server]
-    A <-- control WebSocket --> S
-    F1[SFU - worker 1] <-- worker WebSocket --> S
-    FK[SFU - worker ...] <-- worker WebSocket --> S
-    FN[SFU - worker N] <-- worker WebSocket --> S
+    A <-- unary gRPC --> S
+    F1[SFU - worker 1] <-- bidirectional gRPC session --> S
+    FK[SFU - worker ...] <-- bidirectional gRPC session --> S
+    FN[SFU - worker N] <-- bidirectional gRPC session --> S
     B <-- WebRTC --> F1
 ```
 
@@ -59,7 +55,7 @@ Room {
   mode: P2P | Upgrading | SFU | Downgrading,
   members: Map<ClientKey, BrowserClient>,
   signal_epoch: u64,                // V2 only; increments at each committed mode transition (§3.1.2)
-  assigned_sfu: Option<SfuId(u64)>, // V2 only
+  assigned_sfu: Option<InstanceId>, // V2 only; SFU process incarnation
   assignment_epoch: Option<u64>,    // V2 only; increments on worker recovery
 }
 ```
@@ -91,11 +87,11 @@ through `signaling`. An answer is emitted for a browser publish offer; a server-
 same event variant, distinguished by SDP type `offer` and its `request_id`. At this Rust API boundary only, the worker
 adapter maps that field to the signaling protocol's `requestid` field.
 
-The worker owns the only mutable `Sfu` instance in its event loop. WebSocket reads enqueue commands for that loop; the
+The worker owns the only mutable `Sfu` instance in its event loop. gRPC stream reads enqueue commands for that loop; the
 loop performs `handle_event`, drains `poll_write()` to socket, feeds packets to `handle_read`, calls `handle_timeout`,
-and drains `poll_event()` back to the worker WebSocket. WebSocket tasks never mutate `Sfu` concurrently. This loop shape
+and drains `poll_event()` back to the SFU session stream. Transport tasks never mutate `Sfu` concurrently. This loop shape
 is identical in every deployment mode; only the transport that feeds and drains it changes (an in-process channel in a
-merged binary, the §8.5 worker WebSocket across processes).
+merged binary, the §8.5 bidirectional gRPC session across processes).
 
 ICE candidates are first-class application-signaling messages in both P2P and SFU mode. The current engine accepts
 `SFUEvent::IceCandidate` and currently places its host candidate in an SDP answer. A deployment may therefore send no
@@ -103,20 +99,16 @@ incremental SFU candidates, but it uses the same candidate protocol when it does
 gathering later requires only worker/engine work: the worker adapter emits the already-defined candidate `signal` frame.
 It must not require a browser, hub, or wire-protocol revision.
 
-## 3. Signaling WebSocket endpoints and authenticated roles
+## 3. Signaling endpoints and authenticated roles
 
-Browser connections and the future SFU worker role reach `wss://signaling/ws`. The private AppWeb connection reaches
-`wss://signaling/app`, which accepts only Protobuf binary frames. V2 browser credentials are admission tokens created by
-`appweb`; the v1 browser path deliberately retains its current tokenless framing. Service roles are intended to use mTLS
-or a rotated worker/app token and should normally be reachable only on a private listener. The currently implemented P2P
-V1 AppWeb control endpoint transports but does not validate its token (§8.4).
+Browsers reach the public `wss://signaling/ws` endpoint. AppWeb and SFU processes reach a separate private HTTP/2 listener implementing `signaling.v2.SignalingService`. V2 browser credentials are admission tokens created by `appweb`; the V1 browser path deliberately retains its current tokenless framing. Production service callers use mTLS or a rotated bearer token and the private listener is not exposed to browsers.
 
-| Role              | Endpoint | First frame                                                          | Direction after registration                                                         |
-|-------------------|----------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------|
-| Browser v1        | `/ws`    | JSON `{cmd:"register", roomid, clientid}`                            | Existing `{cmd:"send", msg}` and `{msg}` framing, no new required field              |
-| Browser v2        | `/ws`    | JSON `{cmd:"register", roomid, clientid, ver:2, token}`              | Same `send`/`msg` framing plus a required `epoch` on `send` and v2-only controls     |
-| AppRTC front door | `/app`   | Protobuf `Request{request_id, app:Register{app_id, token}}`          | Protobuf `admit`, `remove`, `occupancy`, `inject`, and `status` requests and replies |
-| SFU worker        | `/ws`    | JSON `{cmd:"sfu", sfuid, instance, token, capacity}`              | JSON lifecycle and addressed SDP frames in both directions                           |
+| Role              | Transport/API                                      | Session or request identity                                      | Traffic after admission or registration                                               |
+|-------------------|----------------------------------------------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| Browser V1        | JSON WebSocket `/ws`                               | `{cmd:"register", roomid, clientid}`                            | Existing `{cmd:"send", msg}` and `{msg}` framing, with no new required field          |
+| Browser V2        | JSON WebSocket `/ws`                               | `{cmd:"register", roomid, clientid, ver:2, token}`              | Same `send`/`msg` framing plus required `epoch` and V2-only controls                   |
+| AppWeb            | Unary `SignalingService` RPCs                      | `RequestContext{APP_ID_APPWEB, instance_id, request_id}`         | `AdmitV1/V2`, `RemoveV1/V2`, `OccupancyV1/V2`, `InjectV1`, and `GetStatus`             |
+| SFU worker        | Bidirectional `OpenSfuSession` RPC                 | First stream message is `RegisterSfu` with `APP_ID_SFU` context  | Ordered commands/results and reliable worker events/acknowledgements                   |
 
 The hub validates a service role before processing any other command. A V2 browser may register only after an `admit`
 has created its member record; V2 `register` and `send` never lazily create rooms or clients. The V1 path preserves its
@@ -167,8 +159,7 @@ promote is enqueued after any relay already accepted from the departed peer, so 
 is a membership change, not a mode transition, so it does not increment the epoch. A later `registered` snapshot
 supersedes a missed promotion.
 
-`room-failed` is the v2 failure notification. When the hub marks a room failed — assigned-worker grace expiry, or a
-worker process restart detected by its `instance` nonce (§8.5) — it pushes `{control:"room-failed"}` to every member,
+`room-failed` is the v2 failure notification. When the hub marks a room failed after its assigned SFU `instance_id` remains disconnected past the recovery grace (§8.5), it pushes `{control:"room-failed"}` to every member,
 then removes the membership and reaps the room; admission tokens die with it (§7). The browser tears down all transports
 and, to continue the call, rejoins through `POST /v2/join` as a fresh admission. A member that was disconnected when the
 control was pushed discovers the failure at re-register: its token is dead, the hub rejects with `UNAUTHORIZED`, and the
@@ -237,49 +228,40 @@ would be relayed to the surviving P2P peer). The rules:
   across a downgrade commit is dropped, never relayed to the surviving P2P peer.
 - v1 rooms have no epoch; they never transition modes.
 
-### 3.2 Worker frames
+### 3.2 SFU session envelopes
 
-Use a single envelope so worker control notifications and browser payloads remain separate and request correlation
-survives reconnects:
+The bidirectional gRPC stream uses distinct directional envelopes. `SignalingToSfu` contains registration response, command, or event acknowledgement messages. `SfuToSignaling` contains registration, command result, or reliable worker event messages. This keeps lifecycle commands, health, failures, and opaque browser signaling separate while preserving request correlation across transient reconnects.
 
-```jsonc
-// signaling -> worker; ordered per room
-{ "cmd":"join",  "roomid":42, "clientid":101, "lifecycleid":7 }
-{ "cmd":"signal","roomid":42, "clientid":101,
-  "msg":"{\"type\":\"offer\",\"sdp\":\"...\"}" }
-{ "cmd":"leave", "roomid":42, "clientid":101, "lifecycleid":8,
-  "reason":"leave" }
+```proto
+message SfuToSignaling {
+  oneof message {
+    RegisterSfu register = 1;
+    SfuCommandResult command_result = 2;
+    SfuEvent event = 3;
+  }
+}
 
-// worker -> signaling
-{ "cmd":"joined", "roomid":42, "clientid":101, "lifecycleid":7 }
-{ "cmd":"left",   "roomid":42, "clientid":101, "lifecycleid":8 }
-{ "cmd":"signal", "roomid":42, "clientid":101,
-  "msg":"{\"type\":\"answer\",\"sdp\":\"...\"}" }
-{ "cmd":"error", "roomid":42, "clientid":101, "requestid":11,
-  "code":"INVALID_SDP", "reason":"..." }
+message SignalingToSfu {
+  oneof message {
+    RegisterSfuResponse registered = 1;
+    SfuCommand command = 2;
+    SfuEventAck event_ack = 3;
+  }
+}
 ```
 
-`join` and `leave` are idempotent by `(roomid, clientid, lifecycleid)`. This is a **worker WebSocket-adapter** concern;
-`Sfu` itself does not interpret or retain a `lifecycleid`. The adapter replies `joined` only after its loop has
-successfully applied `SFUEvent::Join`; that acknowledgement is needed to order an upgrade safely. A worker must preserve
-command order for each room even if it multiplexes many rooms on one socket.
+`JoinMember` and `LeaveMember` are idempotent by `(room_id, client_id, lifecycle_id)`, and every `SfuCommand` additionally has a signaling-allocated `request_id` used for transport replay and result correlation. This is an SFU adapter concern; `Sfu` itself does not interpret or retain `lifecycle_id`. The adapter returns `MemberJoined` only after successfully applying `SFUEvent::Join`; that result is the barrier required to commit an upgrade safely. The stream preserves command order, and the adapter preserves per-room order while multiplexing many rooms.
 
 #### Lifecycle ID versus SDP request ID
 
-`lifecycleid` identifies a **membership operation**, not an SDP transaction. It is a strictly increasing `u64` per
-`(roomid, clientid)`, minted by `signaling`:
+`lifecycle_id` identifies a **membership operation**, not an SDP transaction. It is a strictly increasing `u64` per `(room_id, client_id)`, minted by `signaling`:
 
 ```text
-join(room=42, client=101, lifecycleid=7)  → joined(..., lifecycleid=7)
-leave(room=42, client=101, lifecycleid=8) → left(..., lifecycleid=8)
+JoinMember(room=42, client=101, lifecycle_id=7)  → MemberJoined(..., lifecycle_id=7)
+LeaveMember(room=42, client=101, lifecycle_id=8) → MemberLeft(..., lifecycle_id=8)
 ```
 
-If a worker acknowledgement is lost or its WebSocket reconnects, the hub resends the same operation with the same
-`lifecycleid`. The **worker adapter** records the last applied ID, does not call `Sfu` a second time for the same
-operation, and returns the corresponding acknowledgement. It ignores a stale/replayed `joined(7)` after `leave(8)` has
-been applied. This is what makes the hub's SFU membership projection safe to rebuild after reconnect. If the worker
-process itself restarts, its adapter state is empty; the hub sends the current roster as a fresh `sync-room` projection
-before browser signaling is released to that worker.
+If a command result is lost or the gRPC stream reconnects, the hub resends the operation with the same command `request_id` and lifecycle ID. The SFU adapter records the last applied IDs, does not call `Sfu` twice, and returns the cached result. It ignores a stale `MemberJoined(7)` after `LeaveMember(8)` has been applied. This makes the hub's SFU membership projection safe to verify with `SyncRoom` after a same-process reconnect. A restarted SFU has a new `instance_id`; the hub never treats it as reconstruction of the old media process.
 
 `requestid` is different: it correlates an SDP offer/answer negotiation, especially the browser answer to an
 SFU-initiated subscribe offer. A browser may renegotiate many times during one membership lifetime, so a `requestid`
@@ -296,7 +278,7 @@ corresponding `SFUEvent::SessionDescription`.
 ### 4.1 P2P, one or two members
 
 1. Browser calls `POST /join/{room}` on `appweb`.
-2. `appweb` sends `admit(request_id, room_id, client_id, ver)` over its control WebSocket.
+2. `appweb` calls the appropriate `AdmitV1` or `AdmitV2` unary gRPC method with its process `instance_id` and a nonzero `request_id`.
 3. `signaling` creates the member, elects the first member as initiator, and replies.
 4. Browser registers its own WebSocket with `signaling`.
 5. Every browser `{cmd:"send"}` is relayed to the other member; early messages queue and flush when that member
@@ -385,20 +367,14 @@ commit, a new third join follows the ordinary P2P→SFU upgrade path.
 Workers register capacity and health. `signaling` assigns a room once, using a stable room-affine policy such as
 least-loaded worker with a deterministic room-id tie-breaker. That assignment remains until the room empties.
 
-- A transient worker WebSocket disconnect puts the worker in grace: do not assign new rooms; queue bounded control
-  frames; allow the same `sfuid` to re-register, where the §8.5 `instance` rules decide between projection replay and
-  room failure.
-- On reconnect with an unchanged `instance` nonce (§8.5) — a socket blip with engine state intact — the hub sends a
-  `sync-room` roster before any queued browser signal, then replays unacknowledged commands; repeated join is harmless.
-  `sync-room` restores the membership projection only, never media state.
-- On grace expiry — or on a reconnect whose `instance` nonce changed, which proves a process restart and lost media
-  state — mark the assigned rooms failed and push `room-failed` (§3.1) to their members. Do not move a live WebRTC
-  transport to another worker; that requires a new peer connection and re-publish.
+- A transient `OpenSfuSession` disconnect puts that SFU instance in grace: do not assign new rooms and retain a bounded command backlog. A reconnect with the same `instance_id` resumes the same process incarnation; a restarted process has a new `instance_id` and registers as a new worker.
+- On reconnect with the same `instance_id` — a transport interruption with engine state intact — the hub sends a `SyncRoom` roster before any queued browser signal, then replays unacknowledged commands. `SyncRoom` verifies membership projection only and never reconstructs media state.
+- On grace expiry, mark rooms assigned to the disconnected instance failed and push `room-failed` (§3.1) to their members. A restarted SFU registers with a new `instance_id` and is treated as a new worker; it does not claim the old instance's rooms. Do not move a live WebRTC transport to another worker because that requires a new peer connection and re-publish.
 - Bound every queue: browser outbound queue, worker outbound queue, per-room command backlog, and SDP/ICE frame size.
   Backpressure is a room/client failure, never a reason to block the media UDP loop.
 
-The worker protocol, like the app control protocol, is the **cross-process binding** of the worker boundary. An
-in-process worker (`signaling` and `sfu` linked into one binary) replaces the WebSocket with a channel into the same UDP
+The SFU gRPC session, like the AppWeb unary API, is the **cross-process binding** of the internal authority boundary. An
+in-process worker (`signaling` and `sfu` linked into one binary) replaces the gRPC stream with a channel into the same UDP
 loop and keeps the same command semantics; because a channel cannot lose acknowledgements or replay across a reconnect,
 the `lifecycleid`/`sync-room`/grace machinery above is inert in that binding — it exists only where a socket can drop,
 reconnect, or replay.
@@ -506,7 +482,7 @@ recoverable signaling failure: discard that transport generation and re-establis
   failure state, and rejoin through `POST /v2/join` without reloading the page or reacquiring devices.
 
 `appweb` continues to expose `/join`, `/leave`, `/params`, `/v1alpha/iceconfig`, room pages, and static assets. It
-becomes a thin HTTP/control-WS adapter: all room mutations round-trip to `signaling`; it has no second occupancy or
+becomes a thin HTTP/gRPC adapter: all room mutations round-trip to `signaling`; it has no second occupancy or
 initiator model.
 
 ## 7. Security and acceptance criteria
@@ -521,21 +497,15 @@ initiator model.
 - Run a V1 wire-compatibility suite covering `call.js`, `/join` params/messages, initiator `/message`, `wss_post_url`
   POST/DELETE fallback, queued-offer flush, reconnect grace, and `FULL` at the third join.
 - Test v2 P2P regression, third-join upgrade ordering, stale-epoch frame drops across upgrade/downgrade commits,
-  duplicate join/leave idempotence, worker reconnect/sync, worker-restart room failure via the `instance` nonce,
+  duplicate join/leave idempotence, same-instance reconnect/sync, old-instance grace-expiry room failure,
   malformed SDP isolation, and three-browser publish/subscribe media. Also test that v1/v2 mixed joins never change an
   existing room's version.
 
 ## 8. Detailed wire-protocol definitions
 
-This section is normative. All browser WebSocket frames are UTF-8 JSON text frames; `msg` is a JSON **string**
-containing a second JSON application-signaling object. The outer hub never parses that inner object. Unknown mandatory
-fields/commands are errors; unknown optional fields are ignored. The SFU worker protocol uses JSON text frames. The
-AppWeb control protocol is the exception: §8.4 uses Protobuf binary frames on `/app`. Numbers in browser JSON
-are represented as strings where `u64` precision is required.
+This section is normative. All browser WebSocket frames are UTF-8 JSON text frames; `msg` is a JSON **string** containing a second JSON application-signaling object. The outer hub never parses that inner object. Unknown mandatory fields or commands are errors; unknown optional fields are ignored. The private service protocol uses Protobuf messages over gRPC as defined by `signaling-proto/proto/signaling.v2.proto`. Numbers in browser JSON are represented as strings where `u64` precision is required.
 
-§8.4 and §8.5 are the **cross-process bindings** of internal interfaces (see Status). A merged deployment implements the
-same commands as direct calls and skips the socket-recovery machinery; only the browser protocols (§8.2, §8.3) are
-unconditionally wire protocols.
+§8.4 and §8.5 are the **cross-process bindings** of internal interfaces. A merged deployment implements the same commands as direct calls and skips transport recovery; only the browser protocols (§8.2 and §8.3) are unconditionally wire protocols.
 
 ### 8.1 Common types and error rules
 
@@ -544,14 +514,14 @@ LegacyId       = any non-empty JSON string                 // v1 only
 U64Decimal     = "0" | ("1".."9") { "0".."9" }          // must parse as u64
 RoomIdV2       = U64Decimal
 ClientIdV2     = U64Decimal
-requestid      = U64Decimal on browser messages; JSON u64 number on worker frames
-lifecycleid    = JSON u64 number on worker frames
+requestid      = U64Decimal on browser messages
+lifecycle_id   = Protobuf uint64 on the SFU gRPC session
 epoch          = U64Decimal on browser frames; the room's signal epoch (§3.1.2)
 AppMessage     = JSON string containing Offer | Answer | Candidate | Bye
 ```
 
-The spelling of browser and SFU-worker JSON fields is deliberately `roomid`, `clientid`, `requestid`, and `lifecycleid`—not snake case. The AppWeb Protobuf protocol is separate and uses `request_id`, `room_id`, `client_id`, and `app_id` as defined in §8.4.
-The adapter converts between wire `requestid` and the current Rust core's `SFUEvent::request_id`; `lifecycleid` is
+The spelling of browser JSON fields is deliberately `roomid`, `clientid`, and `requestid`, while service Protobuf fields use snake case: `request_id`, `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, and `instance_id`.
+The adapter converts between browser `requestid` and the current Rust core's `SFUEvent::request_id`; `lifecycle_id` is
 adapter/hub state and is never supplied to `Sfu`.
 
 V2 rejects leading zeroes other than `"0"`, signs, whitespace, decimal points, and values exceeding
@@ -698,231 +668,83 @@ worker-issued `requestid`. In an SFU room, the browser leaves through `POST /v2/
 send `{type:"bye"}` to the worker path. The hub then owns the ordered worker `leave` operation and any resulting
 subscribe re-offers.
 
-### 8.4 AppRTC control WebSocket
+### 8.4 AppWeb unary gRPC API
 
-`appweb` keeps HTTP request/response compatibility but delegates every room mutation to signaling through one private
-`wss://signaling/app` connection. `/app` accepts only WebSocket binary frames containing `signaling.v1`
-Protobuf messages; `/ws` remains browser JSON and rejects binary application frames. One AppWeb process maintains one
-steady-state control connection with the state `Connecting → Registered → Reconnecting → Registered → Closed`. Its first
-request after every connection or reconnection must select the `app` command.
-
-This protocol is the WebSocket binding of the `RoomAuthority` interface currently implemented for P2P V1: `admit`, `remove`, `occupancy`, `inject`, and `status`. Browser `send`/`msg` relay traffic terminates at signaling's `/ws` endpoint and never routes through AppWeb. The normative schema is maintained in `signaling-proto/proto/signaling.v1.proto`; both processes compile against generated types from the shared `signaling-proto` crate.
+`appweb` keeps HTTP request/response compatibility but delegates every room query and mutation to `signaling.v2.SignalingService` through concurrent unary RPCs over one reusable tonic HTTP/2 channel. Browser `send`/`msg` relay traffic still terminates at signaling's public `/ws` endpoint and never routes through AppWeb. The normative schema is `signaling-proto/proto/signaling.v2.proto`; both processes compile against its generated tonic types.
 
 ```proto
-syntax = "proto3";
-package signaling.v1;
-
-message Request {
-  uint64 request_id = 1;
-
-  oneof command {
-    Register app = 10;
-    Admit admit = 11;
-    Remove remove = 12;
-    Occupancy occupancy = 13;
-    Inject inject = 14;
-    StatusRequest status = 15;
-  }
-
-  message Register {
-    string app_id = 1;
-    string token = 2;
-  }
-
-  message Admit {
-    string room_id = 1;
-    string client_id = 2;
-    bool is_loopback = 3;
-  }
-
-  message Remove {
-    string room_id = 1;
-    string client_id = 2;
-  }
-
-  message Occupancy {
-    string room_id = 1;
-  }
-
-  message Inject {
-    string room_id = 1;
-    string client_id = 2;
-    string msg = 3;
-  }
-
-  message StatusRequest {}
-}
-
-message Response {
-  uint64 request_id = 1;
-
-  oneof result {
-    Ok ok = 2;
-    Err err = 3;
-  }
-
-  message Ok {
-    oneof payload {
-      Admitted admitted = 10;
-      OccupancyResult occupancy = 11;
-      StatusResult status = 12;
-    }
-  }
-
-  message Err {
-    string reason = 1;
-  }
-
-  message Admitted {
-    bool is_initiator = 1;
-    repeated string messages = 2;
-  }
-
-  message OccupancyResult {
-    uint64 count = 1;
-  }
-
-  message StatusResult {
-    uint64 rooms = 1;
-    uint64 clients = 2;
-    uint64 websocket_connections = 3;
-    uint64 total_websocket_connections = 4;
-    uint64 websocket_errors = 5;
-  }
+service SignalingService {
+  rpc AdmitV1(AdmitV1Request) returns (AdmitV1Response);
+  rpc RemoveV1(RemoveV1Request) returns (OperationResponse);
+  rpc OccupancyV1(OccupancyV1Request) returns (OccupancyResponse);
+  rpc InjectV1(InjectV1Request) returns (OperationResponse);
+  rpc AdmitV2(AdmitV2Request) returns (AdmitV2Response);
+  rpc RemoveV2(RemoveV2Request) returns (OperationResponse);
+  rpc OccupancyV2(OccupancyV2Request) returns (OccupancyResponse);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  rpc OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu);
 }
 ```
 
-`request_id` is a nonzero Protobuf `uint64`, allocated monotonically within one AppWeb process. Every valid request selects exactly one `command`; every reply copies the corresponding `request_id`. AppWeb uses that ID to correlate replies, so no response-type discriminator is needed. Every response selects exactly one `result`: `ok` contains an optional typed success payload, while `err` contains a non-empty `reason`. A successful `admit`, `occupancy`, or `status` reply selects its corresponding `Ok.payload`. Successful registration, removal, and injection use `Ok` without a payload because the correlated request already identifies the operation. A missing `result` is invalid.
+Every AppWeb request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id, request_id}`. `instance_id` is generated once per process incarnation. `request_id` is a nonzero `uint64`, allocated monotonically within that instance and retained if a caller retries the same logical operation. Signaling caches the most recent 4096 completed AppWeb operations: an identical `(instance_id, request_id)` retry returns the cached domain result without repeating the room mutation, while reuse of that key for different operation content returns gRPC `ALREADY_EXISTS`. Every application response carries `ResponseContext.request_id` copied from its request and selects exactly one typed `result` arm. Expected room-domain failures use the response `Error` message; malformed requests, authorization failure, deadline expiry, and unavailable transport use native gRPC status codes.
 
-The nested `Response.result` representation is wire-incompatible with the earlier pre-release flat enum/reason/payload response. Deploy matching AppWeb and signaling versions together; a mixed-version pair rejects registration or responses and reconnects rather than silently misinterpreting them.
+| RPC           | Required operation fields                           | Successful result             | P2P V1 semantics                                                        |
+|---------------|-----------------------------------------------------|-------------------------------|-------------------------------------------------------------------------|
+| `AdmitV1`     | opaque non-empty `room_id`, `client_id`; `is_loopback` | `V1Admission`               | Admit a member, enforce capacity, elect the initiator, return queued messages. |
+| `RemoveV1`    | opaque non-empty `room_id`, `client_id`              | `Empty`                       | Remove a member and close its live browser WebSocket.                   |
+| `OccupancyV1` | opaque non-empty `room_id`                           | `Occupancy{member_count,P2P}` | Return current room occupancy.                                          |
+| `InjectV1`    | opaque non-empty `room_id`, `client_id`, `message_json` | `Empty`                     | Implement legacy `/message` queue-or-relay behavior without parsing payload. |
+| `GetStatus`   | context only                                        | `Status`                      | Return V1 room/client/browser WebSocket counters; V2/SFU counters are zero until implemented. |
 
-| Command     | Required command fields                      | Successful response payload | Current P2P V1 semantics                                             |
-|-------------|----------------------------------------------|-----------------------------|----------------------------------------------------------------------|
-| `app`       | non-empty `app_id`; optional `token`         | none                        | Register the AppWeb connection; must be the first request.           |
-| `admit`     | `room_id`, `client_id`; optional `is_loopback` | `Admitted`                | Admit a room member, enforce capacity, and elect the initiator.      |
-| `remove`    | `room_id`, `client_id`                       | none                        | Remove a member and close its live browser WebSocket after replying. |
-| `occupancy` | `room_id`                                    | `OccupancyResult`           | Return current room occupancy.                                       |
-| `inject`    | `room_id`, `client_id`, `msg`                | none                        | Implement legacy `/message` queue-or-relay behavior.                 |
-| `status`    | none                                         | `StatusResult`              | Return signaling room, client, WebSocket, and error counters.        |
+V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented server returns `UNIMPLEMENTED` for `AdmitV2`, `RemoveV2`, `OccupancyV2`, and `OpenSfuSession` until the V2 room model and SFU adapter are enabled.
 
-Admission failures select `Err` with a legacy reason such as `FULL` or `DUPLICATE_CLIENT`. V1 `room_id` and `client_id` remain opaque strings inside Protobuf. The optional registration token is transported but not yet validated. Unknown Protobuf fields are ignored for forward compatibility, while a missing command, zero `request_id`, undecodable frame, text frame on `/app`, or binary frame on `/ws` is a protocol violation and closes the socket without a reply because no valid request can be correlated. A valid registration with an empty `app_id` receives a correlated `Err` before closure.
+One tonic `Channel` is shared by all AppWeb requests. Concurrent unary calls are multiplexed as independent HTTP/2 streams, so no application pending-response map or registration handshake is required. The channel uses a 10-second connection timeout, a 15-second RPC timeout, HTTP/2 keepalive every 30 seconds with a 10-second acknowledgement timeout, and lazy connection establishment so AppWeb can start while signaling is unavailable. Tonic reconnects the underlying channel for later RPCs after a transport failure. Both sides log the operation, `instance_id` where available, `request_id`, result, safe reason metadata, and elapsed time without logging signaling payloads or credentials.
 
-AppWeb sends a WebSocket Ping every 30 seconds and requires a Pong within 10 seconds. On connection loss it fails the
-in-flight request, reconnects with exponential backoff plus jitter (1–30 seconds), and re-registers the same configured
-`appid`. It does not automatically replay a request that may already have reached signaling; later requests use the
-recovered connection. Connection/registration attempts time out after 10 seconds, and an HTTP-side authority request
-times out after 15 seconds. AppWeb startup does not depend on signaling availability: it starts serving HTTP immediately
-while the control worker attempts an immediate connection and then retries indefinitely with the same backoff until
-signaling becomes available. Authority requests accepted while disconnected remain subject to the bounded queue and
-15-second caller timeout. AppWeb and signaling log every valid control request and reply at INFO with its operation and
-`request_id`; reply logs also include `result` and the safe `reason` metadata when present. Keep-alive and reconnect
-lifecycle events are also logged, without tokens or signaling payloads.
+### 8.5 SFU bidirectional gRPC session
 
-### 8.5 SFU worker WebSocket
+An out-of-process SFU opens exactly one long-lived `OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu)` RPC per process incarnation. The stream has the state `Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 `uint64` room/client IDs cross this boundary; a V1 room never reaches an SFU.
 
-The worker socket is the SFU's sole signaling transport when the worker runs as a separate binary; an in-process worker
-binds the same commands over a channel and skips the socket-recovery machinery (§5). The socket has the state
-`Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 `u64` IDs appear on this protocol; a V1 room
-never reaches a worker.
+The first `SfuToSignaling` message must be `RegisterSfu`. Its `RequestContext.app_id` is `APP_ID_SFU`; `instance_id` is the globally unique process-incarnation identity and replaces a separate `sfu_id`; and `request_id` identifies the registration operation. The same running process reuses `instance_id` after transient stream reconnection. A restarted process generates a new `instance_id` and cannot inherit the prior process's media state.
 
-```text
-sfuid        = JSON u64 number
-instance     = random non-empty process-instance string; regenerated on worker
-               process restart (mirrors AppId)
-roomid       = JSON u64 number
-clientid     = JSON u64 number
-lifecycleid  = JSON u64 number, monotonic per `(roomid, clientid)`
-requestid    = JSON u64 number, allocated/read by the worker adapter for SDP correlation
-epoch        = JSON u64 number, monotonic per room assignment/recovery — this is the
-               assignment epoch (§1), unrelated to the browser signal epoch (§3.1.2)
-```
+#### Registration and health
 
-#### Worker registration and health
+`RegisterSfu` carries capacity limits. `RegisterSfuResponse` echoes the registration `request_id` and returns `SfuRegistered{health_interval_ms,resumed}` or a typed error. `resumed=true` means signaling recognized the same process incarnation after a transient disconnect and will send `SyncRoom` commands before releasing queued browser signaling. Authentication failure uses gRPC `UNAUTHENTICATED` and closes the stream.
 
-```jsonc
-// worker -> signaling; required first frame
-{ "cmd":"sfu", "sfuid":7, "instance":"w7-4c9d", "token":"...", "capacity":{"rooms":100,"clients":1000} }
+After registration, the SFU periodically sends reliable `SfuEvent{health}` messages and also sends one after a material capacity or readiness change. `SfuHealth.state` is `READY` or `DRAINING`; capacity and current room/client counts determine assignment eligibility. HTTP/2 keepalive detects dead transport independently of application health reports.
 
-// signaling -> worker
-{ "cmd":"ready", "sfuid":7, "heartbeat_ms":5000 }
+#### signaling → SFU commands
 
-// worker -> signaling, periodically and after a material capacity change
-{ "cmd":"health", "sfuid":7, "state":"ready", "rooms":12, "clients":86 }
-{ "cmd":"health", "sfuid":7, "state":"draining", "rooms":12, "clients":86 }
-```
+Every `SignalingToSfu.command` carries a signaling-allocated nonzero `request_id`. The ID remains stable when an unacknowledged command is replayed after reconnect. The SFU adapter deduplicates commands by `(signaling instance, request_id)` and returns exactly one `SfuCommandResult` echoing the command ID.
 
-Authentication failure returns `{cmd:"error", code:"UNAUTHORIZED"}` and closes. A duplicate live `sfuid` is rejected; a
-reconnecting worker with the same `sfuid` is accepted only after the previous socket is gone or has entered grace.
+| Command       | Required payload fields                                                | Adapter action |
+|---------------|------------------------------------------------------------------------|----------------|
+| `SyncRoom`    | `room_id`, `assignment_epoch`, repeated `{client_id,lifecycle_id}`      | Reconcile the local membership projection to the authoritative roster; accept no browser SDP/ICE for the room until synchronization succeeds. |
+| `JoinMember`  | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`             | Apply `SFUEvent::Join` once and return `MemberJoined` with all identity fields echoed. |
+| `LeaveMember` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, `reason`   | Apply `SFUEvent::Leave` once and return `MemberLeft` with all identity fields echoed. |
+| `SfuSignal`   | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, opaque `message_json` | Parse the inner AppRTC SDP/candidate/end-of-candidates JSON and apply it only to the matching current member lifecycle. An inner `bye` is ignored because membership is owned by `LeaveMember`. |
+| `DrainSfu`    | optional `deadline_unix_ms`                                            | Stop accepting new room assignments while continuing existing rooms until signaling removes them. |
 
-The `instance` nonce is how the hub tells a socket blip from a process restart: a re-registering `sfuid` with the same
-`instance` still holds its engine state, so the hub follows the replay path (rule 4 below); a new `instance` proves the
-adapter and engine state are gone, so the hub marks every room assigned to that `sfuid` failed and pushes `room-failed`
-to their members (§5). `sync-room` alone cannot make this distinction — an empty adapter reconciles and replies `synced`
-exactly like an intact one.
+`SfuCommandResult.ok` contains `RoomSynced`, `MemberJoined`, `MemberLeft`, or an empty acknowledgement as appropriate. Expected operation failures use its typed `Error` arm. A stale `assignment_epoch` or `lifecycle_id` is rejected without mutating the engine.
 
-#### signaling → worker commands
+#### SFU → signaling events
 
-| Frame       | Required fields                                                      | Adapter action                                                                                                                                                                                                                                                                                                                                                                                   |
-|-------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `sync-room` | `roomid`, `epoch`, `members:[{clientid,lifecycleid}]`                | Reconcile the worker projection to this authoritative roster: join missing members and leave locally projected members absent from the roster; no browser SDP is accepted until `synced`.                                                                                                                                                                                                        |
-| `join`      | `roomid`, `clientid`, `lifecycleid`                                  | Apply `SFUEvent::Join` once, then emit `joined`.                                                                                                                                                                                                                                                                                                                                                 |
-| `leave`     | `roomid`, `clientid`, `lifecycleid`, `reason`                        | Apply `SFUEvent::Leave` once, then emit `left`.                                                                                                                                                                                                                                                                                                                                                  |
-| `signal`    | `roomid`, `clientid`, `msg`; optional adapter diagnostic `requestid` | Parse inner browser SDP or candidate JSON. Apply an SDP as `SessionDescription`; apply a candidate as `IceCandidate`, buffering it until its remote description is ready. Forward an end-of-candidates marker to the WebRTC layer when supported. An inner `bye` is dropped silently — membership belongs to the hub `leave` path, and stock hangup flows may emit `bye`, so it is not an error. |
-| `drain`     | optional deadline                                                    | Stop accepting new rooms; keep assigned rooms until the hub removes them.                                                                                                                                                                                                                                                                                                                        |
+Each `SfuEvent` carries an SFU-allocated nonzero `request_id`. Signaling deduplicates the event by `(APP_ID_SFU, instance_id, request_id)` and returns `SfuEventAck` with that ID after accepting or recognizing a duplicate. The SFU retains and retransmits an unacknowledged event after a same-instance reconnect.
 
-```jsonc
-{ "cmd":"sync-room", "roomid":42, "epoch":9,
-  "members":[{"clientid":101,"lifecycleid":7},{"clientid":102,"lifecycleid":3}] }
-{ "cmd":"join", "roomid":42, "clientid":103, "lifecycleid":1 }
-{ "cmd":"signal", "roomid":42, "clientid":101,
-  "msg":"{\"type\":\"offer\",\"sdp\":\"v=0\\r\\n...\"}" }
-{ "cmd":"signal", "roomid":42, "clientid":101,
-  "msg":"{\"type\":\"candidate\",\"label\":0,\"id\":\"0\",\"candidate\":\"candidate:...\"}" }
-{ "cmd":"leave", "roomid":42, "clientid":103, "lifecycleid":2, "reason":"leave" }
-```
+| Event       | Required payload fields                                             | Signaling action |
+|-------------|---------------------------------------------------------------------|------------------|
+| `SfuSignal` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, opaque `message_json` | Validate assignment and current member lifecycle, then deliver the opaque SDP, candidate, or end-of-candidates message only to the addressed browser. |
+| `SfuHealth` | state, capacity, current room/client counts                          | Update worker readiness and assignment eligibility. |
+| `SfuFailure`| typed `Error` plus optional room/client/lifecycle/SDP correlation    | Fail or isolate the narrowest declared scope; do not turn an SDP diagnostic into an unrelated room mutation. |
 
-#### Worker → signaling events
-
-| Frame             | Required fields                                                   | Hub action                                                                                                                                                                             |
-|-------------------|-------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `synced`          | `roomid`, `epoch`                                                 | Mark room projection ready; release ordered queued commands.                                                                                                                           |
-| `joined` / `left` | `roomid`, `clientid`, `lifecycleid`                               | Complete the corresponding lifecycle operation.                                                                                                                                        |
-| `signal`          | `roomid`, `clientid`, `msg`; optional `requestid` for diagnostics | Deliver the opaque SDP or candidate message to that browser only. Subscribe-offer correlation ID is embedded in `msg`; a locally gathered worker candidate uses the same frame.        |
-| `error`           | `code`, `reason`, plus `lifecycleid` or `requestid`               | For a lifecycle error, fail the matching operation; a `signal` error is diagnostic only — the hub tracks no SDP transactions. Isolate the client unless worker/room scope is declared. |
-| `health`          | worker capacity/state fields                                      | Update assignment eligibility.                                                                                                                                                         |
-
-```jsonc
-{ "cmd":"synced", "roomid":42, "epoch":9 }
-{ "cmd":"joined", "roomid":42, "clientid":103, "lifecycleid":1 }
-{ "cmd":"signal", "roomid":42, "clientid":101,
-  "msg":"{\"type\":\"offer\",\"sdp\":\"v=0\\r\\n...\",\"requestid\":\"11\"}" }
-{ "cmd":"signal", "roomid":42, "clientid":101,
-  "msg":"{\"type\":\"candidate\",\"label\":0,\"id\":\"0\",\"candidate\":\"candidate:...\"}" }
-{ "cmd":"error", "roomid":42, "clientid":101, "requestid":11,
-  "code":"INVALID_SDP", "reason":"..." }
-```
-
-The worker adapter, not `Sfu`, deduplicates lifecycle IDs and emits `joined`/`left`. It maps the current engine's
-emitted `SFUEvent::SessionDescription` to `signal` and uses the SDP type plus `requestid` to distinguish a publish
-answer from a subscribe offer. Inside browser-bound inner JSON the adapter writes `requestid` as a decimal **string** (
-§8.1) even though outer worker frames carry it as a JSON number, and it converts back when reading a browser answer. It
-maps each locally gathered ICE candidate to the same `signal` frame; an engine configuration that gathers only
-candidates embedded in SDP simply emits no such incremental frames. `signaling` does not parse or modify the inner
-SDP/ICE JSON when forwarding worker→browser `signal` frames.
+The adapter, not `Sfu`, owns lifecycle and transport deduplication. It maps emitted `SFUEvent::SessionDescription` values to `SfuSignal` and uses SDP type plus the optional `sdp_request_id` to distinguish a publish answer from a subscribe offer. Inside browser-bound `message_json`, subscribe correlation remains the browser protocol's decimal-string `requestid`. Locally gathered candidates and end-of-candidates use the same `SfuSignal` envelope; signaling forwards the inner JSON without parsing or modifying SDP/ICE content.
 
 #### Ordering and recovery
 
-1. For one room, `sync-room`, lifecycle commands, and `signal` frames are processed in order. `join` precedes every SDP
-   or candidate `signal` for that client. Candidate order is preserved for each source client; the adapter buffers early
-   candidates until it has applied the relevant remote SDP.
-2. `joined` is the barrier before `signaling` commits P2P→SFU or releases browser SDP.
-3. Repeating a lifecycle command with the same ID returns the prior acknowledgement; an older ID is ignored. `requestid`
-   has no lifecycle meaning.
-4. After a same-`instance` worker WebSocket reconnect, `signaling` sends `sync-room` for every assigned room, waits for
-   `synced`, then replays unacknowledged lifecycle/signal commands.
-5. A worker process restart is detected by its changed `instance` nonce; the hub does not replay into an empty engine.
-   The assigned rooms are failed (`room-failed`) and browsers rejoin — `sync-room` reconstruction is reserved for same-
-   `instance` reconnects.
+1. For one room, `SyncRoom`, lifecycle commands, and `SfuSignal` commands are processed in stream order. `JoinMember` precedes every SDP or candidate for that client. Candidate order is preserved per client, and the adapter buffers early candidates until it has applied the relevant remote SDP.
+2. `MemberJoined` is the barrier before signaling commits P2P→SFU or releases browser SDP.
+3. Repeating a command with the same command `request_id` returns the cached result. `lifecycle_id` independently prevents an older membership operation from affecting a newer incarnation of the same `(room_id, client_id)`; browser SDP `requestid` has no lifecycle meaning.
+4. After a same-`instance_id` stream reconnect, signaling sends `SyncRoom` for every room assigned to that process, waits for `RoomSynced`, then replays unacknowledged commands. Event acknowledgement and command-result correlation use separate request-ID spaces by direction.
+5. A process restart creates a new `instance_id`. Rooms remain assigned to the disconnected old instance during its grace period and fail with `room-failed` when that grace expires; the new instance is eligible only for new assignments. Signaling never replays an old process's media commands into a new empty engine.
 
 ### 8.6 Complete signaling sequence
 
@@ -940,25 +762,25 @@ sequenceDiagram
     participant F as SFU worker
 
     rect rgb(238,238,238)
-    Note over AR,F: Service startup and worker registration
-    AR->>S: app registration with app id and token
-    F->>S: sfu registration with worker id token and capacity
-    S-->>F: worker ready
+    Note over AR,F: Service startup and future SFU registration
+    Note over AR,S: AppWeb creates one lazy reusable gRPC channel with no registration RPC
+    F->>S: OpenSfuSession - RegisterSfu with instance ID and capacity
+    S-->>F: RegisterSfuResponse with request ID and resumed state
     end
 
     rect rgb(235,245,255)
     Note over A,B: V1 P2P compatibility flow
     A->>AR: POST join legacy room
-    AR->>S: admit A to V1 room with legacy string IDs
-    S-->>AR: admit success initiator true
+    AR->>S: gRPC AdmitV1 A with legacy string IDs
+    S-->>AR: V1Admission initiator true
     AR-->>A: join result with messages and wss post url
     A->>S: WS register legacy room and client
     A->>AR: POST message offer
-    AR->>S: inject legacy offer
+    AR->>S: gRPC InjectV1 legacy offer
     Note over S: Queue offer until B registers
     B->>AR: POST join legacy room
-    AR->>S: admit B to V1 room with legacy string IDs
-    S-->>AR: admit success initiator false
+    AR->>S: gRPC AdmitV1 B with legacy string IDs
+    S-->>AR: V1Admission initiator false with queued offer
     AR-->>B: join result with messages and wss post url
     B->>S: WS register legacy room and client
     S-->>B: WS msg offer from queue
@@ -970,27 +792,27 @@ sequenceDiagram
     rect rgb(255,250,230)
     Note over A,C: V2 third join and SFU upgrade
     A->>AR: POST v2 join numeric room
-    AR->>S: admit A to V2 room
+    AR->>S: gRPC AdmitV2 A
     S-->>AR: admit success mode P2P
     AR-->>A: join success with token
     A->>S: WS register V2 numeric IDs token and version
     S-->>A: WS registered mode P2P epoch 0 initiator true
     B->>AR: POST v2 join numeric room
-    AR->>S: admit B to V2 room
+    AR->>S: gRPC AdmitV2 B
     S-->>AR: admit success mode P2P
     AR-->>B: join success with token
     B->>S: WS register V2 numeric IDs token and version
     S-->>B: WS registered mode P2P epoch 0 initiator false
     Note over A,B: V2 P2P offer answer flows through WS send and msg
     C->>AR: POST v2 join numeric room
-    AR->>S: admit C to V2 room
+    AR->>S: gRPC AdmitV2 C
     S->>S: Select worker and enter Upgrading
-    S->>F: A joins room with lifecycle ID
-    F-->>S: A joined room with lifecycle ID
-    S->>F: B joins room with lifecycle ID
-    F-->>S: B joined room with lifecycle ID
-    S->>F: C joins room with lifecycle ID
-    F-->>S: C joined room with lifecycle ID
+    S->>F: SfuCommand JoinMember A with lifecycle ID
+    F-->>S: SfuCommandResult MemberJoined A
+    S->>F: SfuCommand JoinMember B with lifecycle ID
+    F-->>S: SfuCommandResult MemberJoined B
+    S->>F: SfuCommand JoinMember C with lifecycle ID
+    F-->>S: SfuCommandResult MemberJoined C
     S->>S: Commit room mode SFU and increment signal epoch
     S-->>A: WS control sfu-upgrade epoch 1
     S-->>B: WS control sfu-upgrade epoch 1

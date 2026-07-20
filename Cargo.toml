@@ -53,3 +53,7 @@ bytes = "1"
 prost = "0.14.4"
 prost-build = "0.14.4"
 protoc-bin-vendored = "3.2.0"
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tokio-stream = { version = "0.1", features = ["net"] }

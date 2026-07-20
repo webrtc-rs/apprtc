@@ -11,22 +11,26 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-pub fn config(certificate: &str, private_key: &str) -> Result<Arc<ServerConfig>> {
-    let (certificate, private_key) = if certificate.is_empty() && private_key.is_empty() {
-        (
+pub fn pem(certificate: &str, private_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    if certificate.is_empty() && private_key.is_empty() {
+        Ok((
             include_bytes!("../cert/cert.pem").to_vec(),
             include_bytes!("../cert/key.pem").to_vec(),
-        )
+        ))
     } else if !certificate.is_empty() && !private_key.is_empty() {
-        (
+        Ok((
             std::fs::read(certificate)
                 .with_context(|| format!("failed to read certificate {certificate}"))?,
             std::fs::read(private_key)
                 .with_context(|| format!("failed to read private key {private_key}"))?,
-        )
+        ))
     } else {
-        bail!("--certificate and --private-key must be supplied together");
-    };
+        bail!("--certificate and --private-key must be supplied together")
+    }
+}
+
+pub fn config(certificate: &str, private_key: &str) -> Result<Arc<ServerConfig>> {
+    let (certificate, private_key) = pem(certificate, private_key)?;
     let certificates: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut BufReader::new(&certificate[..])).collect::<Result<_, _>>()?;
     let private_key = rustls_pemfile::private_key(&mut BufReader::new(&private_key[..]))?

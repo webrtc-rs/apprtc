@@ -23,9 +23,8 @@ minijinja.workspace = true
 tokio.workspace = true
 log.workspace = true
 async-trait.workspace = true
-tokio-tungstenite.workspace = true
 rustls.workspace = true
-futures-util.workspace = true
+tonic.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 

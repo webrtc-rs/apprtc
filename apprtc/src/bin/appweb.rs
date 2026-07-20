@@ -3,8 +3,8 @@
 mod tls;
 use anyhow::{Result, bail};
 use appweb::config::Config;
+use appweb::grpc_client::GrpcAuthority;
 use appweb::room_server::RoomServer;
-use appweb::ws_client::WebSocketAuthority;
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;
@@ -24,11 +24,12 @@ struct Cli {
     web_root: String,
     #[arg(long)]
     public_url: String,
-    /// Browser signaling WebSocket URL ending in /ws; /app is derived from it.
+    /// Public browser signaling WebSocket URL ending in /ws.
     #[arg(long)]
     signaling_url: String,
-    #[arg(long, default_value = "appweb-1")]
-    appid: String,
+    /// Private signaling gRPC origin used by AppWeb room operations.
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    signaling_grpc_url: String,
     #[arg(long, default_value = "")]
     signaling_token: String,
     #[arg(long)]
@@ -123,14 +124,11 @@ async fn main() -> Result<()> {
     let signaling_origin = signaling_url
         .strip_suffix("/ws")
         .ok_or_else(|| anyhow::anyhow!("--signaling-url must end with /ws"))?;
-    let control_url = format!("{signaling_origin}/app");
-    let authority = WebSocketAuthority::connect_with_options(
-        &control_url,
-        &cli.appid,
+    let authority = GrpcAuthority::connect(
+        &cli.signaling_grpc_url,
         &cli.signaling_token,
         cli.signaling_insecure_tls,
     )
-    .await
     .map_err(|e| anyhow::anyhow!(e))?;
     let server = RoomServer::new(
         Config {
