@@ -62,9 +62,10 @@ Copy the repository to each host, preserving the `appweb` assets on the AppWeb h
 
 ```bash
 rsync -avz --exclude target --exclude .git --exclude .idea ./ root@appweb-host:/opt/apprtc/
+rsync -avz --exclude target --exclude .git --exclude .idea ./ root@signaling-host:/opt/apprtc/
 ```
 
-Build the required binaries:
+Build `appweb` on the AppWeb host and `signaling` on the signaling host. Building both binaries with the following command is also valid on either host:
 
 ```bash
 cd /opt/apprtc
@@ -76,6 +77,10 @@ chmod +x /opt/apprtc/target/release/signaling
 ## Production services
 
 Run signaling on the signaling host:
+
+```bash
+nano /etc/systemd/system/apprtc-signaling.service
+```
 
 ```ini
 [Unit]
@@ -99,6 +104,10 @@ WantedBy=multi-user.target
 
 Run AppWeb on the AppWeb host:
 
+```bash
+nano /etc/systemd/system/apprtc-appweb.service
+```
+
 ```ini
 [Unit]
 Description=AppRTC AppWeb HTTP server
@@ -109,7 +118,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/apprtc
 ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/appweb.log ]; then mv /opt/logs/appweb.log /opt/logs/appweb-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-ExecStart=/opt/apprtc/target/release/appweb --host-ip 0.0.0.0 --public-url https://appr.tc --signaling-url wss://sfu.rs/ws --signaling-grpc-url https://sfu.rs:50051 --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/logs/appweb.log
+ExecStart=/opt/apprtc/target/release/appweb --host-ip 0.0.0.0 --public-url https://appr.tc --signaling-ws-url wss://sfu.rs/ws --signaling-grpc-url https://sfu.rs:50051 --port 443 --web-root /opt/apprtc/appweb --tls --certificate /etc/letsencrypt/live/appr.tc/fullchain.pem --private-key /etc/letsencrypt/live/appr.tc/privkey.pem -d -l info -o /opt/logs/appweb.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -119,13 +128,20 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-Do not use `--signaling-insecure-tls` in production. Enable both services:
+Do not use `--signaling-insecure-tls` in production. Enable signaling on the signaling host:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now apprtc-signaling
+sudo systemctl status apprtc-signaling
+```
+
+Enable AppWeb on the AppWeb host:
+
+```bash
+sudo systemctl daemon-reload
 sudo systemctl enable --now apprtc-appweb
-sudo systemctl status apprtc-signaling apprtc-appweb
+sudo systemctl status apprtc-appweb
 ```
 
 The services handle SIGINT gracefully by draining HTTP/gRPC requests, closing WebSocket connections, and releasing signaling state.
@@ -136,7 +152,7 @@ The bundled certificate is self-signed. Start signaling and AppWeb on separate l
 
 ```bash
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --grpc-port 50051 --tls
-cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls
+cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --signaling-ws-url wss://127.0.0.1:8081/ws --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls
 ```
 
 Then run:
@@ -158,18 +174,28 @@ The `/params` response should advertise `wss://sfu.rs/ws` as `wss_url`. AppWeb u
 
 ## Certificate renewal
 
-Restart the corresponding service after renewal:
+Restart the corresponding service after renewal. On the signaling host, install a hook that restarts signaling; on the AppWeb host, install an equivalent hook that restarts AppWeb.
 
 ```bash
 sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh >/dev/null <<'EOF'
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc-signaling.sh >/dev/null <<'EOF'
 #!/bin/sh
-systemctl restart apprtc-signaling apprtc-appweb
+systemctl restart apprtc-signaling
 EOF
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc-signaling.sh
+sudo certbot renew --dry-run
+```
+
+```bash
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc-appweb.sh >/dev/null <<'EOF'
+#!/bin/sh
+systemctl restart apprtc-appweb
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc-appweb.sh
 sudo certbot renew --dry-run
 ```
 
 ## CLI reference
 
-Run `appweb --help` and `signaling --help` for the authoritative options. AppWeb uses `--signaling-url` for the public browser WebSocket and `--signaling-grpc-url` for the private service channel. Signaling uses `--host-ip` for both listener bind addresses and `--grpc-port` for the private listener's port, while its shared `--tls` setting protects both listeners. Both sides support an optional shared bearer credential with AppWeb `--signaling-token` and signaling `--grpc-token`; mTLS should replace a shared token when service identities are available.
+Run `appweb --help` and `signaling --help` for the authoritative options. Both support `--host-ip`, `--port`, `--tls`, `--certificate`, `--private-key`, `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb requires `--public-url` and `--signaling-ws-url`; it uses `--signaling-grpc-url` for the private service channel. Signaling accepts `--public-url`, uses `--host-ip` for both listener bind addresses, and uses `--grpc-port` for the private listener's port. Its shared `--tls` setting protects both listeners. In the current P2P V1 implementation, AppWeb's `--signaling-ws-url` is the authoritative value returned to browsers; signaling's `--public-url` does not replace it. Both sides support an optional shared bearer credential with AppWeb `--signaling-token` and signaling `--grpc-token`; mTLS should replace a shared token when service identities are available.

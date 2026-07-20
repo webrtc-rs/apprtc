@@ -104,10 +104,10 @@ impl Config {
         let (http_scheme, ws_scheme, host) = self.self_origin(host);
 
         // Single, self-hosted server: the WSS server is this binary.
-        let wss_url = if self.signaling_url.is_empty() {
+        let wss_url = if self.signaling_ws_url.is_empty() {
             format!("{ws_scheme}://{host}/ws")
         } else {
-            format!("{}/ws", self.signaling_url.trim_end_matches('/'))
+            self.signaling_ws_url.trim_end_matches('/').to_string()
         };
         let wss_post_url = format!("{http_scheme}://{host}");
 
@@ -251,6 +251,22 @@ mod tests {
         assert_eq!(params.room_id, "room/a");
         assert_eq!(params.client_id, "client-α");
         assert_eq!(params.is_initiator, "true");
+    }
+
+    #[test]
+    fn configured_signaling_ws_url_is_returned_without_modification() {
+        let config = Config {
+            signaling_ws_url: "wss://signaling.example/ws".into(),
+            ..Default::default()
+        };
+        let params = config.build_room_parameters(
+            "appweb.example".into(),
+            &url("https://appweb.example/params"),
+            "",
+            "",
+            None,
+        );
+        assert_eq!(params.wss_url, "wss://signaling.example/ws");
     }
 
     #[test]

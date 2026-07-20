@@ -14,20 +14,21 @@ prevent the HTTP web edge, signaling authority, and media worker from independen
 mode. The design therefore makes one signaling authority responsible for room state and routes browser SDP/ICE either to
 the P2P peer or to the assigned SFU worker.
 
-Browser and service roles use long-lived, full-duplex signaling channels, while the media plane remains WebRTC between
-browser and SFU.
+Browsers use long-lived, full-duplex WebSocket signaling channels, AppWeb uses unary gRPC calls multiplexed over a reusable HTTP/2 channel, and SFU workers use long-lived bidirectional gRPC streams. The media plane remains WebRTC between browser and SFU.
 
 The implementation is organized as four core Rust crates plus the SFU crate:
 
 | Component         | Network role                                              | Owns                                                                                                                 |
 |-------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| `apprtc`          | TCP/TLS listeners                                         | Standalone appweb and signaling binaries, CLI parsing, TLS listeners, logging, and graceful shutdown.                |
+| `apprtc`          | HTTP, WebSocket, and gRPC runtime adapters                | standalone appweb and signaling binaries, TLS listeners, browser WebSocket sessions, gRPC service adapter, Collider driver, logging, and graceful shutdown |
 | `appweb`          | HTTP server; gRPC **client** of `signaling`               | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
-| `signaling`       | Browser WebSocket authority and Sans-I/O room core        | authoritative room model, browser sockets, queue/reconnect grace, P2P relay, SFU worker registry and room assignment |
+| `signaling`       | no network role; Sans-I/O signaling authority             | authoritative room model, queue/reconnect grace, P2P relay, and eventually SFU worker registry and room assignment  |
 | `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated AppWeb/signaling/SFU gRPC request, response, command, result, and event types                              |
 | `sfu`             | gRPC **client** of `signaling`; WebRTC media server       | current `Sfu` engine, its driver, per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding                  |
 
 `appweb` and `signaling` are separate crates and standalone processes connected through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol. `signaling-proto` owns that shared contract without depending on either implementation. The SFU session boundary (§8.5) similarly keeps the `Sfu` engine independent from its gRPC driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while AppWeb and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
+
+Within the `apprtc` runtime crate, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. Both network adapters submit typed commands to that event loop and never mutate signaling state directly. `tls.rs` provides the shared certificate and listener support used by the binaries.
 
 ## 1. Topology and authority
 

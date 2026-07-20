@@ -40,7 +40,7 @@ jobs:
           ./target/release/appweb \
             --host-ip 127.0.0.1 --port 8080 --web-root appweb \
             --public-url https://127.0.0.1:8080 \
-            --signaling-url wss://127.0.0.1:8081/ws \
+            --signaling-ws-url wss://127.0.0.1:8081/ws \
             --signaling-grpc-url https://127.0.0.1:50051 \
             --signaling-insecure-tls --tls \
             --debug --level info > ./logs/appweb.log 2>&1 &

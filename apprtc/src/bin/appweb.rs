@@ -25,7 +25,7 @@ struct Cli {
     public_url: String,
     /// Public browser signaling WebSocket URL ending in /ws.
     #[arg(long)]
-    signaling_url: String,
+    signaling_ws_url: String,
     /// Private signaling gRPC origin used by AppWeb room operations.
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     signaling_grpc_url: String,
@@ -119,10 +119,15 @@ async fn main() -> Result<()> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    let signaling_url = cli.signaling_url.trim_end_matches('/');
-    let signaling_origin = signaling_url
-        .strip_suffix("/ws")
-        .ok_or_else(|| anyhow::anyhow!("--signaling-url must end with /ws"))?;
+    let signaling_ws_url = Url::parse(cli.signaling_ws_url.trim_end_matches('/'))?;
+    if !matches!(signaling_ws_url.scheme(), "ws" | "wss")
+        || signaling_ws_url.host_str().is_none()
+        || signaling_ws_url.path() != "/ws"
+        || signaling_ws_url.query().is_some()
+        || signaling_ws_url.fragment().is_some()
+    {
+        bail!("--signaling-ws-url must be a ws:// or wss:// URL ending in /ws");
+    }
     let authority = GrpcAuthority::connect(
         &cli.signaling_grpc_url,
         &cli.signaling_token,
@@ -134,7 +139,7 @@ async fn main() -> Result<()> {
             web_root: cli.web_root,
             host: public_host,
             force_tls: scheme == "https",
-            signaling_url: signaling_origin.to_string(),
+            signaling_ws_url: signaling_ws_url.to_string(),
             ice_server_urls: cli.ice_server_urls,
             ice_server_base_url: cli.ice_server_base_url,
             ice_server_api_key: cli.ice_server_api_key,

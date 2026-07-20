@@ -50,12 +50,15 @@ The workspace has four Rust crates:
 
 | Crate                                | Responsibility                                                                                                                                                                          |
 |--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, and the private gRPC server adapter.                        |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and future SFU workers.                                                                                              |
+| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, and the private gRPC server.   |
 | [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                             |
 | [`signaling`](signaling)             | Authoritative room/client state, V1 browser protocol, message queueing and relay, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock of its own. |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and future SFU workers.                                                                                              |
 
-AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent unary gRPC calls over one reusable HTTP/2 channel to submit `AdmitV1`, `RemoveV1`, `OccupancyV1`, `InjectV1`, and `GetStatus` operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb.
+AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent
+unary gRPC calls over one reusable HTTP/2 channel to submit `AdmitV1`, `RemoveV1`, `OccupancyV1`, `InjectV1`, and
+`GetStatus` operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through
+AppWeb.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -66,10 +69,24 @@ Collider
         └── Client
 ```
 
-Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and
-testable in memory, without sockets or a wall clock.
+Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and testable
+in memory, without sockets or a wall clock.
 
-All I/O lives at the binary level. [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs) accepts browser `/ws` connections, while [`apprtc/src/grpc_server.rs`](apprtc/src/grpc_server.rs) adapts private gRPC requests to the same authority command channel. A single event-loop task owns the `Collider`, serializes every browser and authority operation through it, fires its timeouts, and routes outputs back to callers. Tasks sleep on async I/O, deadlines, or shutdown without polling.
+The `apprtc` library keeps each runtime responsibility in a dedicated module:
+
+```text
+apprtc/src/
+├── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
+├── grpc_server.rs        private signaling gRPC service adapter
+├── signaling_server.rs   command channel and single-owner Collider event loop
+└── tls.rs                shared TLS certificate loading and listeners
+```
+
+[`apprtc/src/ws_server.rs`](apprtc/src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
+events and text frames into driver commands. [`apprtc/src/grpc_server.rs`](apprtc/src/grpc_server.rs) adapts private
+gRPC requests to the same command channel. [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs) owns the
+single Collider event loop, serializes every browser and authority operation, fires protocol timeouts, and routes
+outputs back to the WebSocket or gRPC caller. Tasks sleep on async I/O, deadlines, or shutdown without polling.
 
 Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to
 reconnect for 10 seconds before its membership is removed.
@@ -109,7 +126,7 @@ cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
 
 # 2. Start AppWeb.
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
-  --public-url https://127.0.0.1:8080 --signaling-url wss://127.0.0.1:8081/ws \
+  --public-url https://127.0.0.1:8080 --signaling-ws-url wss://127.0.0.1:8081/ws \
   --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls &
 
 # 3. Run the integration tests.
@@ -130,7 +147,7 @@ Run signaling and AppWeb separately from the repository root:
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
-  --public-url http://127.0.0.1:8080 --signaling-url ws://127.0.0.1:8081/ws \
+  --public-url http://127.0.0.1:8080 --signaling-ws-url ws://127.0.0.1:8081/ws \
   --signaling-grpc-url http://127.0.0.1:50051
 ```
 
@@ -142,7 +159,10 @@ AppWeb listening on http://127.0.0.1:8080/
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
-`--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's `--public-url` controls the browser-facing HTTP origin, `--signaling-url` controls the browser-facing WebSocket URL and must include `/ws`, and `--signaling-grpc-url` independently selects the private signaling gRPC origin.
+`--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser
+WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's
+`--public-url` controls the browser-facing HTTP origin, `--signaling-ws-url` controls the browser-facing WebSocket URL
+and must include `/ws`, and `--signaling-grpc-url` independently selects the private signaling gRPC origin.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -157,7 +177,7 @@ cargo run -p apprtc --bin appweb -- \
   --port 8080 \
   --web-root appweb \
   --public-url https://127.0.0.1:8080 \
-  --signaling-url wss://127.0.0.1:8081/ws \
+  --signaling-ws-url wss://127.0.0.1:8081/ws \
   --signaling-grpc-url https://127.0.0.1:50051 \
   --signaling-insecure-tls \
   --tls \
@@ -182,7 +202,7 @@ cargo run -p apprtc --bin signaling -- \
 
 cargo run -p apprtc --bin appweb -- \
   --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
-  --signaling-url wss://sfu.example.com/ws --signaling-grpc-url https://sfu.example.com:50051 --tls \
+  --signaling-ws-url wss://sfu.example.com/ws --signaling-grpc-url https://sfu.example.com:50051 --tls \
   --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
 ```
 
@@ -191,29 +211,29 @@ cargo run -p apprtc --bin appweb -- \
 Run `cargo run -p apprtc --bin appweb -- --help` or `cargo run -p apprtc --bin signaling -- --help` for the
 authoritative lists.
 
-| Option                         |                 Default | Description                                                             |
-|--------------------------------|------------------------:|-------------------------------------------------------------------------|
-| `--host-ip <HOST-IP>`          |             `127.0.0.1` | Local listener bind address (both binaries).                            |
-| `--public-url <URL>`           | listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
-| `-p, --port <PORT>`            |           `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port.                       |
-| `--web-root <PATH>`            |                `appweb` | Static asset directory (`appweb`).                                      |
-| `--tls`                        |                     off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
-| `--certificate <PATH>`         |     bundled certificate | PEM certificate chain used with `--tls`.                                |
-| `--private-key <PATH>`         |             bundled key | PEM private key used with `--tls`.                                      |
-| `--signaling-url <URL>`        |                    none | Public browser signaling URL ending in `/ws` (`appweb`).                |
+| Option                         |                  Default | Description                                                             |
+|--------------------------------|-------------------------:|-------------------------------------------------------------------------|
+| `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local listener bind address (both binaries).                            |
+| `--public-url <URL>`           |  listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
+| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port.                       |
+| `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                      |
+| `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
+| `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                |
+| `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                      |
+| `--signaling-ws-url <URL>`     |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
 | `--signaling-grpc-url <URL>`   | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb`).                               |
-| `--signaling-insecure-tls`     |                     off | Disable verification for local self-signed signaling gRPC TLS.          |
-| `--signaling-token <TOKEN>`    |                   empty | Optional bearer token sent by AppWeb to private gRPC methods.           |
-| `--grpc-port <PORT>`           |                 `50051` | Private gRPC listener port (`signaling`).                               |
-| `--grpc-token <TOKEN>`         |                   empty | Require this bearer token on private gRPC methods (`signaling`).        |
-| `--ice-server-url <URLS>`      |                   empty | ICE server URLs (`appweb`).                                             |
-| `--ice-server-base-url <URL>`  |           AppWeb origin | External ICE credential service origin (`appweb`).                      |
-| `--ice-server-api-key <KEY>`   |                   empty | API key for the ICE credential service (`appweb`).                      |
-| `--header-message <TEXT>`      |                   empty | Banner displayed by the web application (`appweb`).                     |
-| `--bypass-join-confirmation`   |                     off | Skip the browser ready-to-join prompt (`appweb`).                       |
-| `-d, --debug`                  |                     off | Enable application logging (both binaries).                             |
-| `-l, --level <LEVEL>`          |                  `info` | Log filter (both binaries).                                             |
-| `-o, --output-log-file <PATH>` |                  stdout | Write formatted logs to a file (both binaries).                         |
+| `--signaling-insecure-tls`     |                      off | Disable verification for local self-signed signaling gRPC TLS.          |
+| `--signaling-token <TOKEN>`    |                    empty | Optional bearer token sent by AppWeb to private gRPC methods.           |
+| `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                               |
+| `--grpc-token <TOKEN>`         |                    empty | Require this bearer token on private gRPC methods (`signaling`).        |
+| `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                             |
+| `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                      |
+| `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                      |
+| `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                     |
+| `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                       |
+| `-d, --debug`                  |                      off | Enable application logging (both binaries).                             |
+| `-l, --level <LEVEL>`          |                   `info` | Log filter (both binaries).                                             |
+| `-o, --output-log-file <PATH>` |                   stdout | Write formatted logs to a file (both binaries).                         |
 
 Example ICE configuration:
 
