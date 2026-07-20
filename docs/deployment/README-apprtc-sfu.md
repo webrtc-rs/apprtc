@@ -1,18 +1,20 @@
 # AppRTC Deployment
 
-This guide deploys the Rust AppRTC P2P V1 implementation as two services on separate machines. AppWeb serves the browser application and HTTP room APIs. Signaling owns room state, exposes the public browser WebSocket endpoint, and exposes a private TLS-protected gRPC listener to AppWeb.
+This guide deploys Rust AppRTC across two machines: AppWeb runs on `appr.tc`, while signaling and an SFU worker run on `sfu.rs`. AppWeb serves the browser application and HTTP room APIs. Signaling owns V1/V2 room state, exposes the public browser WebSocket endpoint, and exposes a private TLS-protected gRPC listener to AppWeb and SFU. The SFU owns the UDP media ports.
 
 ```text
 Browser ── HTTPS ──> AppWeb (https://appr.tc)
 Browser ── WSS ────> Signaling (wss://sfu.rs/ws)
 AppWeb  ── gRPC/HTTP2/TLS ──> Signaling (https://sfu.rs:50051)
+SFU     ── gRPC/HTTP2/TLS ──> Signaling (https://sfu.rs:50051)
+Browser <── ICE/DTLS/SRTP over UDP ──> SFU (sfu.rs:3478-3495)
 ```
 
-V2/SFU call-mode transitions are not enabled yet.
+V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers P2P→SFU upgrade. SFU→P2P downgrade is not implemented yet.
 
 ## DNS and firewall
 
-Point `appr.tc` at the AppWeb host and `sfu.rs` at the signaling host. Allow TCP `443` on both hosts. Allow signaling TCP `50051` only from the AppWeb host's source address; do not expose the private gRPC listener to the general Internet. Port `80` is only needed for Certbot standalone validation.
+Point `appr.tc` at the AppWeb host and `sfu.rs` at the signaling/SFU host. Allow TCP `443` on both hosts and UDP `3478-3495` on the SFU host. Allow signaling TCP `50051` only from the AppWeb host's source address and the signaling/SFU host itself; do not expose the private gRPC listener to the general Internet. Port `80` is only needed for Certbot standalone validation.
 
 * **A Record** pointing `@` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
 * **A Record** pointing `www` to server IP (e.g., `173.249.199.192` for `appr.tc`, `173.249.204.140` for `sfu.rs`)
@@ -65,13 +67,14 @@ rsync -avz --exclude target --exclude .git --exclude .idea ./ root@appweb-host:/
 rsync -avz --exclude target --exclude .git --exclude .idea ./ root@signaling-host:/opt/apprtc/
 ```
 
-Build `appweb` on the AppWeb host and `signaling` on the signaling host. Building both binaries with the following command is also valid on either host:
+Build `appweb` on the AppWeb host and `signaling` plus `sfu` on the signaling/SFU host. Building all binaries with the following command is also valid on either host:
 
 ```bash
 cd /opt/apprtc
-cargo build --release -p apprtc --bin appweb --bin signaling
+cargo build --release -p apprtc --bin appweb --bin signaling --bin sfu
 chmod +x /opt/apprtc/target/release/appweb
 chmod +x /opt/apprtc/target/release/signaling
+chmod +x /opt/apprtc/target/release/sfu
 ```
 
 ## Production services
@@ -128,12 +131,39 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
+Run the SFU on the signaling/SFU host. Replace the example public IP with the address resolved by `sfu.rs`:
+
+```bash
+nano /etc/systemd/system/apprtc-sfu.service
+```
+
+```ini
+[Unit]
+Description=AppRTC SFU media worker
+After=network-online.target apprtc-signaling.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apprtc
+ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/sfu.log ]; then mv /opt/logs/sfu.log /opt/logs/sfu-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
+ExecStart=/opt/apprtc/target/release/sfu --host-ip 0.0.0.0 --public-ip 173.249.204.140 --media-port-min 3478 --media-port-max 3495 --grpc-url https://sfu.rs:50051 -d -l info -o /opt/logs/sfu.log
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Do not use `--insecure-tls` in production. Enable signaling on the signaling host:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now apprtc-signaling
-sudo systemctl status apprtc-signaling
+sudo systemctl enable --now apprtc-sfu
+sudo systemctl status apprtc-signaling apprtc-sfu
 ```
 
 Enable AppWeb on the AppWeb host:
@@ -144,14 +174,15 @@ sudo systemctl enable --now apprtc-appweb
 sudo systemctl status apprtc-appweb
 ```
 
-The services handle SIGINT gracefully by draining HTTP/gRPC requests, closing WebSocket connections, and releasing signaling state.
+The services handle SIGINT gracefully by draining HTTP/gRPC requests, closing WebSocket and SFU peer connections, and releasing signaling/media state.
 
-## Local two-process test
+## Local three-process test
 
-The bundled certificate is self-signed. Start signaling and AppWeb on separate local ports:
+The bundled certificate is self-signed. Start signaling, SFU, and AppWeb on separate local ports:
 
 ```bash
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --grpc-port 50051 --tls
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 --media-port-min 35000 --media-port-max 35000 --grpc-url https://127.0.0.1:50051 --insecure-tls
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws --grpc-url https://127.0.0.1:50051 --insecure-tls --tls
 ```
 
@@ -161,7 +192,7 @@ Then run:
 cargo test -p apprtc --test '*' -- --nocapture
 ```
 
-Browser clients still need to trust the bundled certificate. The signaling `--tls` flag protects both WSS and gRPC, and AppWeb's `--insecure-tls` accepts that self-signed certificate only for local development.
+Browser clients still need to trust the bundled certificate. The signaling `--tls` flag protects both WSS and gRPC, and AppWeb/SFU `--insecure-tls` accepts that self-signed certificate only for local development.
 
 ## Verify production
 
@@ -198,4 +229,4 @@ sudo certbot renew --dry-run
 
 ## CLI reference
 
-Run `appweb --help` and `signaling --help` for the authoritative options. Both support `--host-ip`, `--port`, `--tls`, `--certificate`, `--private-key`, `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb requires `--public-url` and `--ws-url`; it uses `--grpc-url` for the private service channel and supports `--insecure-tls` only for local development. Signaling accepts `--public-url`, uses `--host-ip` for both listener bind addresses, and uses `--grpc-port` for the private listener's port. Its shared `--tls` setting protects both listeners. In the current P2P V1 implementation, AppWeb's `--ws-url` is the authoritative value returned to browsers; signaling's `--public-url` does not replace it. Restrict port `50051` to the AppWeb host's source address until mTLS client authentication is implemented.
+Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb and signaling support `--host-ip`, `--port`, `--tls`, `--certificate`, and `--private-key`; all three binaries support logging flags. AppWeb requires `--public-url` and `--ws-url` and uses `--grpc-url` for unary authority calls. Signaling uses `--host-ip` for both listener addresses and `--grpc-port` for its private listener; its shared `--tls` setting protects WSS and gRPC. SFU supports `--host-ip`, `--public-ip`, its UDP media range, `--grpc-url`, `--insecure-tls`, advertised capacities, and an optional process-incarnation ID. AppWeb's `--ws-url` is the authoritative browser value. Restrict port `50051` to AppWeb and SFU source addresses until mTLS client authentication is implemented.

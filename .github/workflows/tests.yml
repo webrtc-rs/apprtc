@@ -32,7 +32,7 @@ jobs:
       - name: Create logs directory
         run: mkdir -p logs
 
-      - name: Build AppWeb, signaling, and tests
+      - name: Build AppWeb, signaling, SFU, and tests
         run: cargo build --release --package apprtc --bins --tests
 
       - name: Start AppWeb before signaling and verify startup recovery
@@ -51,6 +51,11 @@ jobs:
             --host-ip 127.0.0.1 --port 8081 \
             --grpc-port 50051 --tls \
             --debug --level info > ./logs/signaling.log 2>&1 &
+          ./target/release/sfu \
+            --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+            --media-port-min 35000 --media-port-max 35000 \
+            --grpc-url https://127.0.0.1:50051 --insecure-tls \
+            --debug --level info > ./logs/sfu.log 2>&1 &
           for attempt in {1..30}; do
             if curl --silent --fail --insecure https://127.0.0.1:8080/status >/dev/null; then
               exit 0
@@ -87,6 +92,7 @@ jobs:
       - name: Stop signaling and AppWeb servers
         if: always()
         run: |
+          pkill -x sfu || true
           pkill -x signaling || true
           pkill -x appweb || true
 

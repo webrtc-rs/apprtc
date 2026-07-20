@@ -32,9 +32,9 @@
  <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
 </p>
 
-AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation supports both the AppRTC-compatible P2P V1 flow and the token-authenticated P2P V2 flow. The room-selection page defaults to V1 and provides an unchecked **Use signaling V2** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes, signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
+AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults to V1 and provides an unchecked **V2 P2P/SFU** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes, signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-V2 currently remains P2P-only. P2P→SFU upgrading, SFU operation, and SFU→P2P downgrading are not yet enabled; a V2 third join returns `NO_SFU_AVAILABLE`.
+The first two V2 members use a direct P2P connection. When a third member joins, signaling assigns a ready SFU worker, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. SFU→P2P downgrade is not implemented yet.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -45,13 +45,12 @@ The workspace has four Rust crates:
 
 | Crate                                | Responsibility                                                                                                                                                                          |
 |--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)                   | Standalone `appweb` and `signaling` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, and the private gRPC server.   |
+| [`apprtc`](apprtc)                   | Standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
 | [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                             |
-| [`signaling`](signaling)             | Authoritative V1 and P2P V2 room/client state, browser protocols, message queueing and relay, token/epoch validation, and reconnect deadlines — a pure Sans-I/O crate with no sockets, no threads, and no clock or entropy source of its own. |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and future SFU workers.                                                                                              |
+| [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own. |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and SFU workers. |
 
-AppWeb and signaling are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent
-unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1 injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb.
+AppWeb, signaling, and SFU are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1 injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb. Each SFU process owns one reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser media travels directly to the SFU over ICE/DTLS/SRTP and never passes through AppWeb or signaling.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -72,6 +71,7 @@ apprtc/src/
 ├── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ├── grpc_server.rs        private signaling gRPC service adapter
 ├── signaling_server.rs   command channel and single-owner Collider event loop
+├── sfu_server.rs         signaling stream, UDP media shards, and Sans-I/O SFU adapter
 └── tls.rs                shared TLS certificate loading and listeners
 ```
 
@@ -111,6 +111,18 @@ P2P V2 adds:
 - Symmetric WebSocket relay for offers, answers, and trickle-ICE candidates; V2 does not use `/message` or the V1 WebSocket POST fallback.
 - Authenticated leave using `Authorization: Bearer <admission_token>` and `p2p-promote` for the surviving participant.
 
+SFU-capable V2 adds:
+
+- Capacity-aware selection of a ready SFU worker when the third member joins.
+- An ordered `JoinMember` barrier for all room members before signaling commits `Upgrading` to `SFU` and increments the signal epoch.
+- A fresh browser SFU peer connection while the existing P2P connection remains active; the old P2P connection closes only after SFU ICE connects.
+- Grid-based remote participant video while retaining the existing self-view and call controls.
+- SFU publish/subscribe SDP and full trickle-ICE exchange through the same browser V2 WebSocket envelope.
+- Reliable worker events, command result correlation and deduplication, health/capacity reporting, same-instance reconnect synchronization, and command replay.
+- Ordered worker-side joins and leaves for members admitted to or removed from an existing SFU room.
+
+SFU→P2P downgrade is intentionally deferred.
+
 ## Build and test
 
 Use a Rust toolchain with Edition 2024 support.
@@ -130,28 +142,35 @@ The integration tests are black-box clients of real standalone AppWeb and signal
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051 --tls &
 
-# 2. Start AppWeb.
+# 2. Start one SFU worker.
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+  --media-port-min 35000 --media-port-max 35000 \
+  --grpc-url https://127.0.0.1:50051 --insecure-tls &
+
+# 3. Start AppWeb.
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
   --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws \
   --grpc-url https://127.0.0.1:50051 --insecure-tls --tls &
 
-# 3. Run the integration tests.
+# 4. Run the integration tests.
 cargo test -p apprtc --test '*' -- --nocapture
 
-# 4. Stop both servers.
-kill $(pgrep -f "target/debug/(appweb|signaling)") || true
+# 5. Stop all three services.
+kill $(pgrep -f "target/debug/(appweb|signaling|sfu)") || true
 ```
 
-CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the server log when the
-job finishes.
+CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when the job finishes. Its black-box V2 test verifies the real AppWeb→signaling→SFU third-member join barrier and browser upgrade controls.
 
 ## Run over HTTP and WebSocket
 
-Run signaling and AppWeb separately from the repository root:
+Run signaling, one SFU worker, and AppWeb separately from the repository root:
 
 ```bash
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+  --media-port-min 35000 --media-port-max 35000 \
+  --grpc-url http://127.0.0.1:50051
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
   --public-url http://127.0.0.1:8080 --ws-url ws://127.0.0.1:8081/ws \
   --grpc-url http://127.0.0.1:50051
@@ -177,6 +196,10 @@ Add `--tls` to serve real HTTPS and WSS from the same listener:
 cargo run -p apprtc --bin signaling -- \
   --host-ip 127.0.0.1 --port 8081 --tls \
   --grpc-port 50051
+cargo run -p apprtc --bin sfu -- \
+  --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+  --media-port-min 35000 --media-port-max 35000 \
+  --grpc-url https://127.0.0.1:50051 --insecure-tls
 cargo run -p apprtc --bin appweb -- \
   --host-ip 127.0.0.1 \
   --port 8080 \
@@ -205,6 +228,11 @@ cargo run -p apprtc --bin signaling -- \
   --certificate /path/to/fullchain.pem \
   --private-key /path/to/privkey.pem
 
+cargo run -p apprtc --bin sfu -- \
+  --host-ip 0.0.0.0 --public-ip 203.0.113.20 \
+  --media-port-min 3478 --media-port-max 3495 \
+  --grpc-url https://sfu.example.com:50051
+
 cargo run -p apprtc --bin appweb -- \
   --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
   --ws-url wss://sfu.example.com/ws --grpc-url https://sfu.example.com:50051 --tls \
@@ -213,12 +241,11 @@ cargo run -p apprtc --bin appweb -- \
 
 ## Command-line options
 
-Run `cargo run -p apprtc --bin appweb -- --help` or `cargo run -p apprtc --bin signaling -- --help` for the
-authoritative lists.
+Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin signaling -- --help`, or `cargo run -p apprtc --bin sfu -- --help` for the authoritative lists.
 
 | Option                         |                  Default | Description                                                             |
 |--------------------------------|-------------------------:|-------------------------------------------------------------------------|
-| `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local listener bind address (both binaries).                            |
+| `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local TCP or UDP bind address (all binaries).                           |
 | `--public-url <URL>`           |  listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
 | `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port.                       |
 | `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                      |
@@ -226,17 +253,23 @@ authoritative lists.
 | `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                |
 | `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                      |
 | `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
-| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb`).                               |
-| `--insecure-tls`               |                      off | Disable verification for local self-signed signaling gRPC TLS.          |
+| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb` and `sfu`).                     |
+| `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`appweb`, `sfu`).  |
 | `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                               |
 | `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                             |
 | `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                      |
 | `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                      |
 | `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                     |
 | `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                       |
-| `-d, --debug`                  |                      off | Enable application logging (both binaries).                             |
-| `-l, --level <LEVEL>`          |                   `info` | Log filter (both binaries).                                             |
-| `-o, --output-log-file <PATH>` |                   stdout | Write formatted logs to a file (both binaries).                         |
+| `--public-ip <IP>`             |              `127.0.0.1` | ICE candidate address advertised by `sfu`.                              |
+| `--media-port-min <PORT>`      |                   `3478` | First UDP media port owned by `sfu`.                                    |
+| `--media-port-max <PORT>`      |                   `3495` | Last UDP media port owned by `sfu`.                                     |
+| `--max-rooms <COUNT>`          |                   `1000` | SFU room capacity advertised to signaling.                              |
+| `--max-clients <COUNT>`        |                  `10000` | SFU client capacity advertised to signaling.                            |
+| `--instance-id <ID>`           |         generated value | Optional SFU process-incarnation ID; normally omit it.                   |
+| `-d, --debug`                  |                      off | Enable application logging (all binaries).                              |
+| `-l, --level <LEVEL>`          |                   `info` | Log filter (all binaries).                                              |
+| `-o, --output-log-file <PATH>` |                   stdout | Write formatted logs to a file (all binaries).                          |
 
 Example ICE configuration:
 

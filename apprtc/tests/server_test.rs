@@ -11,8 +11,8 @@ mod common;
 
 use anyhow::{Context, Result};
 use common::{
-    http, join, unique_room, wait_for_server, ws_connect, ws_expect_close, ws_receive_json,
-    ws_register, ws_send,
+    http, http_with_headers, join, join_v2, unique_room, wait_for_server, ws_connect,
+    ws_expect_close, ws_receive_json, ws_register, ws_register_v2, ws_send,
 };
 use serde_json::{Value, json};
 
@@ -260,6 +260,63 @@ async fn completes_the_stock_v1_join_queue_and_websocket_relay_flow() -> Result<
 }
 
 #[tokio::test]
+async fn upgrades_a_three_member_v2_room_through_the_real_sfu_worker() -> Result<()> {
+    wait_for_server().await?;
+    let room_id = rand::random::<u64>().max(1);
+
+    let first = join_v2(room_id).await?;
+    let second = join_v2(room_id).await?;
+    assert_eq!(first["result"], "SUCCESS");
+    assert_eq!(first["params"]["mode"], "p2p");
+    assert_eq!(first["params"]["epoch"], "0");
+    assert_eq!(first["params"]["is_initiator"], true);
+    assert_eq!(second["result"], "SUCCESS");
+    assert_eq!(second["params"]["mode"], "p2p");
+    assert_eq!(second["params"]["is_initiator"], false);
+
+    let (mut first_ws, first_registered) =
+        ws_register_v2(room_id, v2_client_id(&first)?, v2_token(&first)?).await?;
+    let (mut second_ws, second_registered) =
+        ws_register_v2(room_id, v2_client_id(&second)?, v2_token(&second)?).await?;
+    assert_eq!(first_registered["control"], "registered");
+    assert_eq!(first_registered["mode"], "p2p");
+    assert_eq!(second_registered["control"], "registered");
+    assert_eq!(second_registered["mode"], "p2p");
+
+    // This HTTP response is held until signaling has received MemberJoined for
+    // all three clients from the real SFU process and committed epoch 1.
+    let third = join_v2(room_id).await?;
+    assert_eq!(third["result"], "SUCCESS");
+    assert_eq!(third["params"]["mode"], "sfu");
+    assert_eq!(third["params"]["epoch"], "1");
+    assert!(third["params"].get("is_initiator").is_none());
+
+    for control in [
+        ws_receive_json(&mut first_ws).await?,
+        ws_receive_json(&mut second_ws).await?,
+    ] {
+        assert_eq!(control["control"], "sfu-upgrade");
+        assert_eq!(control["roomid"], room_id.to_string());
+        assert_eq!(control["epoch"], "1");
+    }
+
+    let (mut third_ws, third_registered) =
+        ws_register_v2(room_id, v2_client_id(&third)?, v2_token(&third)?).await?;
+    assert_eq!(third_registered["control"], "registered");
+    assert_eq!(third_registered["mode"], "sfu");
+    assert_eq!(third_registered["epoch"], "1");
+    assert!(third_registered.get("is_initiator").is_none());
+
+    for member in [&first, &second, &third] {
+        cleanup_v2(room_id, v2_client_id(member)?, v2_token(member)?).await?;
+    }
+    first_ws.close(None).await?;
+    second_ws.close(None).await?;
+    third_ws.close(None).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn supports_root_and_internal_fallback_routes() -> Result<()> {
     wait_for_server().await?;
     let room = unique_room("fallback");
@@ -402,10 +459,39 @@ fn client_id(response: &Value) -> Result<&str> {
         .context("join response has no client_id")
 }
 
+fn v2_client_id(response: &Value) -> Result<u64> {
+    response["params"]["client_id"]
+        .as_str()
+        .context("V2 join response has no client_id")?
+        .parse()
+        .context("V2 client_id is not a u64")
+}
+
+fn v2_token(response: &Value) -> Result<&str> {
+    response["params"]["admission_token"]
+        .as_str()
+        .context("V2 join response has no admission_token")
+}
+
 async fn cleanup(room_id: &str, client_id: &str) -> Result<()> {
     let response = http("POST", &format!("/leave/{room_id}/{client_id}"), &[]).await?;
     if response.status != 200 {
         anyhow::bail!("cleanup leave returned HTTP {}", response.status);
+    }
+    Ok(())
+}
+
+async fn cleanup_v2(room_id: u64, client_id: u64, token: &str) -> Result<()> {
+    let authorization = format!("Bearer {token}");
+    let response = http_with_headers(
+        "POST",
+        &format!("/v2/leave/{room_id}/{client_id}"),
+        &[],
+        &[("Authorization", authorization.as_str())],
+    )
+    .await?;
+    if response.status != 200 {
+        anyhow::bail!("V2 cleanup leave returned HTTP {}", response.status);
     }
     Ok(())
 }

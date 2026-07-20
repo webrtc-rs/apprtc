@@ -697,12 +697,12 @@ Every AppWeb request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id,
 | `RemoveV1`    | opaque non-empty `room_id`, `client_id`              | `Empty`                       | Remove a member and close its live browser WebSocket.                   |
 | `OccupancyV1` | opaque non-empty `room_id`                           | `Occupancy{member_count,P2P}` | Return current room occupancy.                                          |
 | `InjectV1`    | opaque non-empty `room_id`, `client_id`, `message_json` | `Empty`                     | Implement legacy `/message` queue-or-relay behavior without parsing payload. |
-| `AdmitV2`     | numeric `room_id`, `client_id`                       | `V2Admission{P2P,signal_epoch,admission_token,is_initiator}` | Admit up to two P2P members, issue a bound browser credential, and return `NO_SFU_AVAILABLE` for a third member until upgrading is implemented. |
+| `AdmitV2`     | numeric `room_id`, `client_id`                       | `V2Admission{mode,signal_epoch,admission_token,is_initiator?}` | Admit the first two members in P2P. A third member selects a ready worker, waits for all `MemberJoined` barriers, and returns committed SFU mode; later SFU joins also wait for their worker barrier. `NO_SFU_AVAILABLE` is returned when no eligible worker has capacity. |
 | `RemoveV2`    | numeric `room_id`, `client_id`; `admission_token`    | `Empty`                       | Validate and invalidate the admission, close its browser socket, and promote the sole survivor. |
-| `OccupancyV2` | numeric `room_id`                                   | `Occupancy{member_count,P2P}` | Return P2P V2 occupancy; transition/SFU modes are added with the SFU milestone. |
-| `GetStatus`   | context only                                        | `Status`                      | Return V1 and V2 room/client/browser WebSocket counters; SFU counters remain zero until implemented. |
+| `OccupancyV2` | numeric `room_id`                                   | `Occupancy{member_count,mode}` | Return V2 occupancy and the authority's current P2P, Upgrading, SFU, or Failed mode. |
+| `GetStatus`   | context only                                        | `Status`                      | Return V1 and V2 room/client/browser WebSocket counters plus connected and ready SFU worker counts. |
 
-V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented P2P V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages, preserves reconnect grace, and emits `registered` and `p2p-promote` controls. The server returns `UNIMPLEMENTED` only for `OpenSfuSession`; V2 upgrade, SFU, and downgrade modes remain deferred.
+V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages in P2P, preserves browser reconnect grace, and emits `registered` and `p2p-promote` controls. It also implements `OpenSfuSession`, worker selection, the P2P→SFU join barrier, SFU signal routing, later SFU joins and leaves, same-instance worker reconnection/synchronization, command replay, event acknowledgement/deduplication, and worker-loss room failure. SFU→P2P downgrade remains deferred.
 
 One tonic `Channel` is shared by all AppWeb requests. Concurrent unary calls are multiplexed as independent HTTP/2 streams, so no application pending-response map or registration handshake is required. The channel uses a 10-second connection timeout, a 15-second RPC timeout, HTTP/2 keepalive every 30 seconds with a 10-second acknowledgement timeout, and lazy connection establishment so AppWeb can start while signaling is unavailable. Tonic reconnects the underlying channel for later RPCs after a transport failure. Both sides log the operation, `instance_id` where available, `request_id`, result, safe reason metadata, and elapsed time without logging signaling payloads or credentials.
 
@@ -768,7 +768,7 @@ sequenceDiagram
     participant F as SFU worker
 
     rect rgb(238,238,238)
-    Note over AR,F: Service startup and future SFU registration
+    Note over AR,F: Service startup and SFU registration
     Note over AR,S: AppWeb creates one lazy reusable gRPC channel with no registration RPC
     F->>S: OpenSfuSession - RegisterSfu with instance ID and capacity
     S-->>F: RegisterSfuResponse with request ID and resumed state
