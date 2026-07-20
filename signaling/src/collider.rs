@@ -1,9 +1,12 @@
-//! Sans-I/O signaling authority and V1 browser WebSocket protocol.
+//! Sans-I/O signaling authority for the V1 compatibility protocol and P2P V2.
 
 use crate::client::ClientId;
-use crate::messages::{Message, WsClientMsg, server_err, server_msg};
+use crate::messages::{
+    Message, V2Promoted, V2Registered, WsClientMsg, server_err, server_msg, to_wire,
+};
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
+use crate::v2::{self, RoomTable as V2RoomTable};
 use sansio::Protocol;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -60,6 +63,20 @@ pub enum AuthorityOperation {
         msg: String,
         now: Instant,
     },
+    AdmitV2 {
+        room_id: v2::RoomId,
+        client_id: v2::ClientId,
+        admission_token: String,
+        now: Instant,
+    },
+    RemoveV2 {
+        room_id: v2::RoomId,
+        client_id: v2::ClientId,
+        admission_token: String,
+    },
+    OccupancyV2 {
+        room_id: v2::RoomId,
+    },
     Status,
 }
 
@@ -72,6 +89,7 @@ pub struct AuthorityCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusSnapshot {
     pub rooms: usize,
+    pub v2_rooms: usize,
     pub clients: usize,
     pub websocket_connections: usize,
     pub total_websocket_connections: u64,
@@ -89,6 +107,15 @@ pub enum AuthorityResult {
         count: usize,
     },
     Injected,
+    AdmittedV2 {
+        signal_epoch: u64,
+        admission_token: String,
+        is_initiator: bool,
+    },
+    RemovedV2,
+    OccupancyV2 {
+        count: usize,
+    },
     Status(StatusSnapshot),
     Error {
         result: String,
@@ -104,14 +131,23 @@ pub struct AuthorityResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Session {
     Connected,
-    Registered { roomid: RoomId, clientid: ClientId },
+    RegisteredV1 {
+        roomid: RoomId,
+        clientid: ClientId,
+    },
+    RegisteredV2 {
+        room_id: v2::RoomId,
+        client_id: v2::ClientId,
+    },
 }
 
 /// Owns all mutable room state. Drivers must serialize inputs through this value.
 pub struct Collider {
     rooms: RoomTable,
+    v2_rooms: V2RoomTable,
     sessions: HashMap<ConnectionId, Session>,
     connections: HashMap<(RoomId, ClientId), ConnectionId>,
+    v2_connections: HashMap<(v2::RoomId, v2::ClientId), ConnectionId>,
     browser_outputs: VecDeque<BrowserOutput>,
     authority_responses: VecDeque<AuthorityResponse>,
     total_websocket_connections: u64,
@@ -122,8 +158,10 @@ impl Collider {
     pub fn new(register_timeout: Duration) -> Self {
         Self {
             rooms: RoomTable::new(register_timeout),
+            v2_rooms: V2RoomTable::new(register_timeout),
             sessions: HashMap::new(),
             connections: HashMap::new(),
+            v2_connections: HashMap::new(),
             browser_outputs: VecDeque::new(),
             authority_responses: VecDeque::new(),
             total_websocket_connections: 0,
@@ -159,7 +197,12 @@ impl Collider {
         };
 
         match msg.cmd.as_str() {
-            "register" => self.register(connection_id, msg, now),
+            "register" if msg.ver == Some(2) => self.register_v2(connection_id, msg),
+            "register" if msg.ver.is_none() => self.register_v1(connection_id, msg, now),
+            "register" => {
+                self.fail_connection(connection_id, "INVALID_VERSION");
+                Ok(())
+            }
             "send" => self.send(connection_id, msg, now),
             _ => {
                 self.fail_connection(connection_id, "Invalid message: unexpected 'cmd'");
@@ -168,7 +211,7 @@ impl Collider {
         }
     }
 
-    fn register(
+    fn register_v1(
         &mut self,
         connection_id: ConnectionId,
         msg: WsClientMsg,
@@ -176,7 +219,7 @@ impl Collider {
     ) -> Result<(), String> {
         if matches!(
             self.sessions.get(&connection_id),
-            Some(Session::Registered { .. })
+            Some(Session::RegisteredV1 { .. } | Session::RegisteredV2 { .. })
         ) {
             self.fail_connection(connection_id, "Duplicated register request");
             return Ok(());
@@ -198,7 +241,7 @@ impl Collider {
                 );
                 self.sessions.insert(
                     connection_id,
-                    Session::Registered {
+                    Session::RegisteredV1 {
                         roomid: msg.roomid.clone(),
                         clientid: msg.clientid.clone(),
                     },
@@ -214,15 +257,76 @@ impl Collider {
         Ok(())
     }
 
+    fn register_v2(&mut self, connection_id: ConnectionId, msg: WsClientMsg) -> Result<(), String> {
+        if matches!(
+            self.sessions.get(&connection_id),
+            Some(Session::RegisteredV1 { .. } | Session::RegisteredV2 { .. })
+        ) {
+            self.fail_connection(connection_id, "Duplicated register request");
+            return Ok(());
+        }
+        let room_id = match canonical_u64(&msg.roomid) {
+            Some(value) => value,
+            None => {
+                self.fail_connection(connection_id, "INVALID_ROOM_ID");
+                return Ok(());
+            }
+        };
+        let client_id = match canonical_u64(&msg.clientid) {
+            Some(value) => value,
+            None => {
+                self.fail_connection(connection_id, "INVALID_CLIENT_ID");
+                return Ok(());
+            }
+        };
+        if msg.token.is_empty() {
+            self.fail_connection(connection_id, "UNAUTHORIZED");
+            return Ok(());
+        }
+        let registration = match self.v2_rooms.register(room_id, client_id, &msg.token) {
+            Ok(registration) => registration,
+            Err(error) => {
+                self.fail_connection(connection_id, error);
+                return Ok(());
+            }
+        };
+        log::info!(
+            "V2 register: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={}",
+            registration.signal_epoch
+        );
+        self.sessions
+            .insert(connection_id, Session::RegisteredV2 { room_id, client_id });
+        self.v2_connections
+            .insert((room_id, client_id), connection_id);
+        self.total_websocket_connections = self.total_websocket_connections.saturating_add(1);
+
+        // The authoritative snapshot must precede any queued SDP/ICE messages.
+        self.browser_outputs.push_back(BrowserOutput::Text {
+            connection_id,
+            text: to_wire(&V2Registered {
+                control: "registered",
+                roomid: room_id.to_string(),
+                epoch: registration.signal_epoch.to_string(),
+                mode: "p2p",
+                is_initiator: registration.is_initiator,
+            }),
+        });
+        for message in registration.queued_messages {
+            self.browser_outputs.push_back(BrowserOutput::Text {
+                connection_id,
+                text: server_msg(&message),
+            });
+        }
+        Ok(())
+    }
+
     fn send(
         &mut self,
         connection_id: ConnectionId,
         msg: WsClientMsg,
         now: Instant,
     ) -> Result<(), String> {
-        let Some(Session::Registered { roomid, clientid }) =
-            self.sessions.get(&connection_id).cloned()
-        else {
+        let Some(session) = self.sessions.get(&connection_id).cloned() else {
             self.fail_connection(connection_id, "Client not registered");
             return Ok(());
         };
@@ -231,20 +335,51 @@ impl Collider {
             return Ok(());
         }
 
-        log::info!(
-            "V1 send: connection_id={connection_id} room_id={roomid} client_id={clientid} bytes={}",
-            msg.msg.len()
-        );
-        self.rooms.handle_read(Message {
-            roomid,
-            clientid,
-            msg: msg.msg,
-        })?;
-        while let Some(message) = self.rooms.poll_read() {
-            self.rooms
-                .send(now, &message.roomid, &message.clientid, message.msg)?;
+        match session {
+            Session::RegisteredV1 { roomid, clientid } => {
+                log::info!(
+                    "V1 send: connection_id={connection_id} room_id={roomid} client_id={clientid} bytes={}",
+                    msg.msg.len()
+                );
+                self.rooms.handle_read(Message {
+                    roomid,
+                    clientid,
+                    msg: msg.msg,
+                })?;
+                while let Some(message) = self.rooms.poll_read() {
+                    self.rooms
+                        .send(now, &message.roomid, &message.clientid, message.msg)?;
+                }
+                self.drain_room_writes();
+            }
+            Session::RegisteredV2 { room_id, client_id } => {
+                let Some(signal_epoch) = msg.epoch.as_ref().and_then(canonical_json_u64) else {
+                    log::info!(
+                        "V2 send dropped: connection_id={connection_id} room_id={room_id} client_id={client_id} reason=invalid_epoch"
+                    );
+                    return Ok(());
+                };
+                log::info!(
+                    "V2 send: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} bytes={}",
+                    msg.msg.len()
+                );
+                if let Some(delivery) =
+                    self.v2_rooms
+                        .send(room_id, client_id, signal_epoch, msg.msg)?
+                    && let Some(&peer_connection) = self
+                        .v2_connections
+                        .get(&(delivery.room_id, delivery.client_id))
+                {
+                    self.browser_outputs.push_back(BrowserOutput::Text {
+                        connection_id: peer_connection,
+                        text: server_msg(&delivery.message),
+                    });
+                }
+            }
+            Session::Connected => {
+                self.fail_connection(connection_id, "Client not registered");
+            }
         }
-        self.drain_room_writes();
         Ok(())
     }
 
@@ -253,11 +388,18 @@ impl Collider {
             return;
         };
         match session {
-            Session::Registered { roomid, clientid } => {
+            Session::RegisteredV1 { roomid, clientid } => {
                 let key = (roomid.clone(), clientid.clone());
                 if self.connections.get(&key) == Some(&connection_id) {
                     self.connections.remove(&key);
                     self.rooms.deregister(now, &roomid, &clientid);
+                }
+            }
+            Session::RegisteredV2 { room_id, client_id } => {
+                let key = (room_id, client_id);
+                if self.v2_connections.get(&key) == Some(&connection_id) {
+                    self.v2_connections.remove(&key);
+                    self.v2_rooms.deregister(now, room_id, client_id);
                 }
             }
             Session::Connected => {}
@@ -280,6 +422,31 @@ impl Collider {
             self.sessions.remove(&connection_id);
             self.browser_outputs
                 .push_back(BrowserOutput::Close { connection_id });
+        }
+    }
+
+    fn close_v2_client_connection(&mut self, room_id: v2::RoomId, client_id: v2::ClientId) {
+        if let Some(connection_id) = self.v2_connections.remove(&(room_id, client_id)) {
+            self.sessions.remove(&connection_id);
+            self.browser_outputs
+                .push_back(BrowserOutput::Close { connection_id });
+        }
+    }
+
+    fn push_promotion(&mut self, promotion: v2::Promotion) {
+        if let Some(&connection_id) = self
+            .v2_connections
+            .get(&(promotion.room_id, promotion.client_id))
+        {
+            self.browser_outputs.push_back(BrowserOutput::Text {
+                connection_id,
+                text: to_wire(&V2Promoted {
+                    control: "p2p-promote",
+                    roomid: promotion.room_id.to_string(),
+                    epoch: promotion.signal_epoch.to_string(),
+                    is_initiator: true,
+                }),
+            });
         }
     }
 
@@ -331,10 +498,44 @@ impl Collider {
                 }
                 Err(result) => AuthorityResult::Error { result },
             },
+            AuthorityOperation::AdmitV2 {
+                room_id,
+                client_id,
+                admission_token,
+                now,
+            } => match self
+                .v2_rooms
+                .admit(now, room_id, client_id, admission_token)
+            {
+                Ok(admission) => AuthorityResult::AdmittedV2 {
+                    signal_epoch: admission.signal_epoch,
+                    admission_token: admission.admission_token,
+                    is_initiator: admission.is_initiator,
+                },
+                Err(result) => AuthorityResult::Error { result },
+            },
+            AuthorityOperation::RemoveV2 {
+                room_id,
+                client_id,
+                admission_token,
+            } => match self.v2_rooms.remove(room_id, client_id, &admission_token) {
+                Ok(promotion) => {
+                    self.close_v2_client_connection(room_id, client_id);
+                    if let Some(promotion) = promotion {
+                        self.push_promotion(promotion);
+                    }
+                    AuthorityResult::RemovedV2
+                }
+                Err(result) => AuthorityResult::Error { result },
+            },
+            AuthorityOperation::OccupancyV2 { room_id } => AuthorityResult::OccupancyV2 {
+                count: self.v2_rooms.occupancy(room_id),
+            },
             AuthorityOperation::Status => AuthorityResult::Status(StatusSnapshot {
                 rooms: self.rooms.room_count(),
-                clients: self.rooms.client_count(),
-                websocket_connections: self.rooms.ws_count(),
+                v2_rooms: self.v2_rooms.room_count(),
+                clients: self.rooms.client_count() + self.v2_rooms.member_count(),
+                websocket_connections: self.rooms.ws_count() + self.v2_rooms.registered_count(),
                 total_websocket_connections: self.total_websocket_connections,
                 websocket_errors: self.websocket_errors,
             }),
@@ -392,11 +593,18 @@ impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
     }
 
     fn handle_timeout(&mut self, now: Self::Time) -> Result<(), Self::Error> {
-        self.rooms.handle_timeout(now)
+        self.rooms.handle_timeout(now)?;
+        for promotion in self.v2_rooms.handle_timeout(now) {
+            self.push_promotion(promotion);
+        }
+        Ok(())
     }
 
     fn poll_timeout(&mut self) -> Option<Self::Time> {
-        self.rooms.poll_timeout()
+        match (self.rooms.poll_timeout(), self.v2_rooms.poll_timeout()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        }
     }
 
     fn close(&mut self) -> Result<(), Self::Error> {
@@ -406,8 +614,27 @@ impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
         }
         self.sessions.clear();
         self.connections.clear();
+        self.v2_connections.clear();
+        self.v2_rooms.clear();
         self.rooms.close()
     }
+}
+
+fn canonical_u64(value: &str) -> Option<u64> {
+    if value == "0" {
+        return Some(0);
+    }
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn canonical_json_u64(value: &serde_json::Value) -> Option<u64> {
+    value.as_str().and_then(canonical_u64)
 }
 
 #[cfg(test)]
@@ -508,6 +735,306 @@ mod tests {
                 text: r#"{"msg":"candidate","error":""}"#.into(),
             })
         );
+    }
+
+    #[test]
+    fn v2_requires_admission_then_acknowledges_and_relays_p2p_signals() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+        let first_token = match authority(
+            &mut collider,
+            1,
+            AuthorityOperation::AdmitV2 {
+                room_id: 42,
+                client_id: 101,
+                admission_token: "token-101".into(),
+                now,
+            },
+        ) {
+            AuthorityResult::AdmittedV2 {
+                admission_token,
+                is_initiator: true,
+                signal_epoch: 0,
+            } => admission_token,
+            result => panic!("unexpected first admission: {result:?}"),
+        };
+        let second_token = match authority(
+            &mut collider,
+            2,
+            AuthorityOperation::AdmitV2 {
+                room_id: 42,
+                client_id: 102,
+                admission_token: "token-102".into(),
+                now,
+            },
+        ) {
+            AuthorityResult::AdmittedV2 {
+                admission_token,
+                is_initiator: false,
+                signal_epoch: 0,
+            } => admission_token,
+            result => panic!("unexpected second admission: {result:?}"),
+        };
+
+        connect(&mut collider, 10);
+        connect(&mut collider, 20);
+        text(
+            &mut collider,
+            10,
+            &format!(
+                r#"{{"cmd":"register","roomid":"42","clientid":"101","ver":2,"token":"{first_token}"}}"#
+            ),
+            now,
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 10,
+                text: r#"{"control":"registered","roomid":"42","epoch":"0","mode":"p2p","is_initiator":true}"#.into(),
+            })
+        );
+        text(
+            &mut collider,
+            20,
+            &format!(
+                r#"{{"cmd":"register","roomid":"42","clientid":"102","ver":2,"token":"{second_token}"}}"#
+            ),
+            now,
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 20,
+                text: r#"{"control":"registered","roomid":"42","epoch":"0","mode":"p2p","is_initiator":false}"#.into(),
+            })
+        );
+
+        text(
+            &mut collider,
+            10,
+            r#"{"cmd":"send","epoch":"0","msg":"candidate"}"#,
+            now,
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 20,
+                text: r#"{"msg":"candidate","error":""}"#.into(),
+            })
+        );
+        text(
+            &mut collider,
+            10,
+            r#"{"cmd":"send","epoch":"1","msg":"stale offer"}"#,
+            now,
+        );
+        text(
+            &mut collider,
+            10,
+            r#"{"cmd":"send","msg":"missing epoch"}"#,
+            now,
+        );
+        assert_eq!(collider.poll_write(), None);
+    }
+
+    #[test]
+    fn v2_rejects_invalid_ids_tokens_and_third_member() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+        connect(&mut collider, 1);
+        text(
+            &mut collider,
+            1,
+            r#"{"cmd":"register","roomid":"042","clientid":"1","ver":2,"token":"x"}"#,
+            now,
+        );
+        assert_error_and_close(&mut collider, 1, "INVALID_ROOM_ID");
+
+        connect(&mut collider, 2);
+        text(
+            &mut collider,
+            2,
+            r#"{"cmd":"register","roomid":"42","clientid":"1","ver":2,"token":"wrong"}"#,
+            now,
+        );
+        assert_error_and_close(&mut collider, 2, "UNAUTHORIZED");
+
+        for (request_id, client_id) in [(1, 1), (2, 2)] {
+            assert!(matches!(
+                authority(
+                    &mut collider,
+                    request_id,
+                    AuthorityOperation::AdmitV2 {
+                        room_id: 42,
+                        client_id,
+                        admission_token: format!("token-{client_id}"),
+                        now,
+                    }
+                ),
+                AuthorityResult::AdmittedV2 { .. }
+            ));
+        }
+        assert_eq!(
+            authority(
+                &mut collider,
+                3,
+                AuthorityOperation::AdmitV2 {
+                    room_id: 42,
+                    client_id: 3,
+                    admission_token: "token-3".into(),
+                    now,
+                }
+            ),
+            AuthorityResult::Error {
+                result: "NO_SFU_AVAILABLE".into()
+            }
+        );
+    }
+
+    #[test]
+    fn v2_leave_closes_member_and_promotes_survivor() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+        let mut tokens = Vec::new();
+        for (request_id, client_id) in [(1, 1), (2, 2)] {
+            let AuthorityResult::AdmittedV2 {
+                admission_token, ..
+            } = authority(
+                &mut collider,
+                request_id,
+                AuthorityOperation::AdmitV2 {
+                    room_id: 9,
+                    client_id,
+                    admission_token: format!("token-{client_id}"),
+                    now,
+                },
+            )
+            else {
+                panic!("admission failed");
+            };
+            tokens.push(admission_token);
+            connect(&mut collider, client_id);
+            text(
+                &mut collider,
+                client_id,
+                &format!(
+                    r#"{{"cmd":"register","roomid":"9","clientid":"{client_id}","ver":2,"token":"{}"}}"#,
+                    tokens.last().unwrap()
+                ),
+                now,
+            );
+            let _ = collider.poll_write();
+        }
+
+        assert_eq!(
+            authority(
+                &mut collider,
+                3,
+                AuthorityOperation::RemoveV2 {
+                    room_id: 9,
+                    client_id: 2,
+                    admission_token: tokens[1].clone(),
+                }
+            ),
+            AuthorityResult::RemovedV2
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Close { connection_id: 2 })
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 1,
+                text: r#"{"control":"p2p-promote","roomid":"9","epoch":"0","is_initiator":true}"#
+                    .into(),
+            })
+        );
+    }
+
+    #[test]
+    fn v2_registered_snapshot_precedes_queued_offer_and_trickle_ice() {
+        let now = Instant::now();
+        let mut collider = Collider::new(Duration::from_secs(10));
+        for (request_id, client_id) in [(1, 1), (2, 2)] {
+            assert!(matches!(
+                authority(
+                    &mut collider,
+                    request_id,
+                    AuthorityOperation::AdmitV2 {
+                        room_id: 5,
+                        client_id,
+                        admission_token: format!("token-{client_id}"),
+                        now,
+                    }
+                ),
+                AuthorityResult::AdmittedV2 { .. }
+            ));
+        }
+        connect(&mut collider, 1);
+        text(
+            &mut collider,
+            1,
+            r#"{"cmd":"register","roomid":"5","clientid":"1","ver":2,"token":"token-1"}"#,
+            now,
+        );
+        let _ = collider.poll_write();
+        text(
+            &mut collider,
+            1,
+            r#"{"cmd":"send","epoch":"0","msg":"offer"}"#,
+            now,
+        );
+        text(
+            &mut collider,
+            1,
+            r#"{"cmd":"send","epoch":"0","msg":"candidate"}"#,
+            now,
+        );
+        connect(&mut collider, 2);
+        text(
+            &mut collider,
+            2,
+            r#"{"cmd":"register","roomid":"5","clientid":"2","ver":2,"token":"token-2"}"#,
+            now,
+        );
+        assert!(matches!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text { text, .. }) if text.contains("registered")
+        ));
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 2,
+                text: server_msg("offer"),
+            })
+        );
+        assert_eq!(
+            collider.poll_write(),
+            Some(BrowserOutput::Text {
+                connection_id: 2,
+                text: server_msg("candidate"),
+            })
+        );
+    }
+
+    #[test]
+    fn v2_decimal_ids_are_canonical_u64_strings() {
+        assert_eq!(canonical_u64("0"), Some(0));
+        assert_eq!(canonical_u64("18446744073709551615"), Some(u64::MAX));
+        for invalid in [
+            "",
+            "00",
+            "01",
+            "+1",
+            "-1",
+            " 1",
+            "1 ",
+            "1.0",
+            "18446744073709551616",
+        ] {
+            assert_eq!(canonical_u64(invalid), None, "accepted {invalid:?}");
+        }
     }
 
     #[test]

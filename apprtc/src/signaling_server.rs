@@ -215,6 +215,25 @@ mod tests {
                 .unwrap();
         }
 
+        async fn authority(
+            &self,
+            request_id: u64,
+            operation: signaling::collider::AuthorityOperation,
+        ) -> signaling::collider::AuthorityResult {
+            let (response, response_rx) = oneshot::channel();
+            self.commands
+                .send(DriverCommand::Authority {
+                    command: AuthorityCommand {
+                        request_id,
+                        operation,
+                    },
+                    response,
+                })
+                .await
+                .unwrap();
+            response_rx.await.unwrap().result
+        }
+
         async fn shutdown(self) {
             self.stop_tx.send(()).unwrap();
             self.run.await.unwrap();
@@ -274,6 +293,78 @@ mod tests {
                 .contains("Client not registered")
         );
         recv_close(&mut outputs).await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v2_admission_registration_and_relay_cross_the_async_driver() {
+        use signaling::collider::{AuthorityOperation, AuthorityResult};
+
+        let harness = Harness::spawn();
+        let first_token = match harness
+            .authority(
+                1,
+                AuthorityOperation::AdmitV2 {
+                    room_id: 42,
+                    client_id: 101,
+                    admission_token: "token-101".into(),
+                    now: Instant::now(),
+                },
+            )
+            .await
+        {
+            AuthorityResult::AdmittedV2 {
+                admission_token, ..
+            } => admission_token,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        let second_token = match harness
+            .authority(
+                2,
+                AuthorityOperation::AdmitV2 {
+                    room_id: 42,
+                    client_id: 102,
+                    admission_token: "token-102".into(),
+                    now: Instant::now(),
+                },
+            )
+            .await
+        {
+            AuthorityResult::AdmittedV2 {
+                admission_token, ..
+            } => admission_token,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        let mut first_outputs = harness.connect(1).await;
+        let mut second_outputs = harness.connect(2).await;
+        harness
+            .text(
+                1,
+                &format!(
+                    r#"{{"cmd":"register","roomid":"42","clientid":"101","ver":2,"token":"{first_token}"}}"#
+                ),
+            )
+            .await;
+        assert!(recv_text(&mut first_outputs).await.contains("registered"));
+        harness
+            .text(
+                2,
+                &format!(
+                    r#"{{"cmd":"register","roomid":"42","clientid":"102","ver":2,"token":"{second_token}"}}"#
+                ),
+            )
+            .await;
+        assert!(recv_text(&mut second_outputs).await.contains("registered"));
+        harness
+            .text(
+                1,
+                r#"{"cmd":"send","epoch":"0","msg":"{\"type\":\"candidate\"}"}"#,
+            )
+            .await;
+        assert_eq!(
+            recv_text(&mut second_outputs).await,
+            r#"{"msg":"{\"type\":\"candidate\"}","error":""}"#
+        );
         harness.shutdown().await;
     }
 

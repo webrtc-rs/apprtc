@@ -24,6 +24,29 @@ pub struct WsClientMsg {
     pub clientid: String,
     #[serde(default)]
     pub msg: String,
+    #[serde(default)]
+    pub ver: Option<u8>,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub epoch: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2Registered {
+    pub control: &'static str,
+    pub roomid: String,
+    pub epoch: String,
+    pub mode: &'static str,
+    pub is_initiator: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2Promoted {
+    pub control: &'static str,
+    pub roomid: String,
+    pub epoch: String,
+    pub is_initiator: bool,
 }
 
 /// A message sent to a client on behalf of another client. Both fields are
@@ -69,6 +92,6 @@ pub fn server_err(error: &str) -> String {
 /// Serialize any value to its JSON wire string (was the generic `send`).
 /// Serialization of these fixed string structs is infallible, so an encoding
 /// error yields an empty string rather than propagating.
-fn to_wire<T: Serialize>(value: &T) -> String {
+pub(crate) fn to_wire<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }

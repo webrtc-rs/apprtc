@@ -1,6 +1,7 @@
 //! Private gRPC adapter for AppWeb and future SFU workers.
 
 use crate::{signaling_server::DriverCommand, tls};
+use rand::RngExt;
 use signaling::collider::{
     AuthorityCommand, AuthorityOperation, AuthorityResponse, AuthorityResult,
 };
@@ -10,7 +11,7 @@ use signaling_proto::v2::{
     ErrorCode, InjectV1Request, Occupancy, OccupancyResponse, OccupancyV1Request,
     OccupancyV2Request, OperationResponse, RemoveV1Request, RemoveV2Request, RequestContext,
     ResponseContext, RoomMode, SfuToSignaling, SignalingToSfu, Status, StatusRequest,
-    StatusResponse, V1Admission,
+    StatusResponse, V1Admission, V2Admission,
 };
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -217,6 +218,27 @@ fn operation_fingerprint(operation: &AuthorityOperation) -> u64 {
             clientid.hash(&mut hasher);
             msg.hash(&mut hasher);
         }
+        AuthorityOperation::AdmitV2 {
+            room_id, client_id, ..
+        } => {
+            "admit_v2".hash(&mut hasher);
+            room_id.hash(&mut hasher);
+            client_id.hash(&mut hasher);
+        }
+        AuthorityOperation::RemoveV2 {
+            room_id,
+            client_id,
+            admission_token,
+        } => {
+            "remove_v2".hash(&mut hasher);
+            room_id.hash(&mut hasher);
+            client_id.hash(&mut hasher);
+            admission_token.hash(&mut hasher);
+        }
+        AuthorityOperation::OccupancyV2 { room_id } => {
+            "occupancy_v2".hash(&mut hasher);
+            room_id.hash(&mut hasher);
+        }
         AuthorityOperation::Status => "status".hash(&mut hasher),
     }
     hasher.finish()
@@ -232,6 +254,9 @@ fn domain_error(reason: String) -> Error {
         "DUPLICATE_CLIENT" => ErrorCode::DuplicateClient,
         "ROOM_NOT_FOUND" => ErrorCode::RoomNotFound,
         "CLIENT_NOT_FOUND" => ErrorCode::ClientNotFound,
+        "UNAUTHORIZED" => ErrorCode::Unauthorized,
+        "NO_SFU_AVAILABLE" => ErrorCode::NoSfuAvailable,
+        "RESOURCE_EXHAUSTED" => ErrorCode::ResourceExhausted,
         _ => ErrorCode::InvalidRequest,
     };
     Error {
@@ -410,7 +435,7 @@ impl SignalingService for GrpcSignalingService {
         let result = match result {
             AuthorityResult::Status(status) => v2::status_response::Result::Status(Status {
                 v1_rooms: u64::try_from(status.rooms).unwrap_or(u64::MAX),
-                v2_rooms: 0,
+                v2_rooms: u64::try_from(status.v2_rooms).unwrap_or(u64::MAX),
                 clients: u64::try_from(status.clients).unwrap_or(u64::MAX),
                 browser_websocket_connections: u64::try_from(status.websocket_connections)
                     .unwrap_or(u64::MAX),
@@ -432,23 +457,103 @@ impl SignalingService for GrpcSignalingService {
 
     async fn admit_v2(
         &self,
-        _request: Request<AdmitV2Request>,
+        request: Request<AdmitV2Request>,
     ) -> Result<Response<AdmitV2Response>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented("P2P/SFU V2 is not implemented"))
+        let request = request.into_inner();
+        let context = Self::app_context(request.context)?;
+        let result = self
+            .execute(
+                &context,
+                AuthorityOperation::AdmitV2 {
+                    room_id: request.room_id,
+                    client_id: request.client_id,
+                    admission_token: new_admission_token(),
+                    now: Instant::now(),
+                },
+                "admit_v2",
+            )
+            .await?;
+        let result = match result {
+            AuthorityResult::AdmittedV2 {
+                signal_epoch,
+                admission_token,
+                is_initiator,
+            } => v2::admit_v2_response::Result::Admitted(V2Admission {
+                mode: RoomMode::P2p as i32,
+                signal_epoch,
+                admission_token,
+                is_initiator: Some(is_initiator),
+            }),
+            AuthorityResult::Error { result } => {
+                v2::admit_v2_response::Result::Error(domain_error(result))
+            }
+            _ => return Err(GrpcStatus::internal("unexpected authority response")),
+        };
+        Ok(Response::new(AdmitV2Response {
+            context: response_context(context.request_id),
+            result: Some(result),
+        }))
     }
 
     async fn remove_v2(
         &self,
-        _request: Request<RemoveV2Request>,
+        request: Request<RemoveV2Request>,
     ) -> Result<Response<OperationResponse>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented("P2P/SFU V2 is not implemented"))
+        let request = request.into_inner();
+        let context = Self::app_context(request.context)?;
+        if request.admission_token.is_empty() {
+            return Err(GrpcStatus::invalid_argument(
+                "admission_token must not be empty",
+            ));
+        }
+        let result = self
+            .execute(
+                &context,
+                AuthorityOperation::RemoveV2 {
+                    room_id: request.room_id,
+                    client_id: request.client_id,
+                    admission_token: request.admission_token,
+                },
+                "remove_v2",
+            )
+            .await?;
+        Ok(Response::new(operation_response(
+            context.request_id,
+            result,
+        )?))
     }
 
     async fn occupancy_v2(
         &self,
-        _request: Request<OccupancyV2Request>,
+        request: Request<OccupancyV2Request>,
     ) -> Result<Response<OccupancyResponse>, GrpcStatus> {
-        Err(GrpcStatus::unimplemented("P2P/SFU V2 is not implemented"))
+        let request = request.into_inner();
+        let context = Self::app_context(request.context)?;
+        let result = self
+            .execute(
+                &context,
+                AuthorityOperation::OccupancyV2 {
+                    room_id: request.room_id,
+                },
+                "occupancy_v2",
+            )
+            .await?;
+        let result = match result {
+            AuthorityResult::OccupancyV2 { count } => {
+                v2::occupancy_response::Result::Occupancy(Occupancy {
+                    member_count: u64::try_from(count).unwrap_or(u64::MAX),
+                    mode: RoomMode::P2p as i32,
+                })
+            }
+            AuthorityResult::Error { result } => {
+                v2::occupancy_response::Result::Error(domain_error(result))
+            }
+            _ => return Err(GrpcStatus::internal("unexpected authority response")),
+        };
+        Ok(Response::new(OccupancyResponse {
+            context: response_context(context.request_id),
+            result: Some(result),
+        }))
     }
 
     type OpenSfuSessionStream = Pin<
@@ -468,7 +573,7 @@ fn operation_response(
     result: AuthorityResult,
 ) -> Result<OperationResponse, GrpcStatus> {
     let result = match result {
-        AuthorityResult::Removed | AuthorityResult::Injected => {
+        AuthorityResult::Removed | AuthorityResult::RemovedV2 | AuthorityResult::Injected => {
             v2::operation_response::Result::Ok(Empty {})
         }
         AuthorityResult::Error { result } => {
@@ -482,11 +587,24 @@ fn operation_response(
     })
 }
 
+fn new_admission_token() -> String {
+    let bytes: [u8; 32] = rand::rng().random();
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::signaling_server::{self, COMMAND_CAPACITY};
-    use signaling_proto::v2::{admit_v1_response, occupancy_response, status_response};
+    use signaling_proto::v2::{
+        admit_v1_response, admit_v2_response, occupancy_response, operation_response,
+        status_response,
+    };
     use tokio::sync::watch;
 
     struct Harness {
@@ -646,7 +764,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_rejects_invalid_context_and_unimplemented_v2() {
+    async fn v2_grpc_methods_admit_remove_report_occupancy_and_status() {
+        let harness = Harness::spawn();
+        let first = harness
+            .service
+            .admit_v2(Request::new(AdmitV2Request {
+                context: Some(context(10)),
+                room_id: 42,
+                client_id: 101,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let token = match first.result {
+            Some(admit_v2_response::Result::Admitted(V2Admission {
+                mode,
+                signal_epoch: 0,
+                admission_token,
+                is_initiator: Some(true),
+            })) if mode == RoomMode::P2p as i32 => admission_token,
+            result => panic!("unexpected V2 admission: {result:?}"),
+        };
+        let occupancy = harness
+            .service
+            .occupancy_v2(Request::new(OccupancyV2Request {
+                context: Some(context(11)),
+                room_id: 42,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            occupancy.result,
+            Some(occupancy_response::Result::Occupancy(Occupancy {
+                member_count: 1,
+                mode,
+            })) if mode == RoomMode::P2p as i32
+        ));
+        harness
+            .service
+            .admit_v2(Request::new(AdmitV2Request {
+                context: Some(context(14)),
+                room_id: 42,
+                client_id: 102,
+            }))
+            .await
+            .unwrap();
+        let third = harness
+            .service
+            .admit_v2(Request::new(AdmitV2Request {
+                context: Some(context(15)),
+                room_id: 42,
+                client_id: 103,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            third.result,
+            Some(admit_v2_response::Result::Error(Error { code, .. }))
+                if code == ErrorCode::NoSfuAvailable as i32
+        ));
+        let status = harness
+            .service
+            .get_status(Request::new(StatusRequest {
+                context: Some(context(12)),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            status.result,
+            Some(status_response::Result::Status(Status {
+                v1_rooms: 0,
+                v2_rooms: 1,
+                clients: 2,
+                ..
+            }))
+        ));
+        let removed = harness
+            .service
+            .remove_v2(Request::new(RemoveV2Request {
+                context: Some(context(13)),
+                room_id: 42,
+                client_id: 101,
+                admission_token: token,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(matches!(
+            removed.result,
+            Some(operation_response::Result::Ok(Empty {}))
+        ));
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn grpc_rejects_invalid_context_and_v2_token() {
         let harness = Harness::spawn();
         let error = harness
             .service
@@ -654,17 +869,17 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-
         let error = harness
             .service
-            .admit_v2(Request::new(AdmitV2Request {
+            .remove_v2(Request::new(RemoveV2Request {
                 context: Some(context(1)),
                 room_id: 1,
                 client_id: 2,
+                admission_token: String::new(),
             }))
             .await
             .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::Unimplemented);
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
         harness.shutdown().await;
     }
 }
