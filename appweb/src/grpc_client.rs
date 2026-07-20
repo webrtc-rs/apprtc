@@ -9,9 +9,8 @@ use signaling_proto::v2::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tonic::metadata::MetadataValue;
+use tonic::Status;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tonic::{Request, Status};
 use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -52,12 +51,11 @@ pub struct StatusSnapshot {
 pub struct GrpcAuthority {
     client: SignalingServiceClient<Channel>,
     instance_id: Arc<str>,
-    token: Arc<str>,
     next_request_id: Arc<AtomicU64>,
 }
 
 impl GrpcAuthority {
-    pub fn connect(url: &str, token: &str, insecure_tls: bool) -> Result<Self, String> {
+    pub fn connect(url: &str, insecure_tls: bool) -> Result<Self, String> {
         let parsed = Url::parse(url).map_err(|error| error.to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("signaling gRPC URL must use http or https".into());
@@ -92,7 +90,6 @@ impl GrpcAuthority {
         Ok(Self {
             client: SignalingServiceClient::new(endpoint.connect_lazy()),
             instance_id: instance_id.into(),
-            token: token.to_owned().into(),
             next_request_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -109,16 +106,6 @@ impl GrpcAuthority {
             instance_id: self.instance_id.to_string(),
             request_id,
         }
-    }
-
-    fn request<T>(&self, message: T) -> Result<Request<T>, String> {
-        let mut request = Request::new(message);
-        if !self.token.is_empty() {
-            let value = MetadataValue::try_from(format!("Bearer {}", self.token))
-                .map_err(|error| error.to_string())?;
-            request.metadata_mut().insert("authorization", value);
-        }
-        Ok(request)
     }
 
     fn grpc_error(operation: &str, request_id: u64, error: Status, started: Instant) -> String {
@@ -176,12 +163,12 @@ impl RoomAuthority for GrpcAuthority {
         log::info!("Signaling gRPC request: operation=admit_v1 request_id={request_id}");
         let mut client = self.client.clone();
         let response = client
-            .admit_v1(self.request(AdmitV1Request {
+            .admit_v1(AdmitV1Request {
                 context: Some(context),
                 room_id: roomid,
                 client_id: clientid,
                 is_loopback,
-            })?)
+            })
             .await
             .map_err(|error| Self::grpc_error("admit_v1", request_id, error, started))?
             .into_inner();
@@ -210,11 +197,11 @@ impl RoomAuthority for GrpcAuthority {
         log::info!("Signaling gRPC request: operation=remove_v1 request_id={request_id}");
         let mut client = self.client.clone();
         let response = client
-            .remove_v1(self.request(RemoveV1Request {
+            .remove_v1(RemoveV1Request {
                 context: Some(context),
                 room_id: roomid,
                 client_id: clientid,
-            })?)
+            })
             .await
             .map_err(|error| Self::grpc_error("remove_v1", request_id, error, started))?
             .into_inner();
@@ -229,10 +216,10 @@ impl RoomAuthority for GrpcAuthority {
         log::info!("Signaling gRPC request: operation=occupancy_v1 request_id={request_id}");
         let mut client = self.client.clone();
         let response = client
-            .occupancy_v1(self.request(OccupancyV1Request {
+            .occupancy_v1(OccupancyV1Request {
                 context: Some(context),
                 room_id: roomid,
-            })?)
+            })
             .await
             .map_err(|error| Self::grpc_error("occupancy_v1", request_id, error, started))?
             .into_inner();
@@ -259,12 +246,12 @@ impl RoomAuthority for GrpcAuthority {
         log::info!("Signaling gRPC request: operation=inject_v1 request_id={request_id}");
         let mut client = self.client.clone();
         let response = client
-            .inject_v1(self.request(InjectV1Request {
+            .inject_v1(InjectV1Request {
                 context: Some(context),
                 room_id: roomid,
                 client_id: clientid,
                 message_json: msg,
-            })?)
+            })
             .await
             .map_err(|error| Self::grpc_error("inject_v1", request_id, error, started))?
             .into_inner();
@@ -279,9 +266,9 @@ impl RoomAuthority for GrpcAuthority {
         log::info!("Signaling gRPC request: operation=get_status request_id={request_id}");
         let mut client = self.client.clone();
         let response = client
-            .get_status(self.request(StatusRequest {
+            .get_status(StatusRequest {
                 context: Some(context),
-            })?)
+            })
             .await
             .map_err(|error| Self::grpc_error("get_status", request_id, error, started))?
             .into_inner();

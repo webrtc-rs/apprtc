@@ -102,7 +102,7 @@ It must not require a browser, hub, or wire-protocol revision.
 
 ## 3. Signaling endpoints and authenticated roles
 
-Browsers reach the public `wss://signaling/ws` endpoint. AppWeb and SFU processes reach a separate private HTTP/2 listener implementing `signaling.v2.SignalingService`. V2 browser credentials are admission tokens created by `appweb`; the V1 browser path deliberately retains its current tokenless framing. Production service callers use mTLS or a rotated bearer token and the private listener is not exposed to browsers.
+Browsers reach the public `wss://signaling/ws` endpoint. AppWeb and SFU processes reach a separate private HTTP/2 listener implementing `signaling.v2.SignalingService`. V2 browser credentials are admission tokens created by `appweb`; the V1 browser path deliberately retains its current tokenless framing. The production service channel uses mTLS and the private listener is not exposed to browsers. Until mTLS is implemented, deployments must restrict the gRPC listener with host and provider firewalls.
 
 | Role              | Transport/API                                      | Session or request identity                                      | Traffic after admission or registration                                               |
 |-------------------|----------------------------------------------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------|

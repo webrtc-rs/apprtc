@@ -33,9 +33,8 @@ pub async fn run(
     commands: mpsc::Sender<DriverCommand>,
     listener: TcpListener,
     tls_files: Option<(String, String)>,
-    token: String,
 ) -> anyhow::Result<()> {
-    let service = GrpcSignalingService::new(commands, token);
+    let service = GrpcSignalingService::new(commands);
     let mut server = Server::builder()
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
@@ -89,32 +88,14 @@ impl RequestCache {
 #[derive(Clone)]
 pub struct GrpcSignalingService {
     commands: mpsc::Sender<DriverCommand>,
-    token: String,
     request_cache: Arc<Mutex<RequestCache>>,
 }
 
 impl GrpcSignalingService {
-    pub fn new(commands: mpsc::Sender<DriverCommand>, token: String) -> Self {
+    pub fn new(commands: mpsc::Sender<DriverCommand>) -> Self {
         Self {
             commands,
-            token,
             request_cache: Arc::new(Mutex::new(RequestCache::default())),
-        }
-    }
-
-    fn validate_request<T>(&self, request: &Request<T>) -> Result<(), GrpcStatus> {
-        if self.token.is_empty() {
-            return Ok(());
-        }
-        let expected = format!("Bearer {}", self.token);
-        let actual = request
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok());
-        if actual == Some(expected.as_str()) {
-            Ok(())
-        } else {
-            Err(GrpcStatus::unauthenticated("invalid signaling credential"))
         }
     }
 
@@ -284,7 +265,6 @@ impl SignalingService for GrpcSignalingService {
         &self,
         request: Request<AdmitV1Request>,
     ) -> Result<Response<AdmitV1Response>, GrpcStatus> {
-        self.validate_request(&request)?;
         let request = request.into_inner();
         let context = Self::app_context(request.context)?;
         if request.room_id.is_empty() || request.client_id.is_empty() {
@@ -327,7 +307,6 @@ impl SignalingService for GrpcSignalingService {
         &self,
         request: Request<RemoveV1Request>,
     ) -> Result<Response<OperationResponse>, GrpcStatus> {
-        self.validate_request(&request)?;
         let request = request.into_inner();
         let context = Self::app_context(request.context)?;
         if request.room_id.is_empty() || request.client_id.is_empty() {
@@ -355,7 +334,6 @@ impl SignalingService for GrpcSignalingService {
         &self,
         request: Request<OccupancyV1Request>,
     ) -> Result<Response<OccupancyResponse>, GrpcStatus> {
-        self.validate_request(&request)?;
         let request = request.into_inner();
         let context = Self::app_context(request.context)?;
         if request.room_id.is_empty() {
@@ -392,7 +370,6 @@ impl SignalingService for GrpcSignalingService {
         &self,
         request: Request<InjectV1Request>,
     ) -> Result<Response<OperationResponse>, GrpcStatus> {
-        self.validate_request(&request)?;
         let request = request.into_inner();
         let context = Self::app_context(request.context)?;
         if request.room_id.is_empty()
@@ -425,7 +402,6 @@ impl SignalingService for GrpcSignalingService {
         &self,
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, GrpcStatus> {
-        self.validate_request(&request)?;
         let request = request.into_inner();
         let context = Self::app_context(request.context)?;
         let result = self
@@ -520,7 +496,7 @@ mod tests {
     }
 
     impl Harness {
-        fn spawn(token: &str) -> Self {
+        fn spawn() -> Self {
             let (stop, stop_rx) = watch::channel(());
             let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
             let run = tokio::spawn(signaling_server::run(
@@ -531,7 +507,7 @@ mod tests {
             Self {
                 stop,
                 run,
-                service: GrpcSignalingService::new(commands, token.to_owned()),
+                service: GrpcSignalingService::new(commands),
             }
         }
 
@@ -551,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn v1_grpc_methods_preserve_admission_queue_occupancy_and_status() {
-        let harness = Harness::spawn("");
+        let harness = Harness::spawn();
         let first = harness
             .service
             .admit_v1(Request::new(AdmitV1Request {
@@ -671,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_rejects_invalid_context_and_unimplemented_v2() {
-        let harness = Harness::spawn("");
+        let harness = Harness::spawn();
         let error = harness
             .service
             .get_status(Request::new(StatusRequest { context: None }))
@@ -689,31 +665,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::Unimplemented);
-        harness.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn grpc_bearer_token_is_enforced_when_configured() {
-        let harness = Harness::spawn("secret");
-        let request = Request::new(StatusRequest {
-            context: Some(context(1)),
-        });
-        assert_eq!(
-            harness
-                .service
-                .validate_request(&request)
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unauthenticated
-        );
-
-        let mut request = Request::new(StatusRequest {
-            context: Some(context(2)),
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", "Bearer secret".parse().unwrap());
-        harness.service.validate_request(&request).unwrap();
         harness.shutdown().await;
     }
 }

@@ -24,9 +24,6 @@ struct Cli {
     /// Private gRPC listening port used by AppWeb and future SFU workers.
     #[arg(long, default_value_t = 50051)]
     grpc_port: u16,
-    /// Optional bearer token required by private gRPC calls.
-    #[arg(long, default_value_t = String::new())]
-    grpc_token: String,
     /// Public WSS/WS origin advertised to AppWeb deployments.
     #[arg(long, default_value_t = String::new())]
     public_url: String,
@@ -136,7 +133,6 @@ async fn main() -> anyhow::Result<()> {
         commands_tx,
         grpc_listener,
         cli.tls.then_some((cli.certificate, cli.private_key)),
-        cli.grpc_token,
     ));
 
     println!("Press Ctrl-C to stop");

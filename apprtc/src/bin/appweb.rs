@@ -25,14 +25,13 @@ struct Cli {
     public_url: String,
     /// Public browser signaling WebSocket URL ending in /ws.
     #[arg(long)]
-    signaling_ws_url: String,
+    ws_url: String,
     /// Private signaling gRPC origin used by AppWeb room operations.
     #[arg(long, default_value = "http://127.0.0.1:50051")]
-    signaling_grpc_url: String,
-    #[arg(long, default_value = "")]
-    signaling_token: String,
+    grpc_url: String,
+    /// Disable signaling gRPC certificate verification for local development.
     #[arg(long)]
-    signaling_insecure_tls: bool,
+    insecure_tls: bool,
     #[arg(long)]
     tls: bool,
     #[arg(long, default_value_t = String::new())]
@@ -119,27 +118,23 @@ async fn main() -> Result<()> {
         Some(port) => format!("{host}:{port}"),
         None => host.to_string(),
     };
-    let signaling_ws_url = Url::parse(cli.signaling_ws_url.trim_end_matches('/'))?;
-    if !matches!(signaling_ws_url.scheme(), "ws" | "wss")
-        || signaling_ws_url.host_str().is_none()
-        || signaling_ws_url.path() != "/ws"
-        || signaling_ws_url.query().is_some()
-        || signaling_ws_url.fragment().is_some()
+    let ws_url = Url::parse(cli.ws_url.trim_end_matches('/'))?;
+    if !matches!(ws_url.scheme(), "ws" | "wss")
+        || ws_url.host_str().is_none()
+        || ws_url.path() != "/ws"
+        || ws_url.query().is_some()
+        || ws_url.fragment().is_some()
     {
-        bail!("--signaling-ws-url must be a ws:// or wss:// URL ending in /ws");
+        bail!("--ws-url must be a ws:// or wss:// URL ending in /ws");
     }
-    let authority = GrpcAuthority::connect(
-        &cli.signaling_grpc_url,
-        &cli.signaling_token,
-        cli.signaling_insecure_tls,
-    )
-    .map_err(|e| anyhow::anyhow!(e))?;
+    let authority =
+        GrpcAuthority::connect(&cli.grpc_url, cli.insecure_tls).map_err(|e| anyhow::anyhow!(e))?;
     let server = RoomServer::new(
         Config {
             web_root: cli.web_root,
             host: public_host,
             force_tls: scheme == "https",
-            signaling_ws_url: signaling_ws_url.to_string(),
+            signaling_ws_url: ws_url.to_string(),
             ice_server_urls: cli.ice_server_urls,
             ice_server_base_url: cli.ice_server_base_url,
             ice_server_api_key: cli.ice_server_api_key,

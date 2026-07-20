@@ -28,7 +28,7 @@ service SignalingService {
 }
 
 // Identifies the calling service role. Authentication must independently
-// authorize the mTLS identity or bearer credential for the declared role.
+// authorize the mTLS identity for the declared role.
 enum AppId {
   APP_ID_UNSPECIFIED = 0;
   APP_ID_APPWEB = 1;

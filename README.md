@@ -126,8 +126,8 @@ cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
 
 # 2. Start AppWeb.
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
-  --public-url https://127.0.0.1:8080 --signaling-ws-url wss://127.0.0.1:8081/ws \
-  --signaling-grpc-url https://127.0.0.1:50051 --signaling-insecure-tls --tls &
+  --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws \
+  --grpc-url https://127.0.0.1:50051 --insecure-tls --tls &
 
 # 3. Run the integration tests.
 cargo test -p apprtc --test '*' -- --nocapture
@@ -147,8 +147,8 @@ Run signaling and AppWeb separately from the repository root:
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
-  --public-url http://127.0.0.1:8080 --signaling-ws-url ws://127.0.0.1:8081/ws \
-  --signaling-grpc-url http://127.0.0.1:50051
+  --public-url http://127.0.0.1:8080 --ws-url ws://127.0.0.1:8081/ws \
+  --grpc-url http://127.0.0.1:50051
 ```
 
 AppWeb prints:
@@ -161,8 +161,7 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
 `--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser
 WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's
-`--public-url` controls the browser-facing HTTP origin, `--signaling-ws-url` controls the browser-facing WebSocket URL
-and must include `/ws`, and `--signaling-grpc-url` independently selects the private signaling gRPC origin.
+`--public-url` controls the browser-facing HTTP origin, `--ws-url` controls the browser-facing WebSocket URL and must include `/ws`, and `--grpc-url` independently selects the private signaling gRPC origin.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -177,9 +176,9 @@ cargo run -p apprtc --bin appweb -- \
   --port 8080 \
   --web-root appweb \
   --public-url https://127.0.0.1:8080 \
-  --signaling-ws-url wss://127.0.0.1:8081/ws \
-  --signaling-grpc-url https://127.0.0.1:50051 \
-  --signaling-insecure-tls \
+  --ws-url wss://127.0.0.1:8081/ws \
+  --grpc-url https://127.0.0.1:50051 \
+  --insecure-tls \
   --tls \
   --debug \
   --level info
@@ -202,7 +201,7 @@ cargo run -p apprtc --bin signaling -- \
 
 cargo run -p apprtc --bin appweb -- \
   --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
-  --signaling-ws-url wss://sfu.example.com/ws --signaling-grpc-url https://sfu.example.com:50051 --tls \
+  --ws-url wss://sfu.example.com/ws --grpc-url https://sfu.example.com:50051 --tls \
   --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
 ```
 
@@ -220,12 +219,10 @@ authoritative lists.
 | `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
 | `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                |
 | `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                      |
-| `--signaling-ws-url <URL>`     |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
-| `--signaling-grpc-url <URL>`   | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb`).                               |
-| `--signaling-insecure-tls`     |                      off | Disable verification for local self-signed signaling gRPC TLS.          |
-| `--signaling-token <TOKEN>`    |                    empty | Optional bearer token sent by AppWeb to private gRPC methods.           |
+| `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
+| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb`).                               |
+| `--insecure-tls`               |                      off | Disable verification for local self-signed signaling gRPC TLS.          |
 | `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                               |
-| `--grpc-token <TOKEN>`         |                    empty | Require this bearer token on private gRPC methods (`signaling`).        |
 | `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                             |
 | `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                      |
 | `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                      |
