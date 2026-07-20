@@ -1,9 +1,9 @@
 [workspace]
 members = [
     "apprtc", # apprtc binary
-    "signaling-proto", # private AppWeb/signaling Protobuf protocol
     "appweb", # app/web server
     "signaling", # signaling hub
+    "signaling-proto", # signaling protobuf
 ]
 resolver = "2"
 
@@ -11,7 +11,7 @@ resolver = "2"
 opt-level = 0
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
 license = "MIT/Apache-2.0"
@@ -21,10 +21,11 @@ keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
 [workspace.dependencies]
-appweb = { version = "0.1.0", path = "appweb" }
-signaling = { version = "0.1.0", path = "signaling" }
-signaling-proto = { version = "0.1.0", path = "signaling-proto" }
+appweb = { version = "0.2.0-alpha.1", path = "appweb" }
+signaling = { version = "0.2.0-alpha.1", path = "signaling" }
+signaling-proto = { version = "0.2.0-alpha.1", path = "signaling-proto" }
 
+sfu = "0.20.0-rc.3"
 webrtc = "0.20.0-rc.3"
 rtc = "0.20.0-rc.3"
 sansio = "1.0.1"

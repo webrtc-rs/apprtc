@@ -16,6 +16,8 @@ readme = "../README.md"
 appweb.workspace = true
 signaling.workspace = true
 signaling-proto.workspace = true
+sfu.workspace = true
+rtc.workspace = true
 
 sansio.workspace = true
 
@@ -35,11 +37,10 @@ tokio-tungstenite.workspace = true
 futures-util.workspace = true
 tonic.workspace = true
 tokio-stream.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 webrtc.workspace = true
-rtc.workspace = true
-
-serde_json.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
