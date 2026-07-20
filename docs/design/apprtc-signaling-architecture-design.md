@@ -1036,7 +1036,7 @@ sequenceDiagram
     Note over C,F: Leave and SFU room maintenance
     C->>AR: POST v2 leave
     AR->>S: remove C from room
-    Note over S: A WS disconnect past grace triggers removal in the hub; a future v2 extension may also notify appweb
+    Note over S: A WS disconnect past grace triggers removal in the hub - a future v2 extension may also notify appweb
     S->>F: C leaves room with lifecycle ID
     F->>F: apply SFUEvent Leave
     F-->>S: C left room with lifecycle ID
