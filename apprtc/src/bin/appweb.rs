@@ -1,7 +1,6 @@
 //! Standalone AppWeb HTTP/API server using a remote signaling authority.
-#[path = "../tls.rs"]
-mod tls;
 use anyhow::{Result, bail};
+use apprtc::tls;
 use appweb::config::Config;
 use appweb::grpc_client::GrpcAuthority;
 use appweb::room_server::RoomServer;

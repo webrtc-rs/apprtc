@@ -2,14 +2,8 @@
 //!
 //! All I/O lives here (async Tokio tasks + `tokio-tungstenite`, keeping the SFU `chat`
 //! example's architecture); the `signaling` crate is a pure Sans-I/O state machine.
-#[path = "../grpc_server.rs"]
-mod grpc_server;
-#[path = "../signaling_server.rs"]
-mod signaling_server;
-#[allow(dead_code)]
-#[path = "../tls.rs"]
-mod tls;
 
+use apprtc::{grpc_server, signaling_server, tls, ws_server};
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;
@@ -134,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
         commands_rx,
         REGISTER_TIMEOUT,
     ));
-    let accept_loop_handle = tokio::spawn(signaling_server::accept_loop(
+    let accept_loop_handle = tokio::spawn(ws_server::accept_loop(
         io_stop_rx.clone(),
         commands_tx.clone(),
         listener,
