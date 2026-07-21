@@ -21,7 +21,7 @@ struct Cli {
     host_ip: String,
     #[arg(short, long, default_value_t = 8081)]
     port: u16,
-    /// Private gRPC listening port used by AppWeb and future SFU workers.
+    /// Private gRPC listening port used by AppWeb and SFU workers.
     #[arg(long, default_value_t = 50051)]
     grpc_port: u16,
     /// Public WSS/WS origin advertised to AppWeb deployments.

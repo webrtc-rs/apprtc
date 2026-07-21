@@ -2,7 +2,8 @@
 
 use crate::client::ClientId;
 use crate::messages::{
-    Message, V2Promoted, V2Registered, WsClientMsg, server_err, server_msg, to_wire,
+    Message, V2Promoted, V2Registered, V2RoomFailed, V2Upgrade, WsClientMsg, server_err,
+    server_msg, to_wire,
 };
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
@@ -40,6 +41,7 @@ pub enum BrowserOutput {
     Close {
         connection_id: ConnectionId,
     },
+    Sfu(crate::sfu::Output),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +96,8 @@ pub struct StatusSnapshot {
     pub websocket_connections: usize,
     pub total_websocket_connections: u64,
     pub websocket_errors: u64,
+    pub connected_sfu_instances: usize,
+    pub ready_sfu_instances: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,13 +112,15 @@ pub enum AuthorityResult {
     },
     Injected,
     AdmittedV2 {
+        mode: v2::RoomMode,
         signal_epoch: u64,
         admission_token: String,
-        is_initiator: bool,
+        is_initiator: Option<bool>,
     },
     RemovedV2,
     OccupancyV2 {
         count: usize,
+        mode: v2::RoomMode,
     },
     Status(StatusSnapshot),
     Error {
@@ -307,7 +313,7 @@ impl Collider {
                 control: "registered",
                 roomid: room_id.to_string(),
                 epoch: registration.signal_epoch.to_string(),
-                mode: "p2p",
+                mode: room_mode_name(registration.mode),
                 is_initiator: registration.is_initiator,
             }),
         });
@@ -363,7 +369,7 @@ impl Collider {
                     "V2 send: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} bytes={}",
                     msg.msg.len()
                 );
-                if let Some(delivery) =
+                if let v2::SendResult::P2p(Some(delivery)) =
                     self.v2_rooms
                         .send(room_id, client_id, signal_epoch, msg.msg)?
                     && let Some(&peer_connection) = self
@@ -375,6 +381,7 @@ impl Collider {
                         text: server_msg(&delivery.message),
                     });
                 }
+                self.drain_v2_actions();
             }
             Session::Connected => {
                 self.fail_connection(connection_id, "Client not registered");
@@ -503,34 +510,52 @@ impl Collider {
                 client_id,
                 admission_token,
                 now,
-            } => match self
-                .v2_rooms
-                .admit(now, room_id, client_id, admission_token)
-            {
-                Ok(admission) => AuthorityResult::AdmittedV2 {
+            } => match self.v2_rooms.admit(
+                command.request_id,
+                now,
+                room_id,
+                client_id,
+                admission_token,
+            ) {
+                Ok(v2::AdmissionResult::Complete(admission)) => AuthorityResult::AdmittedV2 {
+                    mode: admission.mode,
                     signal_epoch: admission.signal_epoch,
                     admission_token: admission.admission_token,
                     is_initiator: admission.is_initiator,
                 },
+                Ok(v2::AdmissionResult::Pending) => {
+                    self.drain_v2_actions();
+                    return;
+                }
                 Err(result) => AuthorityResult::Error { result },
             },
             AuthorityOperation::RemoveV2 {
                 room_id,
                 client_id,
                 admission_token,
-            } => match self.v2_rooms.remove(room_id, client_id, &admission_token) {
-                Ok(promotion) => {
-                    self.close_v2_client_connection(room_id, client_id);
-                    if let Some(promotion) = promotion {
-                        self.push_promotion(promotion);
+            } => {
+                match self
+                    .v2_rooms
+                    .remove(command.request_id, room_id, client_id, &admission_token)
+                {
+                    Ok(v2::RemovalResult::Complete(promotion)) => {
+                        self.close_v2_client_connection(room_id, client_id);
+                        if let Some(promotion) = promotion {
+                            self.push_promotion(promotion);
+                        }
+                        AuthorityResult::RemovedV2
                     }
-                    AuthorityResult::RemovedV2
+                    Ok(v2::RemovalResult::Pending) => {
+                        self.drain_v2_actions();
+                        return;
+                    }
+                    Err(result) => AuthorityResult::Error { result },
                 }
-                Err(result) => AuthorityResult::Error { result },
-            },
-            AuthorityOperation::OccupancyV2 { room_id } => AuthorityResult::OccupancyV2 {
-                count: self.v2_rooms.occupancy(room_id),
-            },
+            }
+            AuthorityOperation::OccupancyV2 { room_id } => {
+                let (count, mode) = self.v2_rooms.occupancy(room_id);
+                AuthorityResult::OccupancyV2 { count, mode }
+            }
             AuthorityOperation::Status => AuthorityResult::Status(StatusSnapshot {
                 rooms: self.rooms.room_count(),
                 v2_rooms: self.v2_rooms.room_count(),
@@ -538,12 +563,116 @@ impl Collider {
                 websocket_connections: self.rooms.ws_count() + self.v2_rooms.registered_count(),
                 total_websocket_connections: self.total_websocket_connections,
                 websocket_errors: self.websocket_errors,
+                connected_sfu_instances: self.v2_rooms.connected_sfu_count(),
+                ready_sfu_instances: self.v2_rooms.ready_sfu_count(),
             }),
         };
         self.authority_responses.push_back(AuthorityResponse {
             request_id: command.request_id,
             result,
         });
+        self.drain_v2_actions();
+    }
+
+    pub fn handle_sfu_input(&mut self, input: crate::sfu::Input) -> Result<(), String> {
+        self.v2_rooms.handle_sfu_input(input)?;
+        self.drain_v2_actions();
+        Ok(())
+    }
+
+    fn drain_v2_actions(&mut self) {
+        while let Some(action) = self.v2_rooms.poll_action() {
+            match action {
+                v2::Action::Sfu(output) => {
+                    self.browser_outputs.push_back(BrowserOutput::Sfu(output));
+                }
+                v2::Action::AdmissionCompleted {
+                    authority_request_id,
+                    result,
+                } => {
+                    let result = match result {
+                        Ok(admission) => AuthorityResult::AdmittedV2 {
+                            mode: admission.mode,
+                            signal_epoch: admission.signal_epoch,
+                            admission_token: admission.admission_token,
+                            is_initiator: admission.is_initiator,
+                        },
+                        Err(result) => AuthorityResult::Error { result },
+                    };
+                    self.authority_responses.push_back(AuthorityResponse {
+                        request_id: authority_request_id,
+                        result,
+                    });
+                }
+                v2::Action::RemovalCompleted {
+                    authority_request_id,
+                    room_id,
+                    client_id,
+                    result,
+                } => {
+                    let result = match result {
+                        Ok(()) => {
+                            self.close_v2_client_connection(room_id, client_id);
+                            AuthorityResult::RemovedV2
+                        }
+                        Err(result) => AuthorityResult::Error { result },
+                    };
+                    self.authority_responses.push_back(AuthorityResponse {
+                        request_id: authority_request_id,
+                        result,
+                    });
+                }
+                v2::Action::Upgraded {
+                    room_id,
+                    signal_epoch,
+                    existing_clients,
+                } => {
+                    for client_id in existing_clients {
+                        if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
+                        {
+                            self.browser_outputs.push_back(BrowserOutput::Text {
+                                connection_id,
+                                text: to_wire(&V2Upgrade {
+                                    control: "sfu-upgrade",
+                                    roomid: room_id.to_string(),
+                                    epoch: signal_epoch.to_string(),
+                                }),
+                            });
+                        }
+                    }
+                }
+                v2::Action::Deliver(delivery) => {
+                    if let Some(&connection_id) = self
+                        .v2_connections
+                        .get(&(delivery.room_id, delivery.client_id))
+                    {
+                        self.browser_outputs.push_back(BrowserOutput::Text {
+                            connection_id,
+                            text: server_msg(&delivery.message),
+                        });
+                    }
+                }
+                v2::Action::RoomFailed {
+                    room_id,
+                    clients,
+                    reason,
+                } => {
+                    for client_id in clients {
+                        if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
+                        {
+                            self.browser_outputs.push_back(BrowserOutput::Text {
+                                connection_id,
+                                text: to_wire(&V2RoomFailed {
+                                    control: "room-failed",
+                                    roomid: room_id.to_string(),
+                                    reason: reason.clone(),
+                                }),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -635,6 +764,15 @@ fn canonical_u64(value: &str) -> Option<u64> {
 
 fn canonical_json_u64(value: &serde_json::Value) -> Option<u64> {
     value.as_str().and_then(canonical_u64)
+}
+
+fn room_mode_name(mode: v2::RoomMode) -> &'static str {
+    match mode {
+        v2::RoomMode::P2p => "p2p",
+        v2::RoomMode::Upgrading => "upgrading",
+        v2::RoomMode::Sfu => "sfu",
+        v2::RoomMode::Failed => "failed",
+    }
 }
 
 #[cfg(test)]
@@ -752,8 +890,9 @@ mod tests {
             },
         ) {
             AuthorityResult::AdmittedV2 {
+                mode: v2::RoomMode::P2p,
                 admission_token,
-                is_initiator: true,
+                is_initiator: Some(true),
                 signal_epoch: 0,
             } => admission_token,
             result => panic!("unexpected first admission: {result:?}"),
@@ -769,8 +908,9 @@ mod tests {
             },
         ) {
             AuthorityResult::AdmittedV2 {
+                mode: v2::RoomMode::P2p,
                 admission_token,
-                is_initiator: false,
+                is_initiator: Some(false),
                 signal_epoch: 0,
             } => admission_token,
             result => panic!("unexpected second admission: {result:?}"),

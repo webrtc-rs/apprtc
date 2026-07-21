@@ -38,7 +38,8 @@ pub struct V2Registered {
     pub roomid: String,
     pub epoch: String,
     pub mode: &'static str,
-    pub is_initiator: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_initiator: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47,6 +48,20 @@ pub struct V2Promoted {
     pub roomid: String,
     pub epoch: String,
     pub is_initiator: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2Upgrade {
+    pub control: &'static str,
+    pub roomid: String,
+    pub epoch: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct V2RoomFailed {
+    pub control: &'static str,
+    pub roomid: String,
+    pub reason: String,
 }
 
 /// A message sent to a client on behalf of another client. Both fields are

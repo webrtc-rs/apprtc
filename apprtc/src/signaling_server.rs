@@ -30,6 +30,13 @@ pub enum DriverCommand {
         command: AuthorityCommand,
         response: oneshot::Sender<AuthorityResponse>,
     },
+    SfuConnected {
+        input: signaling::sfu::Input,
+        output: mpsc::Sender<signaling::sfu::Output>,
+    },
+    SfuInput {
+        input: signaling::sfu::Input,
+    },
     Disconnected {
         connection_id: ConnectionId,
         now: Instant,
@@ -45,6 +52,8 @@ pub async fn run(
 ) {
     let mut collider = Collider::new(register_timeout);
     let mut sockets: HashMap<ConnectionId, mpsc::Sender<SocketOutput>> = HashMap::new();
+    let mut sfu_sessions = HashMap::new();
+    let mut pending_authority = HashMap::new();
     loop {
         // Sleep until the next command, the state machine's own deadline, or the stop
         // signal — whichever wakes first.
@@ -56,7 +65,8 @@ pub async fn run(
                     if collider.handle_timeout(Instant::now()).is_err() {
                         break;
                     }
-                    drain_outputs(&mut collider, &mut sockets);
+                    drain_outputs(&mut collider, &mut sockets, &mut sfu_sessions);
+                    drain_authority_responses(&mut collider, &mut pending_authority);
                     continue;
                 }
             }
@@ -68,17 +78,31 @@ pub async fn run(
         };
 
         let Some(command) = command else { break };
-        handle_command(&mut collider, command, &mut sockets);
-        drain_outputs(&mut collider, &mut sockets);
+        handle_command(
+            &mut collider,
+            command,
+            &mut sockets,
+            &mut sfu_sessions,
+            &mut pending_authority,
+        );
+        drain_outputs(&mut collider, &mut sockets, &mut sfu_sessions);
+        drain_authority_responses(&mut collider, &mut pending_authority);
     }
 
     // Graceful stop: apply commands already queued before the signal, then close every
     // browser socket and release all signaling state.
     while let Ok(command) = commands.try_recv() {
-        handle_command(&mut collider, command, &mut sockets);
+        handle_command(
+            &mut collider,
+            command,
+            &mut sockets,
+            &mut sfu_sessions,
+            &mut pending_authority,
+        );
     }
     let _ = collider.close();
-    drain_outputs(&mut collider, &mut sockets);
+    drain_outputs(&mut collider, &mut sockets, &mut sfu_sessions);
+    drain_authority_responses(&mut collider, &mut pending_authority);
     log::info!("signaling event loop stopped");
 }
 
@@ -86,6 +110,8 @@ fn handle_command(
     collider: &mut Collider,
     command: DriverCommand,
     sockets: &mut HashMap<ConnectionId, mpsc::Sender<SocketOutput>>,
+    sfu_sessions: &mut HashMap<signaling::sfu::ConnectionId, mpsc::Sender<signaling::sfu::Output>>,
+    pending_authority: &mut HashMap<u64, oneshot::Sender<AuthorityResponse>>,
 ) {
     match command {
         DriverCommand::Connected {
@@ -119,12 +145,30 @@ fn handle_command(
         }
         DriverCommand::Authority { command, response } => {
             let request_id = command.request_id;
-            if collider.handle_write(command).is_ok()
-                && let Some(authority_response) = collider.poll_event()
+            pending_authority.insert(request_id, response);
+            if collider.handle_write(command).is_err()
+                && let Some(response) = pending_authority.remove(&request_id)
             {
-                debug_assert_eq!(authority_response.request_id, request_id);
-                let _ = response.send(authority_response);
+                let _ = response.send(AuthorityResponse {
+                    request_id,
+                    result: signaling::collider::AuthorityResult::Error {
+                        result: "INTERNAL".into(),
+                    },
+                });
             }
+        }
+        DriverCommand::SfuConnected { input, output } => {
+            let connection_id = match &input {
+                signaling::sfu::Input::Register { connection_id, .. } => *connection_id,
+                _ => return,
+            };
+            sfu_sessions.insert(connection_id, output);
+            if collider.handle_sfu_input(input).is_err() {
+                sfu_sessions.remove(&connection_id);
+            }
+        }
+        DriverCommand::SfuInput { input } => {
+            let _ = collider.handle_sfu_input(input);
         }
         DriverCommand::Disconnected { connection_id, now } => {
             sockets.remove(&connection_id);
@@ -136,6 +180,7 @@ fn handle_command(
 fn drain_outputs(
     collider: &mut Collider,
     sockets: &mut HashMap<ConnectionId, mpsc::Sender<SocketOutput>>,
+    sfu_sessions: &mut HashMap<signaling::sfu::ConnectionId, mpsc::Sender<signaling::sfu::Output>>,
 ) {
     let mut disconnected = Vec::new();
     while let Some(output) = collider.poll_write() {
@@ -157,6 +202,15 @@ fn drain_outputs(
                 }
                 disconnected.push(connection_id);
             }
+            BrowserOutput::Sfu(output) => {
+                let connection_id = sfu_output_connection_id(&output);
+                if sfu_sessions
+                    .get(&connection_id)
+                    .is_some_and(|session| session.try_send(output).is_err())
+                {
+                    sfu_sessions.remove(&connection_id);
+                }
+            }
         }
     }
     disconnected.sort_unstable();
@@ -167,6 +221,27 @@ fn drain_outputs(
             connection_id,
             now: Instant::now(),
         });
+    }
+}
+
+fn sfu_output_connection_id(output: &signaling::sfu::Output) -> signaling::sfu::ConnectionId {
+    match output {
+        signaling::sfu::Output::Registered { connection_id, .. }
+        | signaling::sfu::Output::RegistrationError { connection_id, .. }
+        | signaling::sfu::Output::Command { connection_id, .. }
+        | signaling::sfu::Output::EventAck { connection_id, .. }
+        | signaling::sfu::Output::Close { connection_id } => *connection_id,
+    }
+}
+
+fn drain_authority_responses(
+    collider: &mut Collider,
+    pending: &mut HashMap<u64, oneshot::Sender<AuthorityResponse>>,
+) {
+    while let Some(response) = collider.poll_event() {
+        if let Some(sender) = pending.remove(&response.request_id) {
+            let _ = sender.send(response);
+        }
     }
 }
 
