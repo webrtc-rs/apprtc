@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod sfu_v2;
+
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
