@@ -1,9 +1,7 @@
 //! Private gRPC adapter for AppWeb and SFU workers.
 
-use crate::{
-    signaling_server::{COMMAND_CAPACITY, DriverCommand},
-    tls,
-};
+use crate::signaling_server::{COMMAND_CAPACITY, DriverCommand};
+use crate::tls_pem;
 use rand::RngExt;
 use signaling::collider::{
     AuthorityCommand, AuthorityOperation, AuthorityResponse, AuthorityResult,
@@ -45,7 +43,7 @@ pub async fn run(
         .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
         .tcp_keepalive(Some(KEEPALIVE_INTERVAL));
     if let Some((certificate, private_key)) = tls_files {
-        let (certificate, private_key) = tls::pem(&certificate, &private_key)?;
+        let (certificate, private_key) = tls_pem(&certificate, &private_key)?;
         server = server.tls_config(
             ServerTlsConfig::new().identity(Identity::from_pem(certificate, private_key)),
         )?;

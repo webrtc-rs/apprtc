@@ -1,6 +1,6 @@
 //! Standalone AppWeb HTTP/API server using a remote signaling authority.
 use anyhow::{Result, bail};
-use apprtc::tls;
+use apprtc::{TlsListener, tls_config};
 use appweb::config::Config;
 use appweb::grpc_client::GrpcAuthority;
 use appweb::room_server::RoomServer;
@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
     let app = server.router();
     if cli.tls {
         axum::serve(
-            tls::TlsListener::new(listener, tls::config(&cli.certificate, &cli.private_key)?),
+            TlsListener::new(listener, tls_config(&cli.certificate, &cli.private_key)?),
             app,
         )
         .with_graceful_shutdown(async {
