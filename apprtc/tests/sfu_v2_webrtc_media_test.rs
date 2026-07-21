@@ -24,7 +24,6 @@ use tokio::time::timeout;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
 use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
-use webrtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 
 /// Reject an SDP whose BUNDLE m-lines assign one RTP-header-extension id to two different
 /// URIs — the SDP-level form of Chrome's "BUNDLE group contains a codec collision for
@@ -141,19 +140,11 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
             states,
             outgoing,
             tracks,
-            negotiation,
         } = peer().await?;
         let ssrc = 0x1000_0000 + index as u32 + 1;
         let track = video_track(ssrc, &member.client_id.to_string());
-        pc.add_transceiver_from_track(
-            track.clone() as Arc<dyn TrackLocal>,
-            Some(RTCRtpTransceiverInit {
-                direction: RTCRtpTransceiverDirection::Sendonly,
-                streams: vec![],
-                send_encodings: vec![],
-            }),
-        )
-        .await?;
+        // drive() publishes the video track on mid:0 as the first offer; subscribe re-offers
+        // (also mid:0) are resolved as the polite peer via glare rollback + re-publish.
         let (offers_tx, offers_rx) = mpsc::unbounded_channel();
         let (connected_tx, connected_rx) = oneshot::channel();
         drive(
@@ -163,8 +154,8 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
             outgoing,
             offers_tx,
             states,
-            negotiation,
             connected_tx,
+            Some(track.clone() as Arc<dyn TrackLocal>),
         );
         let publisher = keep_publishing(track.clone(), ssrc);
         timeout(Duration::from_secs(30), connected_rx)

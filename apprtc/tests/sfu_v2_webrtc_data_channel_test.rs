@@ -38,8 +38,8 @@ async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()
             states,
             outgoing,
             tracks: _,
-            negotiation,
         } = peer().await?;
+        // The data channel is the bootstrap m-line drive() offers to bring the PC up.
         let data_channel = pc.create_data_channel("sfu-v2-test", None).await?;
         // Data-channel-only publish never draws a subscribe offer; sink is unused.
         let (offers_tx, _offers_rx) = mpsc::unbounded_channel();
@@ -51,8 +51,8 @@ async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()
             outgoing,
             offers_tx,
             states,
-            negotiation,
             connected_tx,
+            None,
         );
         actives.push(Active { pc, data_channel });
         connections.push(connected_rx);
