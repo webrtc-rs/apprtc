@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long, default_value_t = 3478)]
     media_port_min: u16,
 
-    #[arg(long, default_value_t = 3495)]
+    #[arg(long, default_value_t = 3497)]
     media_port_max: u16,
 
     /// Private signaling gRPC origin.
