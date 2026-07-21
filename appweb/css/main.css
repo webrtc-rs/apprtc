@@ -210,6 +210,42 @@ label {
   z-index: 1;
 }
 
+.sfu-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  height: 100%;
+  padding: 8px;
+  position: absolute;
+  width: 100%;
+  box-sizing: border-box;
+  z-index: 1;
+}
+
+.sfu-grid.hidden {
+  display: none;
+}
+
+.sfu-tile {
+  background: #111;
+  border-radius: 8px;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.sfu-tile video {
+  height: 100%;
+  object-fit: cover;
+  width: 100%;
+}
+
+#videos.sfu-mode #local-video,
+#videos.sfu-mode #remote-video {
+  opacity: 0;
+  pointer-events: none;
+}
+
 #confirm-join-div {
   position: absolute;
   text-align: center;

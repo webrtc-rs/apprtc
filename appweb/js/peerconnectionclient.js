@@ -42,6 +42,7 @@ var PeerConnectionClient = function(params, startTime) {
   this.pc_.onsignalingstatechange = this.onSignalingStateChanged_.bind(this);
   this.pc_.oniceconnectionstatechange =
       this.onIceConnectionStateChanged_.bind(this);
+  this.pc_.onnegotiationneeded = this.onNegotiationNeeded_.bind(this);
   window.dispatchEvent(new CustomEvent('pccreated', {
     detail: {
       pc: this,
@@ -52,9 +53,12 @@ var PeerConnectionClient = function(params, startTime) {
   }));
 
   this.hasRemoteSdp_ = false;
+  this.isDrainingMessages_ = false;
   this.messageQueue_ = [];
   this.isInitiator_ = false;
   this.started_ = false;
+  this.sfuMode_ = params.sfuMode === true;
+  this.pendingRemoteRequestId_ = null;
 
   // TODO(jiayl): Replace callbacks with events.
   // Public callbacks. Keep it sorted.
@@ -143,12 +147,19 @@ PeerConnectionClient.prototype.receiveSignalingMessage = function(message) {
   if (!messageObj) {
     return;
   }
-  if ((this.isInitiator_ && messageObj.type === 'answer') ||
+  if (this.sfuMode_ && messageObj.type === 'offer') {
+    this.hasRemoteSdp_ = true;
+    // SFU subscribe offers follow the publish answer on the same ordered
+    // signaling connection. Preserve that ordering so the subscribe offer
+    // cannot roll back a publish offer whose answer is still being applied.
+    this.messageQueue_.push(messageObj);
+  } else if ((this.isInitiator_ && messageObj.type === 'answer') ||
       (!this.isInitiator_ && messageObj.type === 'offer')) {
     this.hasRemoteSdp_ = true;
-    // Always process offer before candidates.
+    // Always process the initial remote SDP before candidates.
     this.messageQueue_.unshift(messageObj);
-  } else if (messageObj.type === 'candidate') {
+  } else if (messageObj.type === 'candidate' ||
+      messageObj.type === 'end-of-candidates') {
     this.messageQueue_.push(messageObj);
   } else if (messageObj.type === 'bye') {
     if (this.onremotehangup) {
@@ -194,7 +205,7 @@ PeerConnectionClient.prototype.getPeerConnectionStats = function(callback) {
 
 PeerConnectionClient.prototype.doAnswer_ = function() {
   trace('Sending answer to peer.');
-  this.pc_.createAnswer()
+  return this.pc_.createAnswer()
       .then(this.setLocalSdpAndNotify_.bind(this))
       .catch(this.onError_.bind(this, 'createAnswer'));
 };
@@ -219,20 +230,27 @@ PeerConnectionClient.prototype.setLocalSdpAndNotify_ =
       sessionDescription.sdp = maybeRemoveVideoFec(
           sessionDescription.sdp,
           this.params_);
-      this.pc_.setLocalDescription(sessionDescription)
+      return this.pc_.setLocalDescription(sessionDescription)
           .then(trace.bind(null, 'Set session description success.'))
+          .then(function() {
+            if (this.onsignalingmessage) {
+              // Chrome version of RTCSessionDescription can't be serialized directly
+              // because it JSON.stringify won't include attributes which are on the
+              // object's prototype chain. By creating the message to serialize
+              // explicitly we can avoid the issue.
+              var message = {
+                sdp: sessionDescription.sdp,
+                type: sessionDescription.type
+              };
+              if (sessionDescription.type === 'answer' &&
+                  this.pendingRemoteRequestId_ !== null) {
+                message.requestid = this.pendingRemoteRequestId_.toString();
+                this.pendingRemoteRequestId_ = null;
+              }
+              this.onsignalingmessage(message);
+            }
+          }.bind(this))
           .catch(this.onError_.bind(this, 'setLocalDescription'));
-
-      if (this.onsignalingmessage) {
-        // Chrome version of RTCSessionDescription can't be serialized directly
-        // because it JSON.stringify won't include attributes which are on the
-        // object's prototype chain. By creating the message to serialize
-        // explicitly we can avoid the issue.
-        this.onsignalingmessage({
-          sdp: sessionDescription.sdp,
-          type: sessionDescription.type
-        });
-      }
     };
 
 PeerConnectionClient.prototype.setRemoteSdp_ = function(message) {
@@ -243,9 +261,8 @@ PeerConnectionClient.prototype.setRemoteSdp_ = function(message) {
   message.sdp = maybeSetVideoSendBitRate(message.sdp, this.params_);
   message.sdp = maybeSetVideoSendInitialBitRate(message.sdp, this.params_);
   message.sdp = maybeRemoveVideoFec(message.sdp, this.params_);
-  this.pc_.setRemoteDescription(new RTCSessionDescription(message))
-      .then(this.onSetRemoteDescriptionSuccess_.bind(this))
-      .catch(this.onError_.bind(this, 'setRemoteDescription'));
+  return this.pc_.setRemoteDescription(new RTCSessionDescription(message))
+      .then(this.onSetRemoteDescriptionSuccess_.bind(this));
 };
 
 PeerConnectionClient.prototype.onSetRemoteDescriptionSuccess_ = function() {
@@ -263,33 +280,67 @@ PeerConnectionClient.prototype.onSetRemoteDescriptionSuccess_ = function() {
 };
 
 PeerConnectionClient.prototype.processSignalingMessage_ = function(message) {
-  if (message.type === 'offer' && !this.isInitiator_) {
+  if (message.type === 'offer' && this.sfuMode_) {
+    return this.answerSfuOffer_(message);
+  } else if (message.type === 'offer' && !this.isInitiator_) {
     if (this.pc_.signalingState !== 'stable') {
       trace('ERROR: remote offer received in unexpected state: ' +
             this.pc_.signalingState);
-      return;
+      return Promise.resolve();
     }
-    this.setRemoteSdp_(message);
-    this.doAnswer_();
+    return this.setRemoteSdp_(message).then(this.doAnswer_.bind(this));
   } else if (message.type === 'answer' && this.isInitiator_) {
     if (this.pc_.signalingState !== 'have-local-offer') {
       trace('ERROR: remote answer received in unexpected state: ' +
             this.pc_.signalingState);
-      return;
+      return Promise.resolve();
     }
-    this.setRemoteSdp_(message);
+    return this.setRemoteSdp_(message);
   } else if (message.type === 'candidate') {
     var candidate = new RTCIceCandidate({
       sdpMLineIndex: message.label,
       candidate: message.candidate
     });
     this.recordIceCandidate_('Remote', candidate);
-    this.pc_.addIceCandidate(candidate)
-        .then(trace.bind(null, 'Remote candidate added successfully.'))
-        .catch(this.onError_.bind(this, 'addIceCandidate'));
+    return this.pc_.addIceCandidate(candidate)
+        .then(trace.bind(null, 'Remote candidate added successfully.'));
+  } else if (message.type === 'end-of-candidates') {
+    return this.pc_.addIceCandidate(null)
+        .then(trace.bind(null, 'Remote end-of-candidates added successfully.'));
   } else {
     trace('WARNING: unexpected message: ' + JSON.stringify(message));
+    return Promise.resolve();
   }
+};
+
+PeerConnectionClient.prototype.answerSfuOffer_ = function(message) {
+  var ready = Promise.resolve();
+  if (this.pc_.signalingState === 'have-local-offer') {
+    trace('Rolling back a local SFU offer to answer a subscribe offer.');
+    ready = this.pc_.setLocalDescription({type: 'rollback'});
+  } else if (this.pc_.signalingState !== 'stable') {
+    trace('WARNING: SFU offer received in unexpected state: ' +
+        this.pc_.signalingState);
+    return Promise.resolve();
+  }
+  this.pendingRemoteRequestId_ = message.requestid === undefined ?
+      null : message.requestid;
+  return ready.then(function() {
+    return this.setRemoteSdp_(message);
+  }.bind(this)).then(function() {
+    return this.doAnswer_();
+  }.bind(this));
+};
+
+PeerConnectionClient.prototype.onNegotiationNeeded_ = function() {
+  if (!this.sfuMode_ || !this.started_ || !this.pc_ ||
+      this.pc_.signalingState !== 'stable') {
+    return;
+  }
+  trace('SFU negotiation needed; publishing a fresh offer.');
+  this.pc_.createOffer(this.params_.offerOptions)
+      .then(this.setLocalSdpAndNotify_.bind(this))
+      .catch(this.onError_.bind(this, 'createOffer'));
 };
 
 // When we receive messages from GAE registration and from the WSS connection,
@@ -304,13 +355,26 @@ PeerConnectionClient.prototype.drainMessageQueue_ = function() {
   // some requests faster than others. We need to process offer before
   // candidates so we wait for the offer to arrive first if we're answering.
   // Offers are added to the front of the queue.
-  if (!this.pc_ || !this.started_ || !this.hasRemoteSdp_) {
+  if (!this.pc_ || !this.started_ || !this.hasRemoteSdp_ ||
+      this.isDrainingMessages_) {
     return;
   }
-  for (var i = 0, len = this.messageQueue_.length; i < len; i++) {
-    this.processSignalingMessage_(this.messageQueue_[i]);
-  }
+  this.isDrainingMessages_ = true;
+  var messages = this.messageQueue_;
   this.messageQueue_ = [];
+  var sequence = Promise.resolve();
+  messages.forEach(function(message) {
+    sequence = sequence.then(function() {
+      return this.processSignalingMessage_(message);
+    }.bind(this));
+  }.bind(this));
+  sequence.catch(this.onError_.bind(this, 'processSignalingMessage'))
+      .then(function() {
+        this.isDrainingMessages_ = false;
+        if (this.messageQueue_.length > 0) {
+          this.drainMessageQueue_();
+        }
+      }.bind(this));
 };
 
 PeerConnectionClient.prototype.onIceCandidate_ = function(event) {
@@ -330,6 +394,9 @@ PeerConnectionClient.prototype.onIceCandidate_ = function(event) {
     }
   } else {
     trace('End of candidates.');
+    if (this.onsignalingmessage) {
+      this.onsignalingmessage({type: 'end-of-candidates'});
+    }
   }
 };
 
@@ -385,8 +452,15 @@ PeerConnectionClient.prototype.recordIceCandidate_ =
     };
 
 PeerConnectionClient.prototype.onRemoteStreamAdded_ = function(event) {
-  if (this.onremotestreamadded) {
+  if (!this.onremotestreamadded) {
+    return;
+  }
+  if (event.streams && event.streams.length > 0) {
     this.onremotestreamadded(event.streams[0]);
+    return;
+  }
+  if (event.track) {
+    this.onremotestreamadded(new MediaStream([event.track]));
   }
 };
 

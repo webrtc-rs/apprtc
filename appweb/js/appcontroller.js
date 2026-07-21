@@ -46,6 +46,7 @@ var UI_CONSTANTS = {
   roomSelectionRecentList: '#recent-rooms-list',
   roomSelectionV2Checkbox: '#signaling-v2-checkbox',
   sharingDiv: '#sharing-div',
+  sfuGrid: '#sfu-grid',
   statusDiv: '#status-div',
   turnInfoDiv: '#turn-info-div',
   videosDiv: '#videos',
@@ -61,6 +62,8 @@ var AppController = function(loadingParams) {
   this.localVideo_ = $(UI_CONSTANTS.localVideo);
   this.miniVideo_ = $(UI_CONSTANTS.miniVideo);
   this.sharingDiv_ = $(UI_CONSTANTS.sharingDiv);
+  this.sfuGrid_ = $(UI_CONSTANTS.sfuGrid);
+  this.sfuTiles_ = {};
   this.statusDiv_ = $(UI_CONSTANTS.statusDiv);
   this.turnInfoDiv_ = $(UI_CONSTANTS.turnInfoDiv);
   this.remoteVideo_ = $(UI_CONSTANTS.remoteVideo);
@@ -162,6 +165,7 @@ AppController.prototype.createCall_ = function() {
   this.call_.onremotesdpset = this.onRemoteSdpSet_.bind(this);
   this.call_.onremotestreamadded = this.onRemoteStreamAdded_.bind(this);
   this.call_.onlocalstreamadded = this.onLocalStreamAdded_.bind(this);
+  this.call_.onmodechange = this.onModeChange_.bind(this);
 
   this.call_.onsignalingstatechange =
       this.infoBox_.updateInfoDiv.bind(this.infoBox_);
@@ -253,6 +257,9 @@ AppController.prototype.onRemoteHangup_ = function() {
 };
 
 AppController.prototype.onRemoteSdpSet_ = function(hasRemoteVideo) {
+  if (this.call_.getMode() === 'upgrading' || this.call_.getMode() === 'sfu') {
+    return;
+  }
   if (hasRemoteVideo) {
     trace('Waiting for remote video.');
     this.waitForRemoteVideo_();
@@ -279,13 +286,53 @@ AppController.prototype.onRemoteStreamAdded_ = function(stream) {
   this.deactivate_(this.sharingDiv_);
   this.displayTurnStatus_('');
   trace('Remote stream added.');
-  this.remoteVideo_.srcObject = stream;
+  if (this.call_.getMode() === 'upgrading' || this.call_.getMode() === 'sfu') {
+    this.addSfuStream_(stream);
+  } else {
+    this.remoteVideo_.srcObject = stream;
+  }
   this.infoBox_.getRemoteTrackIds(stream);
 
 
   if (this.remoteVideoResetTimer_) {
     clearTimeout(this.remoteVideoResetTimer_);
     this.remoteVideoResetTimer_ = null;
+  }
+};
+
+AppController.prototype.addSfuStream_ = function(stream) {
+  var publisher = /^peer-(\d+)-/.exec(stream.id || '');
+  var participantId = publisher ? publisher[1] :
+      (stream.id || ('participant-' + Object.keys(this.sfuTiles_).length));
+  var video = this.sfuTiles_[participantId];
+  if (!video) {
+    var tile = document.createElement('div');
+    tile.className = 'sfu-tile';
+    tile.dataset.participantId = participantId;
+    video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    tile.appendChild(video);
+    this.sfuGrid_.appendChild(tile);
+    this.sfuTiles_[participantId] = video;
+  }
+  video.srcObject = stream;
+};
+
+AppController.prototype.onModeChange_ = function(mode) {
+  if (mode === 'upgrading') {
+    this.displayStatus_('Switching to group call…');
+    return;
+  }
+  if (mode === 'sfu') {
+    this.videosDiv_.classList.remove('active');
+    this.videosDiv_.classList.add('sfu-mode');
+    this.sfuGrid_.classList.remove('hidden');
+    this.deactivate_(this.remoteVideo_);
+    this.activate_(this.miniVideo_);
+    this.show_(this.icons_);
+    this.show_(this.hangupSvg_);
+    this.displayStatus_('');
   }
 };
 

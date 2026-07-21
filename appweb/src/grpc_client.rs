@@ -48,9 +48,10 @@ pub struct Admission {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V2Admission {
+    pub mode: RoomMode,
     pub signal_epoch: u64,
     pub admission_token: String,
-    pub is_initiator: bool,
+    pub is_initiator: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,20 +295,23 @@ impl RoomAuthority for GrpcAuthority {
         response_request_id(response.context, request_id)?;
         match response.result {
             Some(v2::admit_v2_response::Result::Admitted(admitted)) => {
-                if admitted.mode != RoomMode::P2p as i32 {
-                    return Err("UNSUPPORTED_ROOM_MODE".into());
+                let mode = RoomMode::try_from(admitted.mode)
+                    .map_err(|_| "UNSUPPORTED_ROOM_MODE".to_string())?;
+                if !matches!(mode, RoomMode::P2p | RoomMode::Sfu) {
+                    return Err("ROOM_TRANSITION".into());
                 }
-                let is_initiator = admitted
-                    .is_initiator
-                    .ok_or_else(|| "P2P admission missing is_initiator".to_string())?;
+                if mode == RoomMode::P2p && admitted.is_initiator.is_none() {
+                    return Err("P2P admission missing is_initiator".into());
+                }
                 if admitted.admission_token.is_empty() {
-                    return Err("P2P admission missing admission_token".into());
+                    return Err("V2 admission missing admission_token".into());
                 }
                 log_response("admit_v2", request_id, "OK", "", started);
                 Ok(V2Admission {
+                    mode,
                     signal_epoch: admitted.signal_epoch,
                     admission_token: admitted.admission_token,
-                    is_initiator,
+                    is_initiator: admitted.is_initiator,
                 })
             }
             Some(v2::admit_v2_response::Result::Error(error)) => {

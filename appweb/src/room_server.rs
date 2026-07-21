@@ -60,7 +60,8 @@ struct V2JoinParameters {
     epoch: String,
     wss_url: String,
     admission_token: String,
-    is_initiator: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_initiator: Option<bool>,
 }
 
 impl RoomServer {
@@ -318,7 +319,11 @@ async fn v2_join(
                         client_id: client_id.to_string(),
                         room_id: roomid,
                         room_link: params.room_link,
-                        mode: "p2p",
+                        mode: match admission.mode {
+                            signaling_proto::v2::RoomMode::P2p => "p2p",
+                            signaling_proto::v2::RoomMode::Sfu => "sfu",
+                            _ => unreachable!("gRPC authority filters transition modes"),
+                        },
                         epoch: admission.signal_epoch.to_string(),
                         wss_url: params.wss_url,
                         admission_token: admission.admission_token,
@@ -569,9 +574,10 @@ mod tests {
             let is_initiator = clients.is_empty();
             clients.push((client_id.clone(), Vec::new()));
             Ok(V2Admission {
+                mode: signaling_proto::v2::RoomMode::P2p,
                 signal_epoch: 0,
                 admission_token: format!("token-{room_id}-{client_id}"),
-                is_initiator,
+                is_initiator: Some(is_initiator),
             })
         }
         async fn remove_v2(&self, room_id: u64, client_id: u64, _: String) -> Result<(), String> {

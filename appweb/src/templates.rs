@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-/// The two parsed page templates (`index_template.html`, `full_template.html`).
+/// The parsed page templates, including the SFU grid partial.
 ///
 /// Unlike the Go port — which rewrote the AppRTC Jinja2 constructs into Go
 /// `html/template` syntax with a `strings.Replacer` (`jinjaToGo`) because Go has
@@ -21,7 +21,8 @@ impl Templates {
         let dir = Path::new(web_root).join("html");
         let index = fs::read_to_string(dir.join("index_template.html"))?;
         let full = fs::read_to_string(dir.join("full_template.html"))?;
-        Ok(Self::from_sources(index, full)?)
+        let grid = fs::read_to_string(dir.join("grid_template.html"))?;
+        Ok(Self::from_sources_with_grid(index, full, grid)?)
     }
 
     /// Parse the templates from in-memory sources.
@@ -33,10 +34,23 @@ impl Templates {
     /// literals (`&#x2f;` is not decoded in raw-text `<script>` content). Escaping
     /// exactly like Jinja2/markupsafe instead keeps those URLs intact.
     fn from_sources(index: String, full: String) -> Result<Self, minijinja::Error> {
+        Self::from_sources_with_grid(
+            index,
+            full,
+            "<div id=\"sfu-grid\" class=\"sfu-grid hidden\"></div>".into(),
+        )
+    }
+
+    fn from_sources_with_grid(
+        index: String,
+        full: String,
+        grid: String,
+    ) -> Result<Self, minijinja::Error> {
         let mut env = Environment::new();
         env.set_auto_escape_callback(|_| AutoEscape::None);
         env.add_template_owned("index", index)?;
         env.add_template_owned("full", full)?;
+        env.add_template_owned("grid", grid)?;
         Ok(Self { env })
     }
 
@@ -203,6 +217,7 @@ mod tests {
         std::fs::create_dir_all(root.join("html")).unwrap();
         std::fs::write(root.join("html/index_template.html"), "index").unwrap();
         std::fs::write(root.join("html/full_template.html"), "full").unwrap();
+        std::fs::write(root.join("html/grid_template.html"), "grid").unwrap();
         let templates = Templates::load(root.to_str().unwrap()).unwrap();
         assert_eq!(
             templates.render_index(&RoomParameters::default()).unwrap(),

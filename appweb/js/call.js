@@ -27,6 +27,7 @@ var Call = function(params) {
   this.channel_.onerror = this.onError_.bind(this);
 
   this.pcClient_ = null;
+  this.p2pPcClient_ = null;
   this.createPcClientPromise_ = null;
   this.localStream_ = null;
   this.errorMessageQueue_ = [];
@@ -37,6 +38,7 @@ var Call = function(params) {
   this.onerror = null;
   this.oniceconnectionstatechange = null;
   this.onlocalstreamadded = null;
+  this.onmodechange = null;
   this.onnewicecandidate = null;
   this.onremotehangup = null;
   this.onremotesdpset = null;
@@ -56,6 +58,10 @@ Call.prototype.requestMediaAndIceServers_ = function() {
 
 Call.prototype.isInitiator = function() {
   return this.params_.isInitiator;
+};
+
+Call.prototype.getMode = function() {
+  return this.params_.mode || 'p2p';
 };
 
 Call.prototype.start = function(roomId) {
@@ -95,6 +101,10 @@ Call.prototype.hangup = function(async) {
     this.pcClient_.close();
     this.pcClient_ = null;
     this.createPcClientPromise_ = null;
+  }
+  if (this.p2pPcClient_) {
+    this.p2pPcClient_.close();
+    this.p2pPcClient_ = null;
   }
 
   // Remove membership before closing signaling. V1 then sends its legacy BYE;
@@ -274,6 +284,10 @@ Call.prototype.connectToRoom_ = function(roomId) {
           this.params_.admissionToken = roomParams.admission_token;
           this.channel_.configureV2(
               this.params_.admissionToken, this.params_.signalEpoch);
+          if (this.params_.mode === 'sfu') {
+            this.params_.sfuMode = true;
+            this.params_.isInitiator = true;
+          }
         }
       }.bind(this)).catch(function(error) {
         this.onError_('Room server join error: ' + error.message);
@@ -286,12 +300,24 @@ Call.prototype.connectToRoom_ = function(roomId) {
         this.params_.roomId, this.params_.clientId).then(function(control) {
       if (control && control.control === 'registered') {
         this.params_.signalEpoch = control.epoch;
-        this.params_.isInitiator = control.is_initiator === true;
+        this.params_.mode = control.mode || this.params_.mode;
+        if (this.params_.mode === 'sfu') {
+          this.params_.sfuMode = true;
+          this.params_.isInitiator = true;
+        } else {
+          this.params_.isInitiator = control.is_initiator === true;
+        }
       }
       // V2 waits for the authoritative registered snapshot before allowing
       // offer/answer/candidate production.
       return Promise.all([this.getIceServersPromise_, this.getMediaPromise_])
           .then(function() {
+            if (this.params_.mode === 'sfu') {
+              this.params_.mode = 'upgrading';
+              if (this.onmodechange) {
+                this.onmodechange('upgrading');
+              }
+            }
             this.startSignaling_();
           }.bind(this));
     }.bind(this));
@@ -434,6 +460,10 @@ Call.prototype.createPcClient_ = function() {
   this.pcClient_.onremotestreamadded = this.onremotestreamadded;
   this.pcClient_.onsignalingstatechange = this.onsignalingstatechange;
   this.pcClient_.oniceconnectionstatechange = this.oniceconnectionstatechange;
+  if (this.params_.sfuMode) {
+    this.pcClient_.oniceconnectionstatechange =
+        this.onSfuIceConnectionStateChange_.bind(this);
+  }
   this.pcClient_.onnewicecandidate = this.onnewicecandidate;
   this.pcClient_.onerror = this.onerror;
   trace('Created PeerConnectionClient');
@@ -521,6 +551,53 @@ Call.prototype.onRecvSignalingControl_ = function(control) {
     } else {
       this.onRemoteHangup();
     }
+  } else if (control.control === 'sfu-upgrade') {
+    this.startSfuUpgrade_();
+  } else if (control.control === 'room-failed') {
+    this.onError_('SFU room failed: ' + (control.reason || 'worker unavailable'));
+  }
+};
+
+Call.prototype.startSfuUpgrade_ = function() {
+  if (this.params_.sfuMode || this.params_.mode === 'upgrading') {
+    return;
+  }
+  trace('Starting P2P to SFU upgrade at epoch ' + this.params_.signalEpoch + '.');
+  this.params_.mode = 'upgrading';
+  this.params_.sfuMode = true;
+  this.params_.isInitiator = true;
+  this.p2pPcClient_ = this.pcClient_;
+  this.pcClient_ = null;
+  this.createPcClientPromise_ = null;
+  if (this.onmodechange) {
+    this.onmodechange('upgrading');
+  }
+  this.startTime = window.performance.now();
+  this.maybeCreatePcClientAsync_().then(function() {
+    if (this.localStream_) {
+      this.pcClient_.addStream(this.localStream_);
+    }
+    this.pcClient_.startAsCaller(this.params_.offerOptions);
+  }.bind(this)).catch(function(error) {
+    this.onError_('SFU upgrade failed: ' + error.message);
+  }.bind(this));
+};
+
+Call.prototype.onSfuIceConnectionStateChange_ = function() {
+  var states = this.pcClient_ && this.pcClient_.getPeerConnectionStates();
+  if (states && (states.iceConnectionState === 'connected' ||
+      states.iceConnectionState === 'completed')) {
+    this.params_.mode = 'sfu';
+    if (this.p2pPcClient_) {
+      this.p2pPcClient_.close();
+      this.p2pPcClient_ = null;
+    }
+    if (this.onmodechange) {
+      this.onmodechange('sfu');
+    }
+  }
+  if (this.oniceconnectionstatechange) {
+    this.oniceconnectionstatechange();
   }
 };
 
