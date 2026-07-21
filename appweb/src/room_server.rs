@@ -185,28 +185,24 @@ async fn v2_room_page(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let room_id = match canonical_u64(&roomid) {
-        Some(room_id) => room_id,
-        None => return axum::Json(json!({ "result": "INVALID_ROOM_ID" })).into_response(),
-    };
+    if canonical_u64(&roomid).is_none() {
+        return axum::Json(json!({ "result": "INVALID_ROOM_ID" })).into_response();
+    }
     let (host, url) = match server.request_context(&headers, &uri) {
         Ok(context) => context,
         Err(error) => return server.http_error(error),
     };
-    let occupancy = match server.inner.authority.occupancy_v2(room_id).await {
-        Ok(occupancy) => occupancy,
-        Err(error) => return server.http_error(error),
-    };
+    // V2 rooms are NOT capped at two. The third join upgrades P2P -> SFU (design
+    // sec 4.2), so the room page always serves the app rather than the "full"
+    // template. The V1 two-person cap must not leak into V2, or the third browser
+    // is shown "this room is full" and never POSTs /v2/join, so the upgrade never
+    // starts. Real capacity limits (no SFU worker / SFU exhausted) are decided at
+    // /v2/join and surfaced to the client as a join error, never as a full page.
     let params = server
         .inner
         .config
         .build_v2_room_parameters(host, &url, &roomid);
-    let rendered = if occupancy >= MAX_ROOM_CAPACITY {
-        server.inner.templates.render_full(&params)
-    } else {
-        server.inner.templates.render_index(&params)
-    };
-    match rendered {
+    match server.inner.templates.render_index(&params) {
         Ok(body) => Html(body).into_response(),
         Err(error) => server.http_error(format!("Failed to render V2 page: {error}")),
     }
@@ -867,5 +863,28 @@ mod tests {
             "",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn v2_room_page_never_shows_full_so_the_third_join_can_upgrade() {
+        // The V1 two-person cap must NOT gate a V2 room. At two occupants the page
+        // still serves the app so the third browser can POST /v2/join and trigger the
+        // P2P -> SFU upgrade (design sec 4.2), instead of being shown "this room is
+        // full" and never joining.
+        let app = app();
+        for _ in 0..2 {
+            let joined =
+                json_body(request(&app, Method::POST, "/v2/join/424242", "").await).await;
+            assert_eq!(joined["result"], "SUCCESS");
+        }
+        let page = request(&app, Method::GET, "/v2/r/424242", "").await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("this room is full"),
+            "V2 room page must not gate at the V1 two-person capacity"
+        );
+        assert!(body.contains("signalingVersion: 2"));
     }
 }
