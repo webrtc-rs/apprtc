@@ -873,8 +873,7 @@ mod tests {
         // full" and never joining.
         let app = app();
         for _ in 0..2 {
-            let joined =
-                json_body(request(&app, Method::POST, "/v2/join/424242", "").await).await;
+            let joined = json_body(request(&app, Method::POST, "/v2/join/424242", "").await).await;
             assert_eq!(joined["result"], "SUCCESS");
         }
         let page = request(&app, Method::GET, "/v2/r/424242", "").await;

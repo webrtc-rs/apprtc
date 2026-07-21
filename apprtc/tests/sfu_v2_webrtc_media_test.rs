@@ -8,7 +8,7 @@ mod common;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use common::sfu_v2::{Peer, connected, drive, peer, upgrade_three};
+use common::sfu_v2::{Peer, drive, peer, upgrade_three};
 use common::wait_for_server;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::rtp::Packet;
@@ -19,11 +19,11 @@ use rtc::rtp_transceiver::rtp_sender::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use webrtc::media_stream::track_local::TrackLocal;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
-use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState, RTCSessionDescription};
+use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 use webrtc::rtp_transceiver::{RTCRtpTransceiverDirection, RTCRtpTransceiverInit};
 
 /// Reject an SDP whose BUNDLE m-lines assign one RTP-header-extension id to two different
@@ -107,20 +107,21 @@ fn keep_publishing(track: Arc<TrackLocalStaticRTP>, ssrc: u32) -> tokio::task::J
 
 struct Active {
     pc: Arc<dyn PeerConnection>,
-    states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     tracks: mpsc::UnboundedReceiver<Arc<dyn webrtc::media_stream::track_remote::TrackRemote>>,
     offers: mpsc::UnboundedReceiver<RTCSessionDescription>,
     _publisher: tokio::task::JoinHandle<()>,
     _track: Arc<TrackLocalStaticRTP>,
 }
 
-// Reproduction harness for the SFU multi-party media renegotiation bug. Run explicitly with
+// Reproduction harness for the SFU multi-party media forwarding path. Run explicitly with
 // `cargo test -p apprtc --test sfu_v2_webrtc_media_test -- --ignored --nocapture` against a
-// live signaling + sfu + appweb stack. Ignored by default because the SFU forwarding path
-// does not yet complete: with three simultaneous publishers the worker's subscribe offer for
-// an already-published peer races ahead of a client's own publish answer (glare), and the
-// perfect-negotiation rollback that resolves it does not yet reconnect. See task notes.
-#[ignore = "reproduces the unfixed SFU multi-party media renegotiation failure"]
+// live signaling + sfu + appweb stack. All three clients now upgrade, connect, and publish to
+// the SFU through WebRTC perfect negotiation (the polite-peer rollback + `negotiationneeded`
+// re-publish that recovers from the worker's glare rejection). It is ignored by default
+// because the forwarding step does not yet complete: a publisher's track is not delivered to
+// the other members (no forwarded `on_track`), so the assertion below still fails. That is the
+// next fix, and this test pins it plus the subscribe-offer SDP validity check.
+#[ignore = "SFU multi-party forwarding incomplete: members connect but tracks are not forwarded yet"]
 #[tokio::test]
 async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<()> {
     wait_for_server().await?;
@@ -128,6 +129,11 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
 
     let members = upgrade_three(room_id).await?;
 
+    // Bring the publishers up one at a time: each member's SFU peer connection must reach
+    // Connected before the next one publishes. This builds the forwarding graph incrementally
+    // and keeps a subscribe offer (which the SFU emits as soon as a new publisher appears)
+    // from racing into a peer whose own publish offer is still unanswered — the glare that a
+    // real browser resolves with perfect-negotiation rollback.
     let mut actives: Vec<Active> = Vec::new();
     for (index, member) in members.into_iter().enumerate() {
         let Peer {
@@ -135,6 +141,7 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
             states,
             outgoing,
             tracks,
+            negotiation,
         } = peer().await?;
         let ssrc = 0x1000_0000 + index as u32 + 1;
         let track = video_track(ssrc, &member.client_id.to_string());
@@ -148,23 +155,30 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
         )
         .await?;
         let (offers_tx, offers_rx) = mpsc::unbounded_channel();
-        drive(member.ws, pc.clone(), "1".to_owned(), outgoing, offers_tx);
+        let (connected_tx, connected_rx) = oneshot::channel();
+        drive(
+            member.ws,
+            pc.clone(),
+            "1".to_owned(),
+            outgoing,
+            offers_tx,
+            states,
+            negotiation,
+            connected_tx,
+        );
         let publisher = keep_publishing(track.clone(), ssrc);
+        timeout(Duration::from_secs(30), connected_rx)
+            .await
+            .with_context(|| format!("member {index} connect timed out"))?
+            .with_context(|| format!("member {index} publish task ended"))?
+            .with_context(|| format!("member {index} did not connect to the SFU"))?;
         actives.push(Active {
             pc,
-            states,
             tracks,
             offers: offers_rx,
             _publisher: publisher,
             _track: track,
         });
-    }
-
-    // Every member's SFU peer connection connects.
-    for (index, active) in actives.iter_mut().enumerate() {
-        connected(&mut active.states)
-            .await
-            .with_context(|| format!("member {index} did not connect to the SFU"))?;
     }
 
     // Every member receives the two other publishers' forwarded tracks.

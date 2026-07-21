@@ -8,18 +8,17 @@
 mod common;
 
 use anyhow::{Context, Result, anyhow};
-use common::sfu_v2::{Peer, connected, drive, peer, upgrade_three};
+use common::sfu_v2::{Peer, drive, peer, upgrade_three};
 use common::wait_for_server;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
-use webrtc::peer_connection::{PeerConnection, RTCPeerConnectionState};
+use webrtc::peer_connection::PeerConnection;
 
 struct Active {
     pc: Arc<dyn PeerConnection>,
-    states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     data_channel: Arc<dyn DataChannel>,
 }
 
@@ -32,28 +31,39 @@ async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()
 
     // Each member publishes to the SFU with its own data channel.
     let mut actives: Vec<Active> = Vec::new();
+    let mut connections = Vec::new();
     for member in members {
         let Peer {
             pc,
             states,
             outgoing,
             tracks: _,
+            negotiation,
         } = peer().await?;
         let data_channel = pc.create_data_channel("sfu-v2-test", None).await?;
         // Data-channel-only publish never draws a subscribe offer; sink is unused.
         let (offers_tx, _offers_rx) = mpsc::unbounded_channel();
-        drive(member.ws, pc.clone(), "1".to_owned(), outgoing, offers_tx);
-        actives.push(Active {
-            pc,
+        let (connected_tx, connected_rx) = oneshot::channel();
+        drive(
+            member.ws,
+            pc.clone(),
+            "1".to_owned(),
+            outgoing,
+            offers_tx,
             states,
-            data_channel,
-        });
+            negotiation,
+            connected_tx,
+        );
+        actives.push(Active { pc, data_channel });
+        connections.push(connected_rx);
     }
 
     // All three peer connections connect to the SFU.
-    for (index, active) in actives.iter_mut().enumerate() {
-        connected(&mut active.states)
+    for (index, connected_rx) in connections.into_iter().enumerate() {
+        timeout(Duration::from_secs(30), connected_rx)
             .await
+            .with_context(|| format!("member {index} connect timed out"))?
+            .with_context(|| format!("member {index} publish task ended"))?
             .with_context(|| format!("member {index} did not connect to the SFU"))?;
     }
 

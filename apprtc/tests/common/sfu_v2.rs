@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use webrtc::media_stream::track_remote::TrackRemote;
@@ -41,6 +41,7 @@ pub struct Events {
     pub states: mpsc::UnboundedSender<RTCPeerConnectionState>,
     pub outgoing: mpsc::UnboundedSender<String>,
     pub tracks: mpsc::UnboundedSender<Arc<dyn TrackRemote>>,
+    pub negotiation: mpsc::UnboundedSender<()>,
 }
 
 #[async_trait]
@@ -61,6 +62,10 @@ impl PeerConnectionEventHandler for Events {
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
         let _ = self.tracks.send(track);
     }
+
+    async fn on_negotiation_needed(&self) {
+        let _ = self.negotiation.send(());
+    }
 }
 
 pub struct Peer {
@@ -68,6 +73,7 @@ pub struct Peer {
     pub states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     pub outgoing: mpsc::UnboundedReceiver<String>,
     pub tracks: mpsc::UnboundedReceiver<Arc<dyn TrackRemote>>,
+    pub negotiation: mpsc::UnboundedReceiver<()>,
 }
 
 /// Build a peer connection wired to `Events`. The caller adds its data channel or local
@@ -80,6 +86,7 @@ pub async fn peer() -> Result<Peer> {
     let (states_tx, states_rx) = mpsc::unbounded_channel();
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     let (tracks_tx, tracks_rx) = mpsc::unbounded_channel();
+    let (negotiation_tx, negotiation_rx) = mpsc::unbounded_channel();
     let pc = PeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(media)
@@ -88,6 +95,7 @@ pub async fn peer() -> Result<Peer> {
             states: states_tx,
             outgoing: out_tx,
             tracks: tracks_tx,
+            negotiation: negotiation_tx,
         }))
         .with_runtime(runtime)
         .with_udp_addrs(vec!["127.0.0.1:0".to_owned()])
@@ -98,6 +106,7 @@ pub async fn peer() -> Result<Peer> {
         states: states_rx,
         outgoing: out_rx,
         tracks: tracks_rx,
+        negotiation: negotiation_rx,
     })
 }
 
@@ -152,8 +161,7 @@ pub async fn upgrade_three(room_id: u64) -> Result<[Member; 3]> {
     assert_eq!(second["params"]["mode"], "p2p", "second join should be P2P");
     let (first_id, first_token) = parse_member(&first)?;
     let (second_id, second_token) = parse_member(&second)?;
-    let (mut first_ws, first_registered) =
-        ws_register_v2(room_id, first_id, &first_token).await?;
+    let (mut first_ws, first_registered) = ws_register_v2(room_id, first_id, &first_token).await?;
     let (mut second_ws, second_registered) =
         ws_register_v2(room_id, second_id, &second_token).await?;
     assert_eq!(first_registered["mode"], "p2p");
@@ -238,7 +246,34 @@ async fn send_candidate(writer: &mut Writer, epoch: &str, candidate_json: &str) 
     send_inner(writer, epoch, inner).await
 }
 
-/// Apply one inbound `{msg}` frame from the SFU. Returns the inner value for inspection.
+/// Create and send a publish offer (invoked on `negotiationneeded`). No-op unless the peer
+/// connection is stable, so a re-publish waits until an in-flight subscribe answer settles.
+async fn publish(
+    pc: &Arc<dyn PeerConnection>,
+    writer: &mut Writer,
+    epoch: &str,
+    making_offer: &mut bool,
+) -> Result<()> {
+    if pc.pending_local_description().await.is_some() {
+        return Ok(());
+    }
+    *making_offer = true;
+    let result = async {
+        let offer = pc.create_offer(None).await?;
+        pc.set_local_description(offer.clone()).await?;
+        send_sdp(writer, epoch, &offer, None).await
+    }
+    .await;
+    *making_offer = false;
+    result
+}
+
+/// Apply one inbound `{msg}` frame from the SFU, implementing WebRTC perfect negotiation as
+/// the polite peer. A publish answer and trickle candidates apply directly; a subscribe offer
+/// that collides with our own outstanding publish offer is resolved by rolling that publish
+/// back, answering the worker, and letting `negotiationneeded` re-issue the publish — the
+/// exact glare recovery the SFU relies on (design sec 4.2).
+#[allow(clippy::too_many_arguments)]
 async fn apply_inbound(
     pc: &Arc<dyn PeerConnection>,
     writer: &mut Writer,
@@ -247,6 +282,7 @@ async fn apply_inbound(
     remote_set: &mut bool,
     pending: &mut Vec<RTCIceCandidateInit>,
     seen_offers: &mpsc::UnboundedSender<RTCSessionDescription>,
+    making_offer: bool,
 ) -> Result<()> {
     let Some(inner) = serde_json::from_str::<Value>(text)
         .ok()
@@ -259,6 +295,10 @@ async fn apply_inbound(
     };
     match value.get("type").and_then(Value::as_str) {
         Some("answer") => {
+            // Answer to our publish offer. Ignore a stray answer when we have no local offer.
+            if pc.pending_local_description().await.is_none() {
+                return Ok(());
+            }
             let sdp: RTCSessionDescription = serde_json::from_value(value)?;
             pc.set_remote_description(sdp).await?;
             *remote_set = true;
@@ -267,14 +307,16 @@ async fn apply_inbound(
             }
         }
         Some("offer") => {
-            // A subscribe offer from the SFU. Report it for SDP validation, then answer,
-            // echoing the worker requestid. Perfect negotiation: this client is the polite
-            // peer, so if our own publish offer is still pending (glare), roll it back before
-            // applying the worker's offer — mirroring the browser's `answerSfuOffer_`.
-            let request_id = value.get("requestid").and_then(Value::as_str).map(str::to_owned);
+            let request_id = value
+                .get("requestid")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let sdp: RTCSessionDescription = serde_json::from_value(value)?;
             let _ = seen_offers.send(sdp.clone());
-            if pc.pending_local_description().await.is_some() {
+            // Polite peer: on a glare collision, roll our publish offer back before applying
+            // the worker's subscribe offer.
+            let collision = making_offer || pc.pending_local_description().await.is_some();
+            if collision {
                 pc.set_local_description(RTCSessionDescription::rollback(None)?)
                     .await?;
             }
@@ -306,38 +348,63 @@ async fn apply_inbound(
 }
 
 /// Publish to the SFU and service its answers, subscribe offers, and trickle candidates for
-/// the peer connection's lifetime. `seen_offers` receives every subscribe offer SDP the SFU
-/// sends, for validation.
+/// the peer connection's lifetime, as a WebRTC perfect-negotiation polite peer. `seen_offers`
+/// receives every subscribe offer SDP the SFU sends, for validation. `connected_tx` fires when
+/// the peer connection reaches Connected. The initial publish and every re-publish are driven
+/// by `negotiation` (the peer connection's `negotiationneeded` signal).
+#[allow(clippy::too_many_arguments)]
 pub fn drive(
     ws: WsStream,
     pc: Arc<dyn PeerConnection>,
     epoch: String,
     mut outgoing: mpsc::UnboundedReceiver<String>,
     seen_offers: mpsc::UnboundedSender<RTCSessionDescription>,
+    mut states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
+    mut negotiation: mpsc::UnboundedReceiver<()>,
+    connected_tx: oneshot::Sender<Result<()>>,
 ) {
     tokio::spawn(async move {
         let (mut writer, mut reader): (Writer, SplitStream<WsStream>) = ws.split();
         let mut remote_set = false;
         let mut pending: Vec<RTCIceCandidateInit> = Vec::new();
+        let mut making_offer = false;
+        let mut connected_tx = Some(connected_tx);
 
-        // Publish offer.
-        let offer = match pc.create_offer(None).await {
-            Ok(offer) => offer,
-            Err(error) => {
-                eprintln!("create publish offer failed: {error}");
-                return;
+        // Kick off the initial publish. `negotiationneeded` also fires for an added media
+        // transceiver (and again after a glare rollback) — `publish` is a no-op while a local
+        // offer is already pending, so the two paths never double-offer.
+        if let Err(error) = publish(&pc, &mut writer, &epoch, &mut making_offer).await {
+            if let Some(tx) = connected_tx.take() {
+                let _ = tx.send(Err(anyhow!("initial publish failed: {error}")));
             }
-        };
-        if let Err(error) = pc.set_local_description(offer.clone()).await {
-            eprintln!("set local publish offer failed: {error}");
-            return;
-        }
-        if send_sdp(&mut writer, &epoch, &offer, None).await.is_err() {
             return;
         }
 
         loop {
             tokio::select! {
+                needed = negotiation.recv() => {
+                    if needed.is_some()
+                        && let Err(error) =
+                            publish(&pc, &mut writer, &epoch, &mut making_offer).await
+                    {
+                        eprintln!("publish failed: {error}");
+                    }
+                }
+                state = states.recv() => match state {
+                    Some(RTCPeerConnectionState::Connected) => {
+                        if let Some(tx) = connected_tx.take() {
+                            let _ = tx.send(Ok(()));
+                        }
+                    }
+                    Some(RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed) => {
+                        if let Some(tx) = connected_tx.take() {
+                            let _ = tx.send(Err(anyhow!("publish peer connection failed")));
+                        }
+                        break;
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
                 outbound = outgoing.recv() => {
                     let Some(candidate_json) = outbound else { break };
                     if send_candidate(&mut writer, &epoch, &candidate_json).await.is_err() {
@@ -348,7 +415,7 @@ pub fn drive(
                     Some(Ok(Message::Text(text))) => {
                         if let Err(error) = apply_inbound(
                             &pc, &mut writer, &epoch, &text,
-                            &mut remote_set, &mut pending, &seen_offers,
+                            &mut remote_set, &mut pending, &seen_offers, making_offer,
                         ).await {
                             eprintln!("apply inbound failed: {error}");
                         }
