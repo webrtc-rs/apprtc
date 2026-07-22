@@ -92,7 +92,9 @@ single Collider event loop, serializes every browser and authority operation, fi
 outputs back to the WebSocket or gRPC caller. Tasks sleep on async I/O, deadlines, or shutdown without polling.
 
 Successful V1 registration is intentionally silent, and a disconnected registered client remains eligible to
-reconnect for 10 seconds before its membership is removed.
+reconnect for 10 seconds before its membership is removed. The reconnect grace applies to P2P (V1 and V2) members
+only; an SFU member whose WebSocket drops is treated as an immediate leave so its forwarded media stops and the
+other participants' grid tiles are removed without delay.
 
 ## Current P2P behavior
 
@@ -106,7 +108,7 @@ V1 preserves the legacy AppRTC contract:
 - The second `/join` response returns queued messages in `params.messages`.
 - The stock AppRTC asymmetric signaling flow is preserved: the initiator sends early signaling through `/message`, while
   the callee normally sends through WebSocket.
-- A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately.
+- A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately (P2P only; SFU members leave immediately on disconnect).
 - Root-path and `/_internal` POST/DELETE fallback routes are both supported.
 - V1 identifiers are not restricted to numeric values.
 

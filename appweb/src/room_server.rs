@@ -731,7 +731,7 @@ mod tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("signalingVersion: 2"));
         assert!(body.contains("id=\"signaling-v2-checkbox\""));
-        assert!(!body.contains("id=\"signaling-v2-checkbox\" checked"));
+        assert!(body.contains("id=\"signaling-v2-checkbox\" checked"));
 
         let params = json_body(request(&app, Method::GET, "/v2/params", "").await).await;
         assert!(params.get("wss_post_url").is_none());
@@ -769,7 +769,7 @@ mod tests {
         let root_body = String::from_utf8_lossy(&root_body);
         assert!(root_body.contains("signalingVersion: 1"));
         assert!(root_body.contains("id=\"signaling-v2-checkbox\""));
-        assert!(!root_body.contains("id=\"signaling-v2-checkbox\" checked"));
+        assert!(root_body.contains("id=\"signaling-v2-checkbox\" checked"));
 
         let script = request(&app, Method::GET, "/js/call.js", "").await;
         assert_eq!(script.status(), StatusCode::OK);

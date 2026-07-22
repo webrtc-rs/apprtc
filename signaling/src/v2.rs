@@ -447,14 +447,26 @@ impl RoomTable {
     }
 
     pub fn deregister(&mut self, now: Instant, room_id: RoomId, client_id: ClientId) {
-        if let Some(member) = self
-            .rooms
-            .get_mut(&room_id)
-            .and_then(|room| room.members.get_mut(&client_id))
+        let reconnect_grace = self.reconnect_grace;
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return;
+        };
+        // Match the chat.rs example: an SFU member whose WebSocket drops (browser close,
+        // refresh, crash) is treated as an immediate leave — no reconnect grace — so the SFU
+        // stops forwarding its media and the other clients' grid tiles prune right away.
+        // A zero deadline fires on the very next `handle_timeout` tick. P2P and upgrading
+        // members keep the reconnect grace so a quick refresh can rejoin without collapsing
+        // the call or prematurely promoting the survivor.
+        let grace = if room.mode == RoomMode::Sfu {
+            Duration::ZERO
+        } else {
+            reconnect_grace
+        };
+        if let Some(member) = room.members.get_mut(&client_id)
             && member.registered
         {
             member.registered = false;
-            member.reconnect_deadline = Some(now + self.reconnect_grace);
+            member.reconnect_deadline = Some(now + grace);
         }
     }
 
