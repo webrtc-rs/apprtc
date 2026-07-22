@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpHeaderExtensionCapability, RtpCodecKind};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,8 +76,32 @@ pub struct Peer {
 /// Build a peer connection wired to `Events`. The caller adds its data channel or local
 /// tracks before calling [`drive`].
 pub async fn peer() -> Result<Peer> {
+    build_peer(|_media| Ok(())).await
+}
+
+/// A peer that also registers `ssrc-audio-level` on audio — the way a real browser (Chrome)
+/// does. Registering it before the default extensions gives this peer's audio m-line a low
+/// header-extension id, which collides with the SFU's forwarded video `sdes:mid` (also a low
+/// id) once bundled — reproducing Chrome's "BUNDLE group contains a codec collision for header
+/// extension id" `setLocalDescription` failure.
+pub async fn browser_peer() -> Result<Peer> {
+    build_peer(|media| {
+        media.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: "urn:ietf:params:rtp-hdrext:ssrc-audio-level".to_owned(),
+            },
+            RtpCodecKind::Audio,
+            None,
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+async fn build_peer(configure_media: impl FnOnce(&mut MediaEngine) -> Result<()>) -> Result<Peer> {
     let mut media = MediaEngine::default();
     media.register_default_codecs()?;
+    configure_media(&mut media)?;
     let registry = register_default_interceptors(Registry::new(), &mut media)?;
     let runtime = default_runtime().ok_or_else(|| anyhow!("no async runtime"))?;
     let (states_tx, states_rx) = mpsc::unbounded_channel();
@@ -264,16 +289,21 @@ fn dump_sdp(label: &str, sdp: &str) {
 
 /// Create an offer covering the peer connection's current transceivers and data channels, set
 /// it as the local description, and send it. Used for the initial publish and for the
-/// re-publish that follows a polite-peer glare rollback.
+/// re-publish that follows a polite-peer glare rollback. Each local description is also reported
+/// to `local_descriptions` (when set) so a test can assert it is valid for a real browser.
 async fn send_offer(
     pc: &Arc<dyn PeerConnection>,
     writer: &mut Writer,
     epoch: &str,
     label: &str,
+    local_descriptions: Option<&mpsc::UnboundedSender<RTCSessionDescription>>,
 ) -> Result<()> {
     let offer = pc.create_offer(None).await?;
     dump_sdp(label, &offer.sdp);
     pc.set_local_description(offer.clone()).await?;
+    if let Some(sink) = local_descriptions {
+        let _ = sink.send(offer.clone());
+    }
     send_sdp(writer, epoch, &offer, None).await
 }
 
@@ -282,6 +312,7 @@ async fn send_offer(
 /// re-offer that collides with our own outstanding offer (glare), roll our offer back, apply the
 /// SFU's, answer it, then re-issue our publish so it settles onto its own m-line; and buffer
 /// trickle candidates until a remote description exists.
+#[allow(clippy::too_many_arguments)]
 async fn apply_inbound(
     pc: &Arc<dyn PeerConnection>,
     writer: &mut Writer,
@@ -290,6 +321,7 @@ async fn apply_inbound(
     remote_set: &mut bool,
     pending: &mut Vec<RTCIceCandidateInit>,
     seen_offers: &mpsc::UnboundedSender<RTCSessionDescription>,
+    local_descriptions: Option<&mpsc::UnboundedSender<RTCSessionDescription>>,
 ) -> Result<()> {
     let Some(inner) = serde_json::from_str::<Value>(text)
         .ok()
@@ -336,11 +368,14 @@ async fn apply_inbound(
             }
             let answer = pc.create_answer(None).await?;
             pc.set_local_description(answer.clone()).await?;
+            if let Some(sink) = local_descriptions {
+                let _ = sink.send(answer.clone());
+            }
             send_sdp(writer, epoch, &answer, request_id.as_deref()).await?;
             // Re-issue the local offer we rolled back so our own publish finishes negotiating on
             // its own m-line, additively alongside the track we just subscribed to.
             if glare {
-                send_offer(pc, writer, epoch, "REPUBLISH OFFER").await?;
+                send_offer(pc, writer, epoch, "REPUBLISH OFFER", local_descriptions).await?;
             }
         }
         Some("candidate") => {
@@ -376,6 +411,9 @@ pub struct DriveConfig {
     pub states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
     pub connected_tx: oneshot::Sender<Result<()>>,
     pub publish_track: Option<Arc<dyn TrackLocal>>,
+    /// When set, receives every local description (publish offer, re-publish offer, and answer)
+    /// this client sets — so a test can assert each one is valid for a real browser.
+    pub local_descriptions: Option<mpsc::UnboundedSender<RTCSessionDescription>>,
 }
 
 pub fn drive(config: DriveConfig) {
@@ -389,6 +427,7 @@ pub fn drive(config: DriveConfig) {
             mut states,
             connected_tx,
             publish_track,
+            local_descriptions,
         } = config;
         let (mut writer, mut reader): (Writer, SplitStream<WsStream>) = ws.split();
         let mut remote_set = false;
@@ -411,7 +450,14 @@ pub fn drive(config: DriveConfig) {
                 )
                 .await?;
             }
-            send_offer(&pc, &mut writer, &epoch, "PUBLISH OFFER").await
+            send_offer(
+                &pc,
+                &mut writer,
+                &epoch,
+                "PUBLISH OFFER",
+                local_descriptions.as_ref(),
+            )
+            .await
         };
         if let Err(error) = first_offer.await {
             if let Some(tx) = connected_tx.take() {
@@ -448,6 +494,7 @@ pub fn drive(config: DriveConfig) {
                         if let Err(error) = apply_inbound(
                             &pc, &mut writer, &epoch, &text,
                             &mut remote_set, &mut pending, &seen_offers,
+                            local_descriptions.as_ref(),
                         ).await {
                             eprintln!("apply inbound failed: {error}");
                         }

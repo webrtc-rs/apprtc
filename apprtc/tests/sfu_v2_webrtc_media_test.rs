@@ -155,6 +155,7 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
             states,
             connected_tx,
             publish_track: Some(track.clone() as Arc<dyn TrackLocal>),
+            local_descriptions: None,
         });
         let publisher = keep_publishing(track.clone(), ssrc);
         timeout(Duration::from_secs(30), connected_rx)

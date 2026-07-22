@@ -53,6 +53,7 @@ async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()
             states,
             connected_tx,
             publish_track: None,
+            local_descriptions: None,
         });
         actives.push(Active { pc, data_channel });
         connections.push(connected_rx);
