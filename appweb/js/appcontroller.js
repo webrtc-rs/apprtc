@@ -164,6 +164,7 @@ AppController.prototype.createCall_ = function() {
   this.call_.onremotehangup = this.onRemoteHangup_.bind(this);
   this.call_.onremotesdpset = this.onRemoteSdpSet_.bind(this);
   this.call_.onremotestreamadded = this.onRemoteStreamAdded_.bind(this);
+  this.call_.onremotetrack = this.onSfuTrackAdded_.bind(this);
   this.call_.onlocalstreamadded = this.onLocalStreamAdded_.bind(this);
   this.call_.onmodechange = this.onModeChange_.bind(this);
 
@@ -283,16 +284,12 @@ AppController.prototype.waitForRemoteVideo_ = function() {
 };
 
 AppController.prototype.onRemoteStreamAdded_ = function(stream) {
+  // P2P only: the SFU path is per-track (see onSfuTrackAdded_).
   this.deactivate_(this.sharingDiv_);
   this.displayTurnStatus_('');
   trace('Remote stream added.');
-  if (this.call_.getMode() === 'upgrading' || this.call_.getMode() === 'sfu') {
-    this.addSfuStream_(stream);
-  } else {
-    this.remoteVideo_.srcObject = stream;
-  }
+  this.remoteVideo_.srcObject = stream;
   this.infoBox_.getRemoteTrackIds(stream);
-
 
   if (this.remoteVideoResetTimer_) {
     clearTimeout(this.remoteVideoResetTimer_);
@@ -300,23 +297,98 @@ AppController.prototype.onRemoteStreamAdded_ = function(stream) {
   }
 };
 
-AppController.prototype.addSfuStream_ = function(stream) {
-  var publisher = /^peer-(\d+)-/.exec(stream.id || '');
-  var participantId = publisher ? publisher[1] :
-      (stream.id || ('participant-' + Object.keys(this.sfuTiles_).length));
-  var video = this.sfuTiles_[participantId];
-  if (!video) {
-    var tile = document.createElement('div');
-    tile.className = 'sfu-tile';
-    tile.dataset.participantId = participantId;
-    video = document.createElement('video');
-    video.autoplay = true;
-    video.playsInline = true;
-    tile.appendChild(video);
-    this.sfuGrid_.appendChild(tile);
-    this.sfuTiles_[participantId] = video;
+// Recover the publishing client id from a forwarded track. The SFU stamps each forwarded track's
+// msid with `peer-<clientId>`, so it surfaces here as the received stream id and/or the track id;
+// try both (a peer's audio and video may arrive on different stream ids).
+AppController.prototype.sfuPublisherId_ = function(event) {
+  var ids = [];
+  if (event.streams && event.streams[0]) {
+    ids.push(event.streams[0].id);
   }
-  video.srcObject = stream;
+  if (event.track) {
+    ids.push(event.track.id);
+  }
+  for (var i = 0; i < ids.length; ++i) {
+    var match = /peer-(\d+)/.exec(ids[i] || '');
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+};
+
+// Find (or lazily create) the grid tile that groups one peer's video and audio, keyed by the
+// publishing client id and captioned with it.
+AppController.prototype.getOrCreateSfuTile_ = function(key, publisher) {
+  var tile = this.sfuTiles_[key];
+  if (tile) {
+    return tile;
+  }
+  tile = document.createElement('div');
+  tile.className = 'sfu-tile';
+  tile.dataset.participantId = key;
+  var caption = document.createElement('span');
+  caption.className = 'sfu-caption';
+  caption.textContent = publisher ? ('Peer ' + publisher) : 'Peer';
+  tile.appendChild(caption);
+  this.sfuGrid_.appendChild(tile);
+  this.sfuTiles_[key] = tile;
+  return tile;
+};
+
+// SFU mode: place each forwarded track into its publisher's tile — video fills the tile, audio is
+// a hidden element that only plays. Mirrors the SFU chat sample's per-track grid.
+AppController.prototype.onSfuTrackAdded_ = function(event) {
+  var track = event.track;
+  if (!track) {
+    return;
+  }
+  this.deactivate_(this.sharingDiv_);
+  this.displayTurnStatus_('');
+
+  var domId = 'sfu-media-' + track.id;
+  if (document.getElementById(domId)) {
+    return;
+  }
+  var publisher = this.sfuPublisherId_(event);
+  var key = publisher ||
+      (event.streams && event.streams[0] && event.streams[0].id) || track.id;
+  var tile = this.getOrCreateSfuTile_(key, publisher);
+  var kind = track.kind === 'audio' ? 'audio' : 'video';
+
+  // Replace any existing element of the same kind in this tile (e.g. a re-forwarded track).
+  var previous = tile.querySelector(kind);
+  if (previous) {
+    previous.remove();
+  }
+  var el = document.createElement(kind);
+  el.id = domId;
+  el.autoplay = true;
+  el.playsInline = true;
+  if (kind === 'audio') {
+    el.style.display = 'none';
+  }
+  var media = new MediaStream();
+  media.addTrack(track);
+  el.srcObject = media;
+  tile.appendChild(el);
+
+  var play = function() {
+    el.play().catch(function(error) {
+      trace('SFU media play failed: ' + error);
+    });
+  };
+  el.addEventListener('loadedmetadata', play);
+  play();
+
+  // Drop the tile if the track ends (peer left / stopped publishing).
+  track.addEventListener('ended', function() {
+    el.remove();
+    if (!tile.querySelector('video') && !tile.querySelector('audio')) {
+      tile.remove();
+      delete this.sfuTiles_[key];
+    }
+  }.bind(this));
 };
 
 AppController.prototype.onModeChange_ = function(mode) {

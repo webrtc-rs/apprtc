@@ -240,6 +240,33 @@ label {
   width: 100%;
 }
 
+.sfu-caption {
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  bottom: 6px;
+  color: #fff;
+  font-size: 12px;
+  left: 6px;
+  padding: 2px 6px;
+  position: absolute;
+  z-index: 2;
+}
+
+/* SFU mode only swaps the full-window peer video for the grid. #videos.active gives P2P its own
+   stacking context (via its transform) so the grid — which lives inside #videos — cannot escape
+   to cover the self-view or the control buttons (which sit outside #videos). SFU mode drops the
+   .active transform, so re-establish that context here with isolation, leaving every other
+   element (self-view, #icons) in its P2P position and stacking order. */
+#videos.sfu-mode {
+  isolation: isolate;
+}
+
+/* In P2P the .active transform mirrors the self-view; SFU mode drops it, so mirror the self-view
+   directly here (only the mini video, never the peer grid) so the self-view looks identical. */
+#videos.sfu-mode #mini-video {
+  transform: rotateY(180deg);
+}
+
 #videos.sfu-mode #local-video,
 #videos.sfu-mode #remote-video {
   opacity: 0;

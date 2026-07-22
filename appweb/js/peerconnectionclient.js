@@ -75,6 +75,7 @@ var PeerConnectionClient = function(params, startTime) {
   this.onremotehangup = null;
   this.onremotesdpset = null;
   this.onremotestreamadded = null;
+  this.onremotetrack = null;
   this.onsignalingmessage = null;
   this.onsignalingstatechange = null;
 };
@@ -596,6 +597,15 @@ PeerConnectionClient.prototype.recordIceCandidate_ =
     };
 
 PeerConnectionClient.prototype.onRemoteStreamAdded_ = function(event) {
+  // In SFU mode each forwarded track is surfaced individually (its msid carries the publishing
+  // client id), so the UI can group a peer's video and audio into one tile. In P2P mode there is
+  // a single remote peer, handled as one stream.
+  if (this.sfuMode_) {
+    if (this.onremotetrack) {
+      this.onremotetrack(event);
+    }
+    return;
+  }
   if (!this.onremotestreamadded) {
     return;
   }
