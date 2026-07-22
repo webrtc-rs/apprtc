@@ -211,11 +211,13 @@ label {
 }
 
 .sfu-grid {
+  align-content: start;
   display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
   height: 100%;
-  padding: 8px;
+  overflow-y: auto;
+  padding: 12px;
   position: absolute;
   width: 100%;
   box-sizing: border-box;
@@ -227,9 +229,11 @@ label {
 }
 
 .sfu-tile {
+  /* A fixed 16:9 aspect gives each tile a real height (its columns are width-driven), so the
+     grid flows top-down as a responsive grid of cards instead of collapsing. */
+  aspect-ratio: 16 / 9;
   background: #111;
   border-radius: 8px;
-  min-height: 0;
   overflow: hidden;
   position: relative;
 }

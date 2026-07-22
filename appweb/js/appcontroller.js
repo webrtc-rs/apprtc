@@ -401,6 +401,12 @@ AppController.prototype.onModeChange_ = function(mode) {
     this.videosDiv_.classList.add('sfu-mode');
     this.sfuGrid_.classList.remove('hidden');
     this.deactivate_(this.remoteVideo_);
+    // Show the local stream in the self-view. A client that joined directly in SFU mode never
+    // ran transitionToActive_ (which normally moves the local stream to the mini video), so set
+    // it here too — otherwise its self-view is an empty white box.
+    if (this.localStream_) {
+      this.miniVideo_.srcObject = this.localStream_;
+    }
     this.activate_(this.miniVideo_);
     this.show_(this.icons_);
     this.show_(this.hangupSvg_);
