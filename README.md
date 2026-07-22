@@ -34,7 +34,7 @@
 
 AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation
 supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults
-to V1 and provides an unchecked **V2 P2P/SFU** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes,
+to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the legacy V1 flow. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes,
 signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
 offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
@@ -112,7 +112,7 @@ V1 preserves the legacy AppRTC contract:
 
 P2P V2 adds:
 
-- An unchecked **Use signaling V2** room-selection checkbox; V1 remains the default.
+- A checked **V2 P2P/SFU** room-selection checkbox by default; unchecking it selects the legacy V1 flow.
 - `/v2/r/{roomid}`, `/v2/join/{roomid}`, `/v2/leave/{roomid}/{clientid}`, and `/v2/params` routes.
 - Canonical decimal `u64` room and client IDs.
 - A signaling-issued admission token bound to the room/client pair.
