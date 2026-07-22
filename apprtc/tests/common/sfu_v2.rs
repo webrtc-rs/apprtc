@@ -256,7 +256,10 @@ fn dump_sdp(label: &str, sdp: &str) {
                 || l.starts_with("a=ssrc:")
         })
         .collect();
-    eprintln!("=== {label} ===\n{}\n=====================", summary.join("\n"));
+    eprintln!(
+        "=== {label} ===\n{}\n=====================",
+        summary.join("\n")
+    );
 }
 
 /// Create an offer covering the peer connection's current transceivers and data channels, set

@@ -631,6 +631,13 @@ async fn drain_engine(
     events: &mpsc::Sender<v2::SfuEvent>,
     next_event_id: &AtomicU64,
 ) {
+    // Pump the read side so the SFU dispatches inbound RTP/RTCP to each subscriber's
+    // forwarding sender (`Room::poll_read` does this as a side effect, then the forwarded
+    // packets surface below via `poll_write`). Without this the worker receives publisher
+    // media but never forwards it. `Rout` is `Infallible`, so this only runs the side
+    // effect and never yields a value.
+    while engine.poll_read().is_some() {}
+
     while let Some(transmit) = engine.poll_write() {
         if let Err(error) = socket
             .send_to(&transmit.message, transmit.transport.peer_addr)

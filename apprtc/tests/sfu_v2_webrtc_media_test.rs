@@ -112,15 +112,14 @@ struct Active {
     _track: Arc<TrackLocalStaticRTP>,
 }
 
-// Reproduction harness for the SFU multi-party media forwarding path. Run explicitly with
-// `cargo test -p apprtc --test sfu_v2_webrtc_media_test -- --ignored --nocapture` against a
-// live signaling + sfu + appweb stack. All three clients now upgrade, connect, and publish to
-// the SFU through WebRTC perfect negotiation (the polite-peer rollback + `negotiationneeded`
-// re-publish that recovers from the worker's glare rejection). It is ignored by default
-// because the forwarding step does not yet complete: a publisher's track is not delivered to
-// the other members (no forwarded `on_track`), so the assertion below still fails. That is the
-// next fix, and this test pins it plus the subscribe-offer SDP validity check.
-#[ignore = "SFU multi-party forwarding incomplete: members connect but tracks are not forwarded yet"]
+// End-to-end SFU multi-party media forwarding. Requires a live signaling + sfu + appweb stack.
+// All three clients upgrade to SFU, connect, and publish through WebRTC perfect negotiation (the
+// polite-peer rollback + re-publish that recovers from the worker's glare rejection), and the
+// SFU forwards every publisher's track to the other two members — each member receives two
+// remote tracks. This exercises the two forwarding fixes: the worker draining `poll_read` so the
+// SFU dispatches inbound RTP to subscriber senders, and the peer connection re-running the
+// negotiation-needed check on return to `stable` so a last joiner's second inbound forward
+// (added while it was still answering its own publish) is actually offered.
 #[tokio::test]
 async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<()> {
     wait_for_server().await?;

@@ -88,7 +88,8 @@ async fn main() -> Result<()> {
                 Target::Pipe(Box::new(
                     OpenOptions::new()
                         .create(true)
-                        .append(true)
+                        .write(true)
+                        .truncate(true)
                         .open(&cli.output_log_file)?,
                 ))
             })
