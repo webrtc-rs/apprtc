@@ -771,11 +771,17 @@ impl RoomTable {
             );
             return Ok(());
         };
-        log::info!(
-            "SFU command result: instance_id={instance_id} connection_id={connection_id} request_id={} result={}",
-            result.request_id,
-            if result.result.is_ok() { "OK" } else { "ERR" }
-        );
+        match &result.result {
+            Ok(_) => log::info!(
+                "SFU command result: instance_id={instance_id} connection_id={connection_id} request_id={} result=OK",
+                result.request_id
+            ),
+            Err(error) => log::warn!(
+                "SFU command result: instance_id={instance_id} connection_id={connection_id} request_id={} result=ERR reason={}",
+                result.request_id,
+                error.reason
+            ),
+        }
         self.unacknowledged_commands.remove(&result.request_id);
         self.command_workers.remove(&result.request_id);
         match pending {

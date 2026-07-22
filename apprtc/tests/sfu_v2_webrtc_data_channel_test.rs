@@ -8,7 +8,7 @@
 mod common;
 
 use anyhow::{Context, Result, anyhow};
-use common::sfu_v2::{Peer, drive, peer, upgrade_three};
+use common::sfu_v2::{DriveConfig, Peer, drive, peer, upgrade_three};
 use common::wait_for_server;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,16 +44,16 @@ async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()
         // Data-channel-only publish never draws a subscribe offer; sink is unused.
         let (offers_tx, _offers_rx) = mpsc::unbounded_channel();
         let (connected_tx, connected_rx) = oneshot::channel();
-        drive(
-            member.ws,
-            pc.clone(),
-            "1".to_owned(),
+        drive(DriveConfig {
+            ws: member.ws,
+            pc: pc.clone(),
+            epoch: "1".to_owned(),
             outgoing,
-            offers_tx,
+            seen_offers: offers_tx,
             states,
             connected_tx,
-            None,
-        );
+            publish_track: None,
+        });
         actives.push(Active { pc, data_channel });
         connections.push(connected_rx);
     }

@@ -59,6 +59,13 @@ var PeerConnectionClient = function(params, startTime) {
   this.started_ = false;
   this.sfuMode_ = params.sfuMode === true;
   this.pendingRemoteRequestId_ = null;
+  this.perfectNegotiation_ = params.signalingVersion === 2;
+  this.polite_ = false;
+  this.makingOffer_ = false;
+  this.ignoreOffer_ = false;
+  this.isSettingRemoteAnswerPending_ = false;
+  this.offerRevision_ = 0;
+  this.renegotiationPending_ = false;
 
   // TODO(jiayl): Replace callbacks with events.
   // Public callbacks. Keep it sorted.
@@ -102,12 +109,14 @@ PeerConnectionClient.prototype.startAsCaller = function(offerOptions) {
 
   this.isInitiator_ = true;
   this.started_ = true;
+  // The P2P initiator is impolite. A browser connected to the SFU is polite
+  // because it must yield to authoritative subscribe offers from the SFU.
+  this.polite_ = this.perfectNegotiation_ && this.sfuMode_;
   var constraints = mergeConstraints(
       PeerConnectionClient.DEFAULT_SDP_OFFER_OPTIONS_, offerOptions);
   trace('Sending offer to peer, with constraints: \n\'' +
       JSON.stringify(constraints) + '\'.');
-  this.pc_.createOffer(constraints)
-      .then(this.setLocalSdpAndNotify_.bind(this))
+  this.makeOffer_(constraints)
       .catch(this.onError_.bind(this, 'createOffer'));
 
   return true;
@@ -124,6 +133,7 @@ PeerConnectionClient.prototype.startAsCallee = function(initialMessages) {
 
   this.isInitiator_ = false;
   this.started_ = true;
+  this.polite_ = this.perfectNegotiation_;
 
   if (initialMessages && initialMessages.length > 0) {
     // Convert received messages to JSON objects and add them to the message
@@ -147,7 +157,13 @@ PeerConnectionClient.prototype.receiveSignalingMessage = function(message) {
   if (!messageObj) {
     return;
   }
-  if (this.sfuMode_ && messageObj.type === 'offer') {
+  if (this.perfectNegotiation_ &&
+      (messageObj.type === 'offer' || messageObj.type === 'answer')) {
+    this.hasRemoteSdp_ = true;
+    // V2 WebSocket delivery is ordered. Preserve description order so a
+    // publish answer is applied before a following SFU subscribe offer.
+    this.messageQueue_.push(messageObj);
+  } else if (this.sfuMode_ && messageObj.type === 'offer') {
     this.hasRemoteSdp_ = true;
     // SFU subscribe offers follow the publish answer on the same ordered
     // signaling connection. Preserve that ordering so the subscribe offer
@@ -206,8 +222,28 @@ PeerConnectionClient.prototype.getPeerConnectionStats = function(callback) {
 PeerConnectionClient.prototype.doAnswer_ = function() {
   trace('Sending answer to peer.');
   return this.pc_.createAnswer()
-      .then(this.setLocalSdpAndNotify_.bind(this))
-      .catch(this.onError_.bind(this, 'createAnswer'));
+      .then(this.setLocalSdpAndNotify_.bind(this));
+};
+
+PeerConnectionClient.prototype.makeOffer_ = function(offerOptions) {
+  if (!this.pc_ || this.makingOffer_) {
+    return Promise.resolve();
+  }
+  this.makingOffer_ = true;
+  var revision = ++this.offerRevision_;
+  return this.pc_.createOffer(offerOptions).then(function(offer) {
+    // A polite V2 peer may receive and accept a remote offer while createOffer
+    // is pending. In that case this local offer has been superseded.
+    if (revision !== this.offerRevision_ ||
+        (this.perfectNegotiation_ && this.pc_.signalingState !== 'stable')) {
+      trace('Discarding superseded local offer.');
+      return;
+    }
+    return this.setLocalSdpAndNotify_(offer);
+  }.bind(this)).finally(function() {
+    this.makingOffer_ = false;
+    this.maybeRenegotiate_();
+  }.bind(this));
 };
 
 PeerConnectionClient.prototype.setLocalSdpAndNotify_ =
@@ -249,8 +285,7 @@ PeerConnectionClient.prototype.setLocalSdpAndNotify_ =
               }
               this.onsignalingmessage(message);
             }
-          }.bind(this))
-          .catch(this.onError_.bind(this, 'setLocalDescription'));
+          }.bind(this));
     };
 
 PeerConnectionClient.prototype.setRemoteSdp_ = function(message) {
@@ -280,7 +315,10 @@ PeerConnectionClient.prototype.onSetRemoteDescriptionSuccess_ = function() {
 };
 
 PeerConnectionClient.prototype.processSignalingMessage_ = function(message) {
-  if (message.type === 'offer' && this.sfuMode_) {
+  if (this.perfectNegotiation_ &&
+      (message.type === 'offer' || message.type === 'answer')) {
+    return this.processV2Description_(message);
+  } else if (message.type === 'offer' && this.sfuMode_) {
     return this.answerSfuOffer_(message);
   } else if (message.type === 'offer' && !this.isInitiator_) {
     if (this.pc_.signalingState !== 'stable') {
@@ -297,6 +335,9 @@ PeerConnectionClient.prototype.processSignalingMessage_ = function(message) {
     }
     return this.setRemoteSdp_(message);
   } else if (message.type === 'candidate') {
+    if (this.perfectNegotiation_ && this.ignoreOffer_) {
+      return Promise.resolve();
+    }
     var candidate = new RTCIceCandidate({
       sdpMLineIndex: message.label,
       candidate: message.candidate
@@ -305,12 +346,61 @@ PeerConnectionClient.prototype.processSignalingMessage_ = function(message) {
     return this.pc_.addIceCandidate(candidate)
         .then(trace.bind(null, 'Remote candidate added successfully.'));
   } else if (message.type === 'end-of-candidates') {
+    if (this.perfectNegotiation_ && this.ignoreOffer_) {
+      return Promise.resolve();
+    }
     return this.pc_.addIceCandidate(null)
         .then(trace.bind(null, 'Remote end-of-candidates added successfully.'));
   } else {
     trace('WARNING: unexpected message: ' + JSON.stringify(message));
     return Promise.resolve();
   }
+};
+
+PeerConnectionClient.prototype.processV2Description_ = function(message) {
+  var isOffer = message.type === 'offer';
+  var readyForOffer = !this.makingOffer_ &&
+      (this.pc_.signalingState === 'stable' ||
+       this.isSettingRemoteAnswerPending_);
+  var offerCollision = isOffer && !readyForOffer;
+  this.ignoreOffer_ = !this.polite_ && offerCollision;
+  if (this.ignoreOffer_) {
+    trace('Ignoring colliding V2 offer as the impolite peer.');
+    return Promise.resolve();
+  }
+
+  if (offerCollision) {
+    // Invalidate createOffer work which has not reached setLocalDescription.
+    ++this.offerRevision_;
+    if (this.sfuMode_) {
+      // The answer to an SFU subscribe offer cannot add the browser's pending
+      // publish m-lines. Publish them in a new offer once this collision has
+      // been resolved and the signaling state is stable again.
+      this.renegotiationPending_ = true;
+    }
+  }
+  if (this.sfuMode_ && isOffer) {
+    this.pendingRemoteRequestId_ = message.requestid === undefined ?
+        null : message.requestid;
+  }
+
+  var ready = Promise.resolve();
+  if (offerCollision && this.pc_.signalingState !== 'stable') {
+    trace('Rolling back a local V2 offer as the polite peer.');
+    ready = this.pc_.setLocalDescription({type: 'rollback'});
+  }
+  this.isSettingRemoteAnswerPending_ = message.type === 'answer';
+  return ready.then(function() {
+    return this.setRemoteSdp_(message);
+  }.bind(this)).then(function() {
+    this.ignoreOffer_ = false;
+    if (isOffer) {
+      return this.doAnswer_();
+    }
+  }.bind(this)).finally(function() {
+    this.isSettingRemoteAnswerPending_ = false;
+    this.maybeRenegotiate_();
+  }.bind(this));
 };
 
 PeerConnectionClient.prototype.answerSfuOffer_ = function(message) {
@@ -334,12 +424,22 @@ PeerConnectionClient.prototype.answerSfuOffer_ = function(message) {
 
 PeerConnectionClient.prototype.onNegotiationNeeded_ = function() {
   if (!this.sfuMode_ || !this.started_ || !this.pc_ ||
-      this.pc_.signalingState !== 'stable') {
+      this.pc_.signalingState !== 'stable' || this.makingOffer_) {
     return;
   }
   trace('SFU negotiation needed; publishing a fresh offer.');
-  this.pc_.createOffer(this.params_.offerOptions)
-      .then(this.setLocalSdpAndNotify_.bind(this))
+  this.makeOffer_(this.params_.offerOptions)
+      .catch(this.onError_.bind(this, 'createOffer'));
+};
+
+PeerConnectionClient.prototype.maybeRenegotiate_ = function() {
+  if (!this.renegotiationPending_ || !this.pc_ || this.makingOffer_ ||
+      this.pc_.signalingState !== 'stable') {
+    return;
+  }
+  this.renegotiationPending_ = false;
+  trace('Publishing after a polite SFU offer collision.');
+  this.makeOffer_(this.params_.offerOptions)
       .catch(this.onError_.bind(this, 'createOffer'));
 };
 

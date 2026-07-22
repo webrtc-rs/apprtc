@@ -280,14 +280,19 @@ async fn dispatch_command(
             "media shard stopped",
         )
     });
-    log::info!(
-        "SFU command completed: request_id={request_id} result={}",
-        if matches!(result.result, Some(v2::sfu_command_result::Result::Ok(_))) {
-            "OK"
-        } else {
-            "ERR"
+    match &result.result {
+        Some(v2::sfu_command_result::Result::Ok(_)) => {
+            log::info!("SFU command completed: request_id={request_id} result=OK");
         }
-    );
+        Some(v2::sfu_command_result::Result::Error(error)) => log::warn!(
+            "SFU command completed: request_id={request_id} result=ERR code={:?} reason={}",
+            v2::ErrorCode::try_from(error.code).unwrap_or_default(),
+            error.reason
+        ),
+        None => log::warn!(
+            "SFU command completed: request_id={request_id} result=ERR reason=missing_result"
+        ),
+    }
     result
 }
 

@@ -8,7 +8,7 @@ mod common;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use common::sfu_v2::{Peer, drive, peer, upgrade_three};
+use common::sfu_v2::{DriveConfig, Peer, drive, peer, upgrade_three};
 use common::wait_for_server;
 use rtc::media_stream::MediaStreamTrack;
 use rtc::rtp::Packet;
@@ -146,16 +146,16 @@ async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<
         // (also mid:0) are resolved as the polite peer via glare rollback + re-publish.
         let (offers_tx, offers_rx) = mpsc::unbounded_channel();
         let (connected_tx, connected_rx) = oneshot::channel();
-        drive(
-            member.ws,
-            pc.clone(),
-            "1".to_owned(),
+        drive(DriveConfig {
+            ws: member.ws,
+            pc: pc.clone(),
+            epoch: "1".to_owned(),
             outgoing,
-            offers_tx,
+            seen_offers: offers_tx,
             states,
             connected_tx,
-            Some(track.clone() as Arc<dyn TrackLocal>),
-        );
+            publish_track: Some(track.clone() as Arc<dyn TrackLocal>),
+        });
         let publisher = keep_publishing(track.clone(), ssrc);
         timeout(Duration::from_secs(30), connected_rx)
             .await

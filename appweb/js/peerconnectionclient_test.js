@@ -323,6 +323,72 @@ describe('PeerConnectionClient Test', function() {
     expect(this.pcClient.startAsCaller(null)).toBeFalsy();
   });
 
+  it('V2 SFU creates only one initial offer', function(done) {
+    this.pcClient.close();
+    this.pcClient = new PeerConnectionClient({
+      peerConnectionConfig: FAKEPCCONFIG,
+      peerConnectionConstraints: FAKEPCCONSTRAINTS,
+      signalingVersion: 2,
+      sfuMode: true
+    }, window.performance.now());
+    var pc = peerConnections[peerConnections.length - 1];
+    this.pcClient.onsignalingmessage = function(message) {
+      expect(message.type).toEqual('offer');
+      expect(pc.createSdpRequests.length).toEqual(0);
+      done();
+    };
+
+    expect(this.pcClient.startAsCaller(null)).toBeTruthy();
+    expect(pc.createSdpRequests.length).toEqual(1);
+    pc.onnegotiationneeded();
+    expect(pc.createSdpRequests.length).toEqual(1);
+    pc.resolveLastCreateSdpRequest('one V2 SFU offer');
+  });
+
+  it('V2 SFU politely accepts an offer colliding with createOffer',
+      function(done) {
+        this.pcClient.close();
+        this.pcClient = new PeerConnectionClient({
+          peerConnectionConfig: FAKEPCCONFIG,
+          peerConnectionConstraints: FAKEPCCONSTRAINTS,
+          signalingVersion: 2,
+          sfuMode: true
+        }, window.performance.now());
+        var pc = peerConnections[peerConnections.length - 1];
+        expect(this.pcClient.startAsCaller(null)).toBeTruthy();
+        var pendingLocalOffer = pc.createSdpRequests.shift();
+        var sentAnswer = false;
+        this.pcClient.onsignalingmessage = function(message) {
+          if (message.type === 'answer') {
+            expect(message.requestid).toEqual('77');
+            expect(pc.localDescriptions.some(function(description) {
+              return description.description.type === 'offer';
+            })).toBeFalsy();
+            sentAnswer = true;
+            return;
+          }
+          expect(message.type).toEqual('offer');
+          expect(sentAnswer).toBeTruthy();
+          done();
+        };
+
+        this.pcClient.receiveSignalingMessage(JSON.stringify({
+          type: 'offer',
+          sdp: FAKE_SDP,
+          requestid: '77'
+        }));
+        setTimeout(function() {
+          expect(pc.createSdpRequests.length).toEqual(1);
+          pc.resolveLastCreateSdpRequest('collision answer');
+          pendingLocalOffer.callback({type: 'offer', sdp: 'superseded offer'});
+          setTimeout(function() {
+            expect(pc.createSdpRequests.length).toEqual(1);
+            expect(pc.createSdpRequests[0].type).toEqual('offer');
+            pc.resolveLastCreateSdpRequest('republish offer');
+          }, 0);
+        }, 0);
+      });
+
   it('Close peerConnection', function() {
     this.pcClient.close();
     expect(peerConnections[0].signalingState).toEqual('closed');

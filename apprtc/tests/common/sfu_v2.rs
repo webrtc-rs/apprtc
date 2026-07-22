@@ -367,17 +367,29 @@ async fn apply_inbound(
 /// offers — then auto-answers every subscribe re-offer the SFU pushes, resolving glare as the
 /// polite peer (see `apply_inbound`). `seen_offers` receives each subscribe offer for
 /// validation; `connected_tx` fires when the peer connection reaches Connected.
-pub fn drive(
-    ws: WsStream,
-    pc: Arc<dyn PeerConnection>,
-    epoch: String,
-    mut outgoing: mpsc::UnboundedReceiver<String>,
-    seen_offers: mpsc::UnboundedSender<RTCSessionDescription>,
-    mut states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
-    connected_tx: oneshot::Sender<Result<()>>,
-    publish_track: Option<Arc<dyn TrackLocal>>,
-) {
+pub struct DriveConfig {
+    pub ws: WsStream,
+    pub pc: Arc<dyn PeerConnection>,
+    pub epoch: String,
+    pub outgoing: mpsc::UnboundedReceiver<String>,
+    pub seen_offers: mpsc::UnboundedSender<RTCSessionDescription>,
+    pub states: mpsc::UnboundedReceiver<RTCPeerConnectionState>,
+    pub connected_tx: oneshot::Sender<Result<()>>,
+    pub publish_track: Option<Arc<dyn TrackLocal>>,
+}
+
+pub fn drive(config: DriveConfig) {
     tokio::spawn(async move {
+        let DriveConfig {
+            ws,
+            pc,
+            epoch,
+            mut outgoing,
+            seen_offers,
+            mut states,
+            connected_tx,
+            publish_track,
+        } = config;
         let (mut writer, mut reader): (Writer, SplitStream<WsStream>) = ws.split();
         let mut remote_set = false;
         let mut pending: Vec<RTCIceCandidateInit> = Vec::new();
