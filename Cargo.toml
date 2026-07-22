@@ -30,9 +30,9 @@ appweb = { version = "0.2.0-alpha.1", path = "appweb" }
 signaling = { version = "0.2.0-alpha.1", path = "signaling" }
 signaling-proto = { version = "0.2.0-alpha.1", path = "signaling-proto" }
 
-sfu = { version = "0.20.0-rc.3", path = "sfu" }
-webrtc = { version = "0.20.0-rc.3", path = "sfu/webrtc" }
-rtc = { version = "0.20.0-rc.3", path = "sfu/webrtc/rtc" }
+sfu = { version = "0.20.0-rc.4", path = "sfu" }
+webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
+rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
 sansio = "1.0.1"
 
 serde = { version = "1.0.228", features = ["derive"] }
