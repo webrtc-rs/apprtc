@@ -32,9 +32,16 @@
  <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
 </p>
 
-AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults to V1 and provides an unchecked **V2 P2P/SFU** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes, signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
+AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation
+supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults
+to V1 and provides an unchecked **V2 P2P/SFU** checkbox. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes,
+signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
+offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-The first two V2 members use a direct P2P connection. When a third member joins, signaling assigns a ready SFU worker, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. SFU→P2P downgrade is not implemented yet.
+The first two V2 members use a direct P2P connection. When a third member joins, signaling assigns a ready SFU worker,
+waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU
+peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. SFU→P2P
+downgrade is not implemented yet.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -43,14 +50,18 @@ repository's `go` branch.
 
 The workspace has four Rust crates:
 
-| Crate                                | Responsibility                                                                                                                                                                          |
-|--------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)                   | Standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
-| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                             |
+| Crate                                | Responsibility                                                                                                                                                                                                                 |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [`apprtc`](apprtc)                   | Standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver.     |
+| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                                                                    |
 | [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own. |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and SFU workers. |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and SFU workers.                                                                                                                                            |
 
-AppWeb, signaling, and SFU are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses concurrent unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1 injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes through AppWeb. Each SFU process owns one reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser media travels directly to the SFU over ICE/DTLS/SRTP and never passes through AppWeb or signaling.
+AppWeb, signaling, and SFU are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses
+concurrent unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1
+injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes
+through AppWeb. Each SFU process owns one reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser
+media travels directly to the SFU over ICE/DTLS/SRTP and never passes through AppWeb or signaling.
 
 The signaling state is composed from Sans-I/O protocols:
 
@@ -68,11 +79,10 @@ The `apprtc` library keeps each runtime responsibility in a dedicated module:
 
 ```text
 apprtc/src/
-├── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ├── grpc_server.rs        private signaling gRPC service adapter
-├── signaling_server.rs   command channel and single-owner Collider event loop
 ├── sfu_server.rs         signaling stream, UDP media shards, and Sans-I/O SFU adapter
-└── tls.rs                shared TLS certificate loading and listeners
+├── signaling_server.rs   command channel and single-owner Collider event loop
+└── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ```
 
 [`apprtc/src/ws_server.rs`](apprtc/src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
@@ -108,17 +118,24 @@ P2P V2 adds:
 - A signaling-issued admission token bound to the room/client pair.
 - Explicit `{control:"registered"}` acknowledgement before signaling starts.
 - An `epoch` on every browser `send` frame; stale or malformed epochs are dropped.
-- Symmetric WebSocket relay for offers, answers, and trickle-ICE candidates; V2 does not use `/message` or the V1 WebSocket POST fallback.
+- Symmetric WebSocket relay for offers, answers, and trickle-ICE candidates; V2 does not use `/message` or the V1
+  WebSocket POST fallback.
 - Authenticated leave using `Authorization: Bearer <admission_token>` and `p2p-promote` for the surviving participant.
 
 SFU-capable V2 adds:
 
 - Capacity-aware selection of a ready SFU worker when the third member joins.
-- An ordered `JoinMember` barrier for all room members before signaling commits `Upgrading` to `SFU` and increments the signal epoch.
-- A fresh browser SFU peer connection while the existing P2P connection remains active; the old P2P connection closes only after SFU ICE connects.
-- Grid-based remote participant video while retaining the existing self-view and call controls.
+- An ordered `JoinMember` barrier for all room members before signaling commits `Upgrading` to `SFU` and increments the
+  signal epoch.
+- A fresh browser SFU peer connection while the existing P2P connection remains active; the old P2P connection closes
+  only after SFU ICE connects.
+- Grid-based remote participants: the peer video/audio fills the window as a responsive grid of per-publisher tiles, the
+  only UI change from P2P — the self-view and call controls keep their P2P positions. Each tile groups a peer's
+  forwarded video and audio, and a peer's tile is removed from the grid when it leaves the room (reconciled from the
+  negotiated transceivers after each SFU re-offer).
 - SFU publish/subscribe SDP and full trickle-ICE exchange through the same browser V2 WebSocket envelope.
-- Reliable worker events, command result correlation and deduplication, health/capacity reporting, same-instance reconnect synchronization, and command replay.
+- Reliable worker events, command result correlation and deduplication, health/capacity reporting, same-instance
+  reconnect synchronization, and command replay.
 - Ordered worker-side joins and leaves for members admitted to or removed from an existing SFU room.
 
 SFU→P2P downgrade is intentionally deferred.
@@ -159,7 +176,9 @@ cargo test -p apprtc --test '*' -- --nocapture
 kill $(pgrep -f "target/debug/(appweb|signaling|sfu)") || true
 ```
 
-CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when the job finishes. Its black-box V2 test verifies the real AppWeb→signaling→SFU third-member join barrier and browser upgrade controls.
+CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when
+the job finishes. Its black-box V2 test verifies the real AppWeb→signaling→SFU third-member join barrier and browser
+upgrade controls.
 
 ## Run over HTTP and WebSocket
 
@@ -186,7 +205,8 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
 `--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser
 WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's
-`--public-url` controls the browser-facing HTTP origin, `--ws-url` controls the browser-facing WebSocket URL and must include `/ws`, and `--grpc-url` independently selects the private signaling gRPC origin.
+`--public-url` controls the browser-facing HTTP origin, `--ws-url` controls the browser-facing WebSocket URL and must
+include `/ws`, and `--grpc-url` independently selects the private signaling gRPC origin.
 
 ## Run over HTTPS and secure WebSocket
 
@@ -241,36 +261,37 @@ cargo run -p apprtc --bin appweb -- \
 
 ## Command-line options
 
-Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin signaling -- --help`, or `cargo run -p apprtc --bin sfu -- --help` for the authoritative lists.
+Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin signaling -- --help`, or
+`cargo run -p apprtc --bin sfu -- --help` for the authoritative lists.
 
-| Option                         |                  Default | Description                                                             |
-|--------------------------------|-------------------------:|-------------------------------------------------------------------------|
-| `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local TCP or UDP bind address (all binaries).                           |
-| `--public-url <URL>`           |  listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
-| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S), signaling WS(S), or SFU redirect (`--redirect-url`) port. |
-| `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                      |
-| `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS (all binaries, incl. the SFU redirect). |
-| `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                |
-| `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                      |
-| `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
-| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb` and `sfu`).                     |
-| `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`appweb`, `sfu`).  |
-| `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                               |
-| `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                             |
-| `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                      |
-| `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                      |
-| `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                     |
-| `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                       |
-| `--media-public-ip <IP>`       |               `--host-ip` | ICE candidate address advertised by `sfu`; set only when it differs from the bind address (NAT). |
-| `--redirect-url <URL>`         |                    empty | When set, `sfu` runs a server on `--host-ip:--port` that redirects every request here. |
-| `--media-port-min <PORT>`      |                   `3478` | First UDP media port owned by `sfu`.                                    |
-| `--media-port-max <PORT>`      |                   `3495` | Last UDP media port owned by `sfu`.                                     |
-| `--max-rooms <COUNT>`          |                   `1000` | SFU room capacity advertised to signaling.                              |
-| `--max-clients <COUNT>`        |                  `10000` | SFU client capacity advertised to signaling.                            |
-| `--instance-id <ID>`           |         generated value | Optional SFU process-incarnation ID; normally omit it.                   |
-| `-d, --debug`                  |                      off | Enable application logging (all binaries).                              |
-| `-l, --level <LEVEL>`          |                   `info` | Log filter (all binaries).                                              |
-| `-o, --output-log-file <PATH>` |                   stdout | Write formatted logs to a file (all binaries).                          |
+| Option                         |                  Default | Description                                                                                      |
+|--------------------------------|-------------------------:|--------------------------------------------------------------------------------------------------|
+| `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local TCP or UDP bind address (all binaries).                                                    |
+| `--public-url <URL>`           |  listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`).                          |
+| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S), signaling WS(S), or SFU redirect (`--redirect-url`) port.                        |
+| `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                                               |
+| `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS (all binaries, incl. the SFU redirect).                       |
+| `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                                         |
+| `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                                               |
+| `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).                               |
+| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb` and `sfu`).                                              |
+| `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`appweb`, `sfu`).                           |
+| `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                                                        |
+| `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                                                      |
+| `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                                               |
+| `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                                               |
+| `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                                              |
+| `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                                                |
+| `--media-public-ip <IP>`       |              `--host-ip` | ICE candidate address advertised by `sfu`; set only when it differs from the bind address (NAT). |
+| `--redirect-url <URL>`         |                    empty | When set, `sfu` runs a server on `--host-ip:--port` that redirects every request here.           |
+| `--media-port-min <PORT>`      |                   `3478` | First UDP media port owned by `sfu`.                                                             |
+| `--media-port-max <PORT>`      |                   `3495` | Last UDP media port owned by `sfu`.                                                              |
+| `--max-rooms <COUNT>`          |                   `1000` | SFU room capacity advertised to signaling.                                                       |
+| `--max-clients <COUNT>`        |                  `10000` | SFU client capacity advertised to signaling.                                                     |
+| `--instance-id <ID>`           |          generated value | Optional SFU process-incarnation ID; normally omit it.                                           |
+| `-d, --debug`                  |                      off | Enable application logging (all binaries).                                                       |
+| `-l, --level <LEVEL>`          |                   `info` | Log filter (all binaries).                                                                       |
+| `-o, --output-log-file <PATH>` |                   stdout | Write formatted logs to a file (all binaries).                                                   |
 
 Example ICE configuration:
 
