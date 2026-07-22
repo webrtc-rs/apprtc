@@ -215,6 +215,11 @@ label {
   display: grid;
   gap: 12px;
   grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr));
+  /* Anchor to #videos' top-left so the grid overlays the full window the way the P2P remote-video
+     does. Without top/left an absolutely positioned box uses its static position, which sits below
+     the full-height (opacity:0 but still in-flow) #local-video and pushes the grid off-screen. */
+  top: 0;
+  left: 0;
   height: 100%;
   overflow-y: auto;
   padding: 12px;
@@ -265,10 +270,14 @@ label {
   isolation: isolate;
 }
 
-/* In P2P the .active transform mirrors the self-view; SFU mode drops it, so mirror the self-view
-   directly here (only the mini video, never the peer grid) so the self-view looks identical. */
+/* In P2P the .active transform both mirrors the self-view and (by flipping the whole container)
+   makes #mini-video's `left: 20px` land on the right. SFU mode drops that container transform, so
+   here we (a) mirror the self-view directly and (b) re-anchor it to the right so it keeps the exact
+   P2P bottom-right position. */
 #videos.sfu-mode #mini-video {
   transform: rotateY(180deg);
+  left: auto;
+  right: 20px;
 }
 
 #videos.sfu-mode #local-video,
