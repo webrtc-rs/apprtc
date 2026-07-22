@@ -157,14 +157,13 @@ struct Active {
 }
 
 // Run explicitly against a live signaling + sfu + appweb stack:
-//   cargo test -p apprtc --test sfu_v2_webrtc_header_extension_test -- --ignored --nocapture
+//   cargo test -p apprtc --test sfu_v2_webrtc_header_extension_test -- --nocapture
 //
-// Ignored by default because it currently reproduces (fails on) an unfixed SFU bug: the worker's
-// subscribe offers assign RTP-header-extension ids independently of the ids a client already
-// published with, so a real browser hits "A BUNDLE group contains a codec collision for header
-// extension id" when it re-publishes. Un-ignore once the SFU derives the forwarded m-lines'
-// extension ids from the subscriber's negotiated ids.
-#[ignore = "reproduces the unfixed SFU header-extension-id collision (browser re-publish fails)"]
+// The SFU never makes the first offer: it answers each client's initial offer (learning that
+// client's codec and RTP-header-extension id assignments) before creating any subscribe offer,
+// so a forwarded m-line always uses ids consistent with the client's own m-lines. Without that,
+// a real browser hits "A BUNDLE group contains a codec collision for header extension id" when
+// it re-publishes.
 #[tokio::test]
 async fn every_local_description_has_a_browser_valid_bundle_extmap() -> Result<()> {
     wait_for_server().await?;
