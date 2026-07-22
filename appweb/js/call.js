@@ -44,6 +44,7 @@ var Call = function(params) {
   this.onremotesdpset = null;
   this.onremotestreamadded = null;
   this.onremotetrack = null;
+  this.onsfunegotiated = null;
   this.onsignalingstatechange = null;
   this.onturnstatusmessage = null;
 
@@ -460,6 +461,7 @@ Call.prototype.createPcClient_ = function() {
   this.pcClient_.onremotesdpset = this.onremotesdpset;
   this.pcClient_.onremotestreamadded = this.onremotestreamadded;
   this.pcClient_.onremotetrack = this.onremotetrack;
+  this.pcClient_.onsfunegotiated = this.onsfunegotiated;
   this.pcClient_.onsignalingstatechange = this.onsignalingstatechange;
   this.pcClient_.oniceconnectionstatechange = this.oniceconnectionstatechange;
   if (this.params_.sfuMode) {

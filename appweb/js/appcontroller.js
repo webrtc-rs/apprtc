@@ -165,6 +165,7 @@ AppController.prototype.createCall_ = function() {
   this.call_.onremotesdpset = this.onRemoteSdpSet_.bind(this);
   this.call_.onremotestreamadded = this.onRemoteStreamAdded_.bind(this);
   this.call_.onremotetrack = this.onSfuTrackAdded_.bind(this);
+  this.call_.onsfunegotiated = this.pruneStaleSfuTiles_.bind(this);
   this.call_.onlocalstreamadded = this.onLocalStreamAdded_.bind(this);
   this.call_.onmodechange = this.onModeChange_.bind(this);
 
@@ -389,6 +390,32 @@ AppController.prototype.onSfuTrackAdded_ = function(event) {
       delete this.sfuTiles_[key];
     }
   }.bind(this));
+};
+
+// After the SFU re-offer is answered, |liveTrackIds| is the set (id -> true) of forwarded tracks
+// the SFU is still sending us. Remove any media element whose track is gone, then drop any tile
+// left with no media — this is what makes a departed peer's grid tile disappear. Remote-track
+// 'ended' is unreliable here (SFU renegotiation flips the transceiver to inactive rather than
+// stopping the track), so we reconcile against the negotiated transceivers instead.
+AppController.prototype.pruneStaleSfuTiles_ = function(liveTrackIds) {
+  var mediaElements = this.sfuGrid_.querySelectorAll('video, audio');
+  for (var i = 0; i < mediaElements.length; ++i) {
+    var el = mediaElements[i];
+    var trackId = el.id.replace(/^sfu-media-/, '');
+    if (!liveTrackIds[trackId]) {
+      el.remove();
+    }
+  }
+  for (var key in this.sfuTiles_) {
+    if (!this.sfuTiles_.hasOwnProperty(key)) {
+      continue;
+    }
+    var tile = this.sfuTiles_[key];
+    if (!tile.querySelector('video') && !tile.querySelector('audio')) {
+      tile.remove();
+      delete this.sfuTiles_[key];
+    }
+  }
 };
 
 AppController.prototype.onModeChange_ = function(mode) {

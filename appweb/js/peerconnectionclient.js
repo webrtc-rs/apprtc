@@ -76,6 +76,7 @@ var PeerConnectionClient = function(params, startTime) {
   this.onremotesdpset = null;
   this.onremotestreamadded = null;
   this.onremotetrack = null;
+  this.onsfunegotiated = null;
   this.onsignalingmessage = null;
   this.onsignalingstatechange = null;
 };
@@ -266,7 +267,28 @@ PeerConnectionClient.prototype.doAnswer_ = function() {
   trace('Sending answer to peer.');
   this.setupCodecs_();
   return this.pc_.createAnswer()
-      .then(this.setLocalSdpAndNotify_.bind(this));
+      .then(this.setLocalSdpAndNotify_.bind(this))
+      .then(this.notifySfuNegotiated_.bind(this));
+};
+
+// After answering an SFU (re-)offer, the negotiated transceiver directions reflect the room's
+// current publish state. Report the ids of the forwarded tracks the SFU is still sending us so the
+// UI can drop the tiles of any peer whose media is gone (e.g. it left the room). A departed peer's
+// transceiver flips to 'inactive' rather than firing the remote track's 'ended', so this
+// reconciliation — not track events — is what removes the stale tile. No-op outside SFU mode.
+PeerConnectionClient.prototype.notifySfuNegotiated_ = function() {
+  if (!this.sfuMode_ || !this.pc_ || !this.onsfunegotiated) {
+    return;
+  }
+  var live = {};
+  this.pc_.getTransceivers().forEach(function(transceiver) {
+    var track = transceiver.receiver && transceiver.receiver.track;
+    if (track && (transceiver.currentDirection === 'recvonly' ||
+        transceiver.currentDirection === 'sendrecv')) {
+      live[track.id] = true;
+    }
+  });
+  this.onsfunegotiated(live);
 };
 
 PeerConnectionClient.prototype.makeOffer_ = function(offerOptions) {
