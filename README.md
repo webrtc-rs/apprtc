@@ -143,7 +143,7 @@ cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051 --tls &
 
 # 2. Start one SFU worker.
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls &
 
@@ -168,7 +168,7 @@ Run signaling, one SFU worker, and AppWeb separately from the repository root:
 ```bash
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url http://127.0.0.1:50051
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
@@ -197,7 +197,7 @@ cargo run -p apprtc --bin signaling -- \
   --host-ip 127.0.0.1 --port 8081 --tls \
   --grpc-port 50051
 cargo run -p apprtc --bin sfu -- \
-  --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+  --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls
 cargo run -p apprtc --bin appweb -- \
@@ -229,7 +229,7 @@ cargo run -p apprtc --bin signaling -- \
   --private-key /path/to/privkey.pem
 
 cargo run -p apprtc --bin sfu -- \
-  --host-ip 0.0.0.0 --public-ip 203.0.113.20 \
+  --host-ip 0.0.0.0 --media-public-ip 203.0.113.20 \
   --media-port-min 3478 --media-port-max 3495 \
   --grpc-url https://sfu.example.com:50051
 
@@ -247,9 +247,9 @@ Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin sig
 |--------------------------------|-------------------------:|-------------------------------------------------------------------------|
 | `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local TCP or UDP bind address (all binaries).                           |
 | `--public-url <URL>`           |  listener address/scheme | Browser-facing HTTP(S) origin (`appweb`) or WS(S) origin (`signaling`). |
-| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S) or signaling WS(S) listening port.                       |
+| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S), signaling WS(S), or SFU redirect (`--redirect-url`) port. |
 | `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                      |
-| `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS.                                     |
+| `--tls`                        |                      off | Serve HTTPS/WSS instead of HTTP/WS (all binaries, incl. the SFU redirect). |
 | `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls`.                                |
 | `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls`.                                      |
 | `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).      |
@@ -261,7 +261,8 @@ Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin sig
 | `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                      |
 | `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                     |
 | `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                       |
-| `--public-ip <IP>`             |              `127.0.0.1` | ICE candidate address advertised by `sfu`.                              |
+| `--media-public-ip <IP>`       |               `--host-ip` | ICE candidate address advertised by `sfu`; set only when it differs from the bind address (NAT). |
+| `--redirect-url <URL>`         |                    empty | When set, `sfu` runs a server on `--host-ip:--port` that redirects every request here. |
 | `--media-port-min <PORT>`      |                   `3478` | First UDP media port owned by `sfu`.                                    |
 | `--media-port-max <PORT>`      |                   `3495` | Last UDP media port owned by `sfu`.                                     |
 | `--max-rooms <COUNT>`          |                   `1000` | SFU room capacity advertised to signaling.                              |

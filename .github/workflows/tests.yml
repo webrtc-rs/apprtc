@@ -52,7 +52,7 @@ jobs:
             --grpc-port 50051 --tls \
             --debug --level info > ./logs/signaling.log 2>&1 &
           ./target/release/sfu \
-            --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
+            --host-ip 127.0.0.1 \
             --media-port-min 35000 --media-port-max 35000 \
             --grpc-url https://127.0.0.1:50051 --insecure-tls \
             --debug --level info > ./logs/sfu.log 2>&1 &

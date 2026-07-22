@@ -143,7 +143,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/apprtc
 ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/sfu.log ]; then mv /opt/logs/sfu.log /opt/logs/sfu-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-ExecStart=/opt/apprtc/target/release/sfu --host-ip 0.0.0.0 --public-ip 173.249.199.192 --media-port-min 3478 --media-port-max 3495 --grpc-url https://appr.tc:50051 -d -l info -o /opt/logs/sfu.log
+ExecStart=/opt/apprtc/target/release/sfu --host-ip 0.0.0.0 --media-public-ip 173.249.199.192 --media-port-min 3478 --media-port-max 3495 --grpc-url https://appr.tc:50051 -d -l info -o /opt/logs/sfu.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -153,7 +153,7 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-Replace `173.249.199.192` with the host's actual public IP. `--host-ip` controls UDP binding; `--public-ip` is placed in ICE candidates and therefore must be reachable by browsers. The SFU does not terminate HTTPS itself, so it has no `--tls`, certificate, or private-key options. TLS is selected by its `https://` gRPC URL.
+Replace `173.249.199.192` with the host's actual public IP. `--host-ip` controls UDP binding; `--media-public-ip` is placed in ICE candidates and therefore must be reachable by browsers (it defaults to `--host-ip` when omitted, so set it only when the advertised address differs from the bind address, e.g. behind NAT). The SFU does not terminate HTTPS itself, so it has no `--tls`, certificate, or private-key options. TLS is selected by its `https://` gRPC URL.
 
 The shared `--tls` flag protects both signaling listeners with the `appr.tc` certificate. The gRPC listener binds `0.0.0.0` so AppWeb can connect with the certificate-valid hostname `https://appr.tc:50051`; keep TCP `50051` blocked by the host/provider firewalls so it remains reachable only locally. Enable both services:
 
@@ -173,7 +173,7 @@ The bundled certificate is self-signed. Start signaling, SFU, and AppWeb in sepa
 
 ```bash
 cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 --grpc-port 50051 --tls
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 --media-port-min 35000 --media-port-max 35000 --grpc-url https://127.0.0.1:50051 --insecure-tls
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --media-port-min 35000 --media-port-max 35000 --grpc-url https://127.0.0.1:50051 --insecure-tls
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws --grpc-url https://127.0.0.1:50051 --insecure-tls --tls
 ```
 
@@ -212,4 +212,4 @@ sudo certbot renew --dry-run
 
 ## CLI reference
 
-Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb and signaling support `--host-ip`, `--port`, `--tls`, `--certificate`, and `--private-key`. All three binaries support `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb requires `--public-url` and `--ws-url`; it also supports `--grpc-url`, `--insecure-tls`, `--web-root`, ICE options, banner configuration, and `--bypass-join-confirmation`. Signaling accepts `--public-url` and supports `--grpc-port`; its `--host-ip` and `--tls` settings apply to both listeners. SFU supports `--host-ip`, `--public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, advertised capacities, and an optional process-incarnation `--instance-id`. AppWeb's `--ws-url` is the authoritative value returned to browsers; signaling's `--public-url` does not replace it. Keep port `50051` inaccessible from external networks until mTLS client authentication is implemented.
+Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb and signaling support `--host-ip`, `--port`, `--tls`, `--certificate`, and `--private-key`. All three binaries support `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb requires `--public-url` and `--ws-url`; it also supports `--grpc-url`, `--insecure-tls`, `--web-root`, ICE options, banner configuration, and `--bypass-join-confirmation`. Signaling accepts `--public-url` and supports `--grpc-port`; its `--host-ip` and `--tls` settings apply to both listeners. SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, advertised capacities, and an optional process-incarnation `--instance-id`. AppWeb's `--ws-url` is the authoritative value returned to browsers; signaling's `--public-url` does not replace it. Keep port `50051` inaccessible from external networks until mTLS client authentication is implemented.

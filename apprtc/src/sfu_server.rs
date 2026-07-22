@@ -30,7 +30,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct Config {
     pub host_ip: IpAddr,
-    pub public_ip: IpAddr,
+    pub media_ip: IpAddr,
     pub media_port_min: u16,
     pub media_port_max: u16,
     pub grpc_url: String,
@@ -82,7 +82,7 @@ pub async fn run(mut stop_rx: watch::Receiver<()>, config: Config) -> anyhow::Re
     let mut media = Vec::new();
     let mut media_handles = Vec::new();
     for (port, socket) in sockets {
-        let advertised_addr = SocketAddr::new(config.public_ip, port);
+        let advertised_addr = SocketAddr::new(config.media_ip, port);
         let (command_tx, command_rx) = mpsc::channel(CHANNEL_CAPACITY);
         media.push(command_tx);
         media_handles.push(tokio::spawn(media_loop(

@@ -3,9 +3,9 @@ cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051 --tls -d -l info -o ~/Downloads/signaling.log &
 
 # 2. Start one SFU worker.
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --public-ip 127.0.0.1 \
-  --media-port-min 35000 --media-port-max 35000 \
-  --grpc-url https://127.0.0.1:50051 --insecure-tls -d -l info -o ~/Downloads/sfu.log &
+cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 --port 8082 \
+  --media-port-min 35000 --media-port-max 35000 --redirect-url https://127.0.0.1:8080 \
+  --grpc-url https://127.0.0.1:50051 --insecure-tls --tls -d -l info -o ~/Downloads/sfu.log &
 
 # 3. Start AppWeb.
 cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
