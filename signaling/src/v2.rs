@@ -447,27 +447,98 @@ impl RoomTable {
     }
 
     pub fn deregister(&mut self, now: Instant, room_id: RoomId, client_id: ClientId) {
-        let reconnect_grace = self.reconnect_grace;
-        let Some(room) = self.rooms.get_mut(&room_id) else {
-            return;
-        };
-        // Match the chat.rs example: an SFU member whose WebSocket drops (browser close,
-        // refresh, crash) is treated as an immediate leave — no reconnect grace — so the SFU
-        // stops forwarding its media and the other clients' grid tiles prune right away.
-        // A zero deadline fires on the very next `handle_timeout` tick. P2P and upgrading
-        // members keep the reconnect grace so a quick refresh can rejoin without collapsing
-        // the call or prematurely promoting the survivor.
-        let grace = if room.mode == RoomMode::Sfu {
-            Duration::ZERO
-        } else {
-            reconnect_grace
-        };
-        if let Some(member) = room.members.get_mut(&client_id)
-            && member.registered
-        {
+        let is_sfu = {
+            let Some(room) = self.rooms.get_mut(&room_id) else {
+                return;
+            };
+            let is_sfu = room.mode == RoomMode::Sfu;
+            let Some(member) = room.members.get_mut(&client_id) else {
+                return;
+            };
+            if !member.registered {
+                return;
+            }
             member.registered = false;
-            member.reconnect_deadline = Some(now + grace);
+            is_sfu
+        };
+        // Match the chat.rs example: an SFU member whose WebSocket drops (browser close, refresh,
+        // crash) is treated as an *immediate* leave — issue the `Leave` command to the worker now
+        // so its forwarded media stops and the other clients' grid tiles prune without waiting out
+        // the reconnect grace. Only fall back to the grace deadline when the leave can't be issued
+        // yet (worker unavailable or a leave already pending), where `handle_timeout` retries it.
+        if is_sfu && self.issue_sfu_leave(room_id, client_id, sfu::LeaveReason::Disconnected) {
+            return;
         }
+        // P2P and upgrading members keep the reconnect grace so a quick refresh can rejoin without
+        // collapsing the call or prematurely promoting the survivor.
+        if let Some(member) = self
+            .rooms
+            .get_mut(&room_id)
+            .and_then(|room| room.members.get_mut(&client_id))
+        {
+            member.reconnect_deadline = Some(now + self.reconnect_grace);
+        }
+    }
+
+    /// Queue an immediate `Leave` command to the SFU worker owning `room_id`, recording the room's
+    /// pending leave. Returns `false` (queuing nothing) when the room/member is gone, a leave is
+    /// already in flight, or no worker connection is available; the caller then falls back to a
+    /// reconnect deadline that `handle_timeout` retries.
+    fn issue_sfu_leave(
+        &mut self,
+        room_id: RoomId,
+        client_id: ClientId,
+        reason: sfu::LeaveReason,
+    ) -> bool {
+        let Some(room) = self.rooms.get(&room_id) else {
+            return false;
+        };
+        if room.mode != RoomMode::Sfu || room.pending_leave.is_some() {
+            return false;
+        }
+        let Some(member) = room.members.get(&client_id) else {
+            return false;
+        };
+        let lifecycle_id = member.lifecycle_id;
+        let assignment_epoch = room.assignment_epoch;
+        let Some(instance_id) = room.assigned_instance.clone() else {
+            return false;
+        };
+        let Some(connection_id) = self
+            .workers
+            .get(&instance_id)
+            .and_then(|worker| worker.connection_id)
+        else {
+            return false;
+        };
+        let room = self.rooms.get_mut(&room_id).expect("room checked");
+        room.pending_leave = Some(PendingLeave {
+            authority_request_id: None,
+            client_id,
+        });
+        let request_id = self.next_command_id();
+        self.queue_command(
+            instance_id.clone(),
+            connection_id,
+            sfu::Command {
+                request_id,
+                command: sfu::CommandKind::Leave(sfu::LeaveMember {
+                    room_id,
+                    client_id,
+                    lifecycle_id,
+                    assignment_epoch,
+                    reason,
+                }),
+            },
+            PendingCommand::SfuLeave {
+                instance_id,
+                room_id,
+                client_id,
+                lifecycle_id,
+                assignment_epoch,
+            },
+        );
+        true
     }
 
     pub fn send(
@@ -1291,50 +1362,13 @@ impl RoomTable {
                     .flatten()
             });
             if let Some(client_id) = expired_sfu_client {
-                let (instance_id, assignment_epoch) = {
-                    let room = self.rooms.get(&room_id).expect("room checked");
-                    (
-                        room.assigned_instance.clone().unwrap_or_default(),
-                        room.assignment_epoch,
-                    )
-                };
-                let connection_id = self
-                    .workers
-                    .get(&instance_id)
-                    .and_then(|worker| worker.connection_id);
-                if let Some(connection_id) = connection_id {
-                    let lifecycle_id = self.rooms[&room_id].members[&client_id].lifecycle_id;
-                    let room = self.rooms.get_mut(&room_id).expect("room checked");
-                    room.pending_leave = Some(PendingLeave {
-                        authority_request_id: None,
-                        client_id,
-                    });
-                    let request_id = self.next_command_id();
-                    self.queue_command(
-                        instance_id.clone(),
-                        connection_id,
-                        sfu::Command {
-                            request_id,
-                            command: sfu::CommandKind::Leave(sfu::LeaveMember {
-                                room_id,
-                                client_id,
-                                lifecycle_id,
-                                assignment_epoch,
-                                reason: sfu::LeaveReason::Disconnected,
-                            }),
-                        },
-                        PendingCommand::SfuLeave {
-                            instance_id,
-                            room_id,
-                            client_id,
-                            lifecycle_id,
-                            assignment_epoch,
-                        },
-                    );
-                } else if let Some(member) = self
-                    .rooms
-                    .get_mut(&room_id)
-                    .and_then(|room| room.members.get_mut(&client_id))
+                // Retry the leave that couldn't be issued when the browser disconnected (worker
+                // was unavailable then); re-arm the grace if it still can't go out.
+                if !self.issue_sfu_leave(room_id, client_id, sfu::LeaveReason::Disconnected)
+                    && let Some(member) = self
+                        .rooms
+                        .get_mut(&room_id)
+                        .and_then(|room| room.members.get_mut(&client_id))
                 {
                     member.reconnect_deadline = Some(now + self.reconnect_grace);
                 }
@@ -1838,5 +1872,59 @@ mod tests {
             Some(Action::RoomFailed { room_id: 42, .. })
         ));
         assert_eq!(rooms.occupancy(42), (3, RoomMode::Failed));
+    }
+
+    #[test]
+    fn sfu_member_disconnect_issues_immediate_leave() {
+        let now = Instant::now();
+        let mut rooms = RoomTable::new(Duration::from_secs(10));
+        register_ready_worker(&mut rooms);
+        let first = match rooms.admit(10, now, 42, 101, "token-101".into()).unwrap() {
+            AdmissionResult::Complete(admission) => admission,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        rooms.admit(11, now, 42, 102, "token-102".into()).unwrap();
+        rooms.admit(12, now, 42, 103, "token-103".into()).unwrap();
+        for _ in 0..3 {
+            let command = match rooms.poll_action().unwrap() {
+                Action::Sfu(sfu::Output::Command { command, .. }) => command,
+                action => panic!("unexpected action: {action:?}"),
+            };
+            let join = match command.command {
+                sfu::CommandKind::Join(join) => join,
+                _ => panic!("expected join"),
+            };
+            rooms
+                .handle_sfu_input(sfu::Input::CommandResult {
+                    connection_id: 9,
+                    instance_id: "worker-1".into(),
+                    result: sfu::CommandResult {
+                        request_id: command.request_id,
+                        result: Ok(sfu::CommandOk::MemberJoined(join)),
+                    },
+                })
+                .unwrap();
+        }
+        assert_eq!(rooms.occupancy(42), (3, RoomMode::Sfu));
+
+        // Register client 101's browser WebSocket, then drain the upgrade/registration actions.
+        rooms.register(42, 101, &first.admission_token).unwrap();
+        while rooms.poll_action().is_some() {}
+
+        // The WebSocket drops (browser close/refresh). An SFU member must be left immediately —
+        // no reconnect grace — so the worker stops forwarding its media right away.
+        rooms.deregister(now, 42, 101);
+        let command = match rooms.poll_action().unwrap() {
+            Action::Sfu(sfu::Output::Command { command, .. }) => command,
+            action => panic!("expected immediate leave command, got: {action:?}"),
+        };
+        let leave = match command.command {
+            sfu::CommandKind::Leave(leave) => leave,
+            other => panic!("expected leave, got: {other:?}"),
+        };
+        assert_eq!(leave.room_id, 42);
+        assert_eq!(leave.client_id, 101);
+        assert!(matches!(leave.reason, sfu::LeaveReason::Disconnected));
+        assert!(rooms.poll_action().is_none());
     }
 }

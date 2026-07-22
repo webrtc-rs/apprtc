@@ -407,6 +407,9 @@ impl Collider {
                 if self.v2_connections.get(&key) == Some(&connection_id) {
                     self.v2_connections.remove(&key);
                     self.v2_rooms.deregister(now, room_id, client_id);
+                    // An SFU disconnect issues an immediate `Leave` command; flush it to the
+                    // worker so its forwarded media stops right away.
+                    self.drain_v2_actions();
                 }
             }
             Session::Connected => {}
@@ -726,6 +729,9 @@ impl Protocol<BrowserInput, AuthorityCommand, Infallible> for Collider {
         for promotion in self.v2_rooms.handle_timeout(now) {
             self.push_promotion(promotion);
         }
+        // Timeouts can queue SFU commands (e.g. a retried disconnect `Leave`); flush them so they
+        // reach the worker instead of stalling until the next browser/authority event.
+        self.drain_v2_actions();
         Ok(())
     }
 
