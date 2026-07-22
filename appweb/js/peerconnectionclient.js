@@ -219,8 +219,51 @@ PeerConnectionClient.prototype.getPeerConnectionStats = function(callback) {
       .then(callback);
 };
 
+// SFU mode only: constrain every transceiver to VP8 (video) / Opus (audio) via
+// setCodecPreferences, so this client publishes and receives only the codec the SFU forwards —
+// no client can negotiate a codec (VP9/H264/G722/...) the SFU does not forward. This is the
+// setCodecPreferences equivalent of the SFU chat sample's setupCodecs(); it must run before
+// createOffer/createAnswer so the preference shapes the generated m= lines. A no-op where the
+// browser lacks setCodecPreferences / getCapabilities.
+PeerConnectionClient.prototype.setupCodecs_ = function() {
+  if (!this.sfuMode_ || !this.pc_ ||
+      typeof RTCRtpSender === 'undefined' ||
+      !RTCRtpSender.getCapabilities) {
+    return;
+  }
+  var videoCodecs = RTCRtpSender.getCapabilities('video').codecs
+      .filter(function(codec) {
+        return codec.mimeType.toLowerCase() === 'video/vp8';
+      });
+  var audioCodecs = RTCRtpSender.getCapabilities('audio').codecs
+      .filter(function(codec) {
+        return codec.mimeType.toLowerCase() === 'audio/opus';
+      });
+  this.pc_.getTransceivers().forEach(function(transceiver) {
+    if (!transceiver.setCodecPreferences) {
+      return;
+    }
+    // A transceiver always has both a sender and a receiver; use whichever carries the track so
+    // the kind is known for send-only (publish) and recv-only (forward) transceivers alike.
+    var kind = (transceiver.sender && transceiver.sender.track &&
+                transceiver.sender.track.kind) ||
+               (transceiver.receiver && transceiver.receiver.track &&
+                transceiver.receiver.track.kind);
+    try {
+      if (kind === 'video' && videoCodecs.length > 0) {
+        transceiver.setCodecPreferences(videoCodecs);
+      } else if (kind === 'audio' && audioCodecs.length > 0) {
+        transceiver.setCodecPreferences(audioCodecs);
+      }
+    } catch (e) {
+      trace('setCodecPreferences failed: ' + e);
+    }
+  });
+};
+
 PeerConnectionClient.prototype.doAnswer_ = function() {
   trace('Sending answer to peer.');
+  this.setupCodecs_();
   return this.pc_.createAnswer()
       .then(this.setLocalSdpAndNotify_.bind(this));
 };
@@ -230,6 +273,7 @@ PeerConnectionClient.prototype.makeOffer_ = function(offerOptions) {
     return Promise.resolve();
   }
   this.makingOffer_ = true;
+  this.setupCodecs_();
   var revision = ++this.offerRevision_;
   return this.pc_.createOffer(offerOptions).then(function(offer) {
     // A polite V2 peer may receive and accept a remote offer while createOffer
