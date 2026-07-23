@@ -66,9 +66,7 @@ Build the required binaries:
 ```bash
 cd /opt/apprtc
 cargo build --release -p apprtc --bin appweb --bin signaling --bin sfu
-chmod +x /opt/apprtc/target/release/appweb
-chmod +x /opt/apprtc/target/release/signaling
-chmod +x /opt/apprtc/target/release/sfu
+chmod +x /opt/apprtc/target/release/appweb /opt/apprtc/target/release/signaling /opt/apprtc/target/release/sfu
 ```
 
 For an upgrade after the systemd units below have already been installed, restart both services with:
