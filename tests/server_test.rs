@@ -1,10 +1,11 @@
 //! Black-box compatibility tests against a separately running AppRTC server.
 //!
-//! Start the server before running this test target:
+//! Start the AppWeb, signaling, and SFU processes before running this test target:
 //!
 //! ```text
-//! cargo run -p apprtc -- --host 127.0.0.1 --port 8080 --web-root appweb --tls &
-//! cargo test -p apprtc --test '*'
+//! ./scripts/start.sh
+//! cargo test --test '*' -- --nocapture
+//! ./scripts/stop.sh
 //! ```
 
 mod common;

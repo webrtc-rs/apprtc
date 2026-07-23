@@ -45,11 +45,11 @@ repository's `go` branch.
 
 ## Architecture
 
-The workspace has four Rust crates:
+The repository root is both the `apprtc` package and the Cargo workspace root. The workspace has four Rust crates:
 
 | Crate                                | Responsibility                                                                                                                                                                                                                 |
 |--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](apprtc)                   | Standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver.     |
+| [`apprtc`](.)                        | Root package containing the standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
 | [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                                                                    |
 | [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own. |
 | [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and SFU workers.                                                                                                                                            |
@@ -72,19 +72,19 @@ Collider
 Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and testable
 in memory, without sockets or a wall clock.
 
-The `apprtc` library keeps each runtime responsibility in a dedicated module:
+The root `apprtc` package keeps each runtime responsibility in a dedicated module:
 
 ```text
-apprtc/src/
+src/
 ├── grpc_server.rs        private signaling gRPC service adapter
 ├── sfu_server.rs         signaling stream, UDP media shards, and Sans-I/O SFU adapter
 ├── signaling_server.rs   command channel and single-owner Collider event loop
 └── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ```
 
-[`apprtc/src/ws_server.rs`](apprtc/src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
-events and text frames into driver commands. [`apprtc/src/grpc_server.rs`](apprtc/src/grpc_server.rs) adapts private
-gRPC requests to the same command channel. [`apprtc/src/signaling_server.rs`](apprtc/src/signaling_server.rs) owns the
+[`src/ws_server.rs`](src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
+events and text frames into driver commands. [`src/grpc_server.rs`](src/grpc_server.rs) adapts private
+gRPC requests to the same command channel. [`src/signaling_server.rs`](src/signaling_server.rs) owns the
 single Collider event loop, serializes every browser and authority operation, fires protocol timeouts, and routes
 outputs back to the WebSocket or gRPC caller. Tasks sleep on async I/O, deadlines, or shutdown without polling.
 
@@ -160,25 +160,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+The root `Cargo.toml` defines both the `apprtc` package and the workspace. Commands for the root package can therefore omit `-p apprtc`; use `--workspace` when a command must cover `appweb`, `signaling`, and `signaling-proto` as well.
+
 The integration tests are black-box clients of real standalone AppWeb and signaling TLS servers:
 
 ```bash
 # 1. Start signaling.
-cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
+cargo run --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051 --tls &
 
 # 2. Start one SFU worker.
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 \
+cargo run --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls &
 
 # 3. Start AppWeb.
-cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+cargo run --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
   --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws \
   --grpc-url https://127.0.0.1:50051 --insecure-tls --tls &
 
 # 4. Run the integration tests.
-cargo test -p apprtc --test '*' -- --nocapture
+cargo test --test '*' -- --nocapture
 
 # 5. Stop all three services.
 kill $(pgrep -f "target/debug/(appweb|signaling|sfu)") || true
@@ -191,12 +193,12 @@ CI performs the same sequence with a release build in `.github/workflows/tests.y
 Run signaling, one SFU worker, and AppWeb separately from the repository root:
 
 ```bash
-cargo run -p apprtc --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
+cargo run --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
   --grpc-port 50051
-cargo run -p apprtc --bin sfu -- --host-ip 127.0.0.1 \
+cargo run --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url http://127.0.0.1:50051
-cargo run -p apprtc --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+cargo run --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
   --public-url http://127.0.0.1:8080 --ws-url ws://127.0.0.1:8081/ws \
   --grpc-url http://127.0.0.1:50051
 ```
@@ -219,14 +221,14 @@ include `/ws`, and `--grpc-url` independently selects the private signaling gRPC
 Add `--tls` to serve real HTTPS and WSS from the same listener:
 
 ```bash
-cargo run -p apprtc --bin signaling -- \
+cargo run --bin signaling -- \
   --host-ip 127.0.0.1 --port 8081 --tls \
   --grpc-port 50051
-cargo run -p apprtc --bin sfu -- \
+cargo run --bin sfu -- \
   --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls
-cargo run -p apprtc --bin appweb -- \
+cargo run --bin appweb -- \
   --host-ip 127.0.0.1 \
   --port 8080 \
   --web-root appweb \
@@ -240,7 +242,7 @@ cargo run -p apprtc --bin appweb -- \
 ```
 
 Without certificate options, AppRTC uses the bundled development certificate at [
-`apprtc/cert/cert.pem`](apprtc/cert/cert.pem). Its subject alternative names include `localhost`, `127.0.0.1`, and
+`cert/cert.pem`](cert/cert.pem). Its subject alternative names include `localhost`, `127.0.0.1`, and
 `::1`, but it is self-signed. Trust that certificate in the browser or operating-system trust store before opening the
 page; otherwise HTTPS and WSS clients will reject it with `CertificateUnknown` or an equivalent certificate-authority
 error.
@@ -248,18 +250,18 @@ error.
 For a deployment, supply a certificate issued by a trusted authority. Both options must be supplied together:
 
 ```bash
-cargo run -p apprtc --bin signaling -- \
+cargo run --bin signaling -- \
   --host-ip 0.0.0.0 --port 443 --tls \
   --grpc-port 50051 \
   --certificate /path/to/fullchain.pem \
   --private-key /path/to/privkey.pem
 
-cargo run -p apprtc --bin sfu -- \
+cargo run --bin sfu -- \
   --host-ip 0.0.0.0 --media-public-ip 203.0.113.20 \
   --media-port-min 3478 --media-port-max 3497 \
   --grpc-url https://sfu.example.com:50051
 
-cargo run -p apprtc --bin appweb -- \
+cargo run --bin appweb -- \
   --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
   --ws-url wss://sfu.example.com/ws --grpc-url https://sfu.example.com:50051 --tls \
   --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
@@ -267,8 +269,7 @@ cargo run -p apprtc --bin appweb -- \
 
 ## Command-line options
 
-Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin signaling -- --help`, or
-`cargo run -p apprtc --bin sfu -- --help` for the authoritative lists.
+Run `cargo run --bin appweb -- --help`, `cargo run --bin signaling -- --help`, or `cargo run --bin sfu -- --help` for the authoritative lists.
 
 | Option                         |                  Default | Description                                                                                      |
 |--------------------------------|-------------------------:|--------------------------------------------------------------------------------------------------|
@@ -302,7 +303,7 @@ Run `cargo run -p apprtc --bin appweb -- --help`, `cargo run -p apprtc --bin sig
 Example ICE configuration:
 
 ```bash
-cargo run -p apprtc --bin appweb -- \
+cargo run --bin appweb -- \
   --ice-server-url stun:stun.l.google.com:19302 \
   --ice-server-url turn:turn.example.com:3478
 ```

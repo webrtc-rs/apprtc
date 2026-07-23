@@ -12,7 +12,7 @@ The implementation is organized as four core Rust crates plus the SFU crate:
 
 | Component         | Network role                                              | Owns                                                                                                                 |
 |-------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| `apprtc`          | HTTP, WebSocket, gRPC, and UDP runtime adapters            | standalone `appweb`, `signaling`, and `sfu` binaries, TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
+| `apprtc`          | HTTP, WebSocket, gRPC, and UDP runtime adapters            | root Cargo package with standalone `appweb`, `signaling`, and `sfu` binaries, TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
 | `appweb`          | HTTP server; gRPC **client** of `signaling`               | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
 | `signaling`       | no network role; Sans-I/O signaling authority             | authoritative V1/V2 room model, queue/reconnect grace, P2P relay, SFU worker registry, room assignment, upgrade barrier, and recovery state |
 | `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated AppWeb/signaling/SFU gRPC request, response, command, result, and event types                              |
@@ -20,7 +20,7 @@ The implementation is organized as four core Rust crates plus the SFU crate:
 
 `appweb` and `signaling` are separate crates; the standalone `appweb` and `signaling` processes communicate through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while AppWeb and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
-Within the `apprtc` runtime crate, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. Both network adapters submit typed commands to that event loop and never mutate signaling state directly. `tls.rs` provides the shared certificate and listener support used by the binaries.
+The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate under `cert/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. `tls.rs` provides the shared certificate and listener support used by the binaries.
 
 ## 1. Topology and authority
 

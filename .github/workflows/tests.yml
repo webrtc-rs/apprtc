@@ -33,7 +33,7 @@ jobs:
         run: mkdir -p logs
 
       - name: Build AppWeb, signaling, SFU, and tests
-        run: cargo build --release --package apprtc --bins --tests
+        run: cargo build --release --bins --tests
 
       - name: Start AppWeb before signaling and verify startup recovery
         run: |
@@ -87,7 +87,7 @@ jobs:
           exit 1
 
       - name: Run tests
-        run: cargo test --package apprtc --no-fail-fast --test '*' -- --nocapture
+        run: cargo test --no-fail-fast --test '*' -- --nocapture
 
       - name: Stop signaling and AppWeb servers
         if: always()

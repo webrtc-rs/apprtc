@@ -63,7 +63,7 @@ Build the required binaries:
 
 ```bash
 cd /opt/apprtc
-cargo build --release -p apprtc --bin sfu
+cargo build --release --bin sfu
 chmod +x /opt/apprtc/target/release/sfu
 ```
 

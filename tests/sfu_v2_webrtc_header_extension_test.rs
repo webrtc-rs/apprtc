@@ -157,7 +157,7 @@ struct Active {
 }
 
 // Run explicitly against a live signaling + sfu + appweb stack:
-//   cargo test -p apprtc --test sfu_v2_webrtc_header_extension_test -- --nocapture
+//   cargo test --test sfu_v2_webrtc_header_extension_test -- --nocapture
 //
 // The SFU never makes the first offer: it answers each client's initial offer (learning that
 // client's codec and RTP-header-extension id assignments) before creating any subscribe offer,

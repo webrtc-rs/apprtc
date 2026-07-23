@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "apprtc", # apprtc binary
     "appweb", # app/web server
     "signaling", # signaling hub
     "signaling-proto", # signaling protobuf
@@ -63,3 +62,50 @@ tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tokio-stream = { version = "0.1", features = ["net"] }
+
+[package]
+name = "apprtc"
+description = "AppRTC P2P/SFU Signaling Server in Rust"
+documentation = "https://docs.rs/apprtc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+appweb.workspace = true
+signaling.workspace = true
+signaling-proto.workspace = true
+sfu.workspace = true
+rtc.workspace = true
+
+sansio.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+log.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+url.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+webrtc.workspace = true
+async-trait.workspace = true
