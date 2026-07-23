@@ -1,17 +1,17 @@
-# Javascript object hierarchy #
+# JavaScript object hierarchy
 
-AppController: The controller that connects the UI and the model "Call". It owns
-Call, InfoBox and RoomSelection.
+`AppController`: Connects the UI to `Call`. It owns `Call`, `InfoBox`, and `RoomSelection`; in SFU mode it also owns the publisher-keyed grid tile map and reconciles tiles after each negotiated subscribe offer.
 
-Call: Manages everything needed to make a call. It owns SignalingChannel and
-PeerConnectionClient.
+`Call`: Owns local media, `SignalingChannel`, and the active `PeerConnectionClient`. During P2P→SFU upgrade it temporarily retains the old P2P client while creating the new SFU client, then closes P2P when SFU ICE connects.
 
-SignalingChannel: Wrapper of the WebSocket connection.
+`SignalingChannel`: Wraps the browser WebSocket. V1 registration is silent; V2 waits for the authoritative `registered` control and stamps every send with the current signal epoch.
 
-PeerConnectionClient: Wrapper of RTCPeerConnection.
+`PeerConnectionClient`: Wraps `RTCPeerConnection`, SDP, and trickle ICE. For V2 it implements perfect negotiation: the P2P initiator is impolite, the callee is polite, and every browser is polite toward the SFU. A colliding SFU subscribe offer rolls back/supersedes the browser offer, is answered with its `requestid`, and is followed by a fresh publish offer.
 
-InfoBox: Wrapper of the info div utilities.
+`InfoBox`: Wraps the information and statistics UI.
 
-RoomSelection: Wrapper for the room selection UI. It owns Storage.
+`RoomSelection`: Owns room selection and chooses the V1 or V2 route. The current checkbox defaults to V2.
 
-Storage: Wrapper for localStorage/Chrome app storage API.
+`Storage`: Wraps browser local storage.
+
+The shared page includes `full_template.html` for the P2P stage and `grid_template.html` for the SFU participant grid. SFU→P2P downgrade is not implemented.

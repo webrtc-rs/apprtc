@@ -8,7 +8,7 @@ Browser ── HTTPS ──> AppWeb (https://appr.tc:443)
 Browser ── WSS ────> Signaling (wss://appr.tc:8443/ws)
 AppWeb  ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
 SFU 2   ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
-Browser <── ICE/DTLS/SRTP over UDP ──> SFU (sfu.rs:3478-3495)
+Browser <── ICE/DTLS/SRTP over UDP ──> SFU (sfu.rs:3478-3497)
 ```
 
 V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers P2P→SFU upgrade.
@@ -16,8 +16,7 @@ SFU→P2P downgrade is not implemented yet.
 
 ## DNS and firewall
 
-Point `sfu.rs` at the host. Allow TCP `443` and UDP `3478-3495` on the SFU host. Port `80` is only needed for Certbot
-standalone validation.
+Point `sfu.rs` at the host. Allow TCP `443` for the optional redirect and UDP `3478-3497` for media on the SFU host. Port `80` is only needed for Certbot standalone validation. The SFU host also needs outbound TCP access to signaling at `appr.tc:50051`; the signaling host/provider firewall must allow inbound TCP `50051` only from this SFU host's public IP (and any other trusted AppWeb/SFU hosts).
 
 * **A Record** pointing `@` to the server IP (e.g., `173.249.204.140`)
 * **A Record** pointing `www` to the same server if required
@@ -68,7 +67,7 @@ cargo build --release -p apprtc --bin sfu
 chmod +x /opt/apprtc/target/release/sfu
 ```
 
-For an upgrade after the systemd units below have already been installed, restart both services with:
+For an upgrade after the systemd unit below has already been installed, restart the service with:
 
 ```bash
 sudo systemctl restart apprtc-sfu
@@ -85,14 +84,14 @@ nano /etc/systemd/system/apprtc-sfu.service
 ```ini
 [Unit]
 Description=AppRTC SFU media worker
-After=network-online.target apprtc-signaling.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/apprtc
 ExecStartPre=/bin/sh -c 'mkdir -p /opt/logs; if [ -f /opt/logs/sfu.log ]; then mv /opt/logs/sfu.log /opt/logs/sfu-$(date +%%Y%%m%%d-%%H%%M%%S).log; fi'
-ExecStart=/opt/apprtc/target/release/sfu --host-ip 0.0.0.0 --port 443 --redirect-url https://appr.tc:443 --media-public-ip 173.249.204.140 --media-port-min 3478 --media-port-max 3495 --grpc-url https://appr.tc:50051 --tls --certificate /etc/letsencrypt/live/sfu.rs/fullchain.pem --private-key /etc/letsencrypt/live/sfu.rs/privkey.pem -d -l info -o /opt/logs/sfu.log
+ExecStart=/opt/apprtc/target/release/sfu --host-ip 0.0.0.0 --port 443 --redirect-url https://appr.tc/ --media-public-ip 173.249.204.140 --media-port-min 3478 --media-port-max 3497 --grpc-url https://appr.tc:50051 --tls --certificate /etc/letsencrypt/live/sfu.rs/fullchain.pem --private-key /etc/letsencrypt/live/sfu.rs/privkey.pem -d -l info -o /opt/logs/sfu.log
 Restart=always
 RestartSec=5
 KillSignal=SIGINT
@@ -102,7 +101,7 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-Do not use `--insecure-tls` in production. Enable sfu service on the host:
+`--tls`, `--certificate`, and `--private-key` protect only the optional redirect endpoint; the `https://` scheme in `--grpc-url` independently enables server-authenticated TLS for the outbound gRPC session. Do not use `--insecure-tls` in production. Enable the SFU service on the host:
 
 ```bash
 sudo systemctl daemon-reload
@@ -110,7 +109,13 @@ sudo systemctl enable --now apprtc-sfu
 sudo systemctl status apprtc-sfu
 ```
 
-The services handle SIGINT gracefully by draining SFU peer connections, and releasing media state.
+The service handles SIGINT gracefully by closing the SFU session and peer connections and releasing media state.
+
+## Worker registration and load balancing
+
+The process opens one reconnecting `OpenSfuSession` stream to signaling and reports `Ready` health plus its `--max-rooms` and `--max-clients` capacity. Signaling selects among eligible workers by the lowest tuple `(assigned_clients, assigned_rooms, instance_id)` and pins each upgraded room to one worker.
+
+Normally omit `--instance-id`. The process generates a unique incarnation ID once at startup and reuses it if its gRPC stream reconnects. A process restart generates a new ID by design: an empty replacement process must not claim WebRTC state owned by the previous process. If the old process does not reconnect during signaling's grace period, its established rooms fail with `room-failed`; they are not migrated automatically to another worker.
 
 ## Verify production
 
@@ -140,12 +145,4 @@ sudo certbot renew --dry-run
 
 ## CLI reference
 
-Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb and signaling support
-`--host-ip`, `--port`, `--tls`, `--certificate`, and `--private-key`. All three binaries support `--debug` (`-d`),
-`--level` (`-l`), and `--output-log-file` (`-o`). AppWeb requires `--public-url` and `--ws-url`; it also supports
-`--grpc-url`, `--insecure-tls`, `--web-root`, ICE options, banner configuration, and `--bypass-join-confirmation`.
-Signaling accepts `--public-url` and supports `--grpc-port`; its `--host-ip` and `--tls` settings apply to both
-listeners. SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`,
-`--insecure-tls`, advertised capacities, and an optional process-incarnation `--instance-id`. AppWeb's `--ws-url` is the
-authoritative value returned to browsers; signaling's `--public-url` does not replace it. Keep port `50051` inaccessible
-from external networks until mTLS client authentication is implemented.
+Run `sfu --help` for the authoritative options. The SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, `--max-rooms`, `--max-clients`, and an optional process-incarnation `--instance-id`. Its `--port`, `--redirect-url`, `--tls`, `--certificate`, and `--private-key` options configure only the optional landing-page redirect server. `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`) configure logging. On the signaling host, keep port `50051` inaccessible from all sources except the trusted AppWeb and SFU hosts until mTLS client authentication is implemented.
