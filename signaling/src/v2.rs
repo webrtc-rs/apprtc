@@ -1549,10 +1549,16 @@ impl RoomTable {
                         .map(|_| client_id)
                 })
                 .collect::<Vec<_>>();
-            for client_id in expired {
-                room.members.remove(&client_id);
+            for client_id in &expired {
+                room.members.remove(client_id);
             }
-            if let Some(promotion) = promote_survivor(room_id, room) {
+            // Only an actual removal can produce a survivor to promote. Without this guard
+            // the sweep re-promotes the lone member of every idle one-member P2P room on
+            // each timeout — including rooms nothing happened in — and the browser reads a
+            // `p2p-promote` as "the other side left".
+            if !expired.is_empty()
+                && let Some(promotion) = promote_survivor(room_id, room)
+            {
                 promotions.push(promotion);
             }
             if room.members.is_empty() {
@@ -1798,6 +1804,54 @@ mod tests {
             result => panic!("unexpected removal result: {result:?}"),
         };
         assert_eq!(promotion.client_id, 101);
+    }
+
+    /// A lone member waiting for a peer must never be promoted by a timeout. The sweep runs
+    /// for every room whenever any deadline in the table fires, so an unrelated room's
+    /// reconnect grace used to hand this room's only member a `p2p-promote`, which its
+    /// browser renders as "the remote side hung up".
+    #[test]
+    fn idle_single_member_room_is_not_promoted_by_an_unrelated_timeout() {
+        let now = Instant::now();
+        let mut rooms = RoomTable::new(Duration::from_secs(10));
+
+        // Room 7: two members, one of which disconnects and starts its reconnect grace.
+        let leaving = match rooms.admit(1, now, 7, 701, "token-701".into()).unwrap() {
+            AdmissionResult::Complete(value) => value,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        let staying = match rooms.admit(2, now, 7, 702, "token-702".into()).unwrap() {
+            AdmissionResult::Complete(value) => value,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        rooms.register(7, 701, &leaving.admission_token).unwrap();
+        rooms.register(7, 702, &staying.admission_token).unwrap();
+        rooms.deregister(now, 7, 701);
+
+        // Room 42: a single registered member waiting for someone to join.
+        let alone = match rooms.admit(3, now, 42, 101, "token-101".into()).unwrap() {
+            AdmissionResult::Complete(value) => value,
+            result => panic!("unexpected admission: {result:?}"),
+        };
+        rooms.register(42, 101, &alone.admission_token).unwrap();
+
+        // Room 7's grace expires. Its survivor is promoted; room 42 must be untouched.
+        let promotions = rooms.handle_timeout(now + Duration::from_secs(11));
+        assert_eq!(
+            promotions.len(),
+            1,
+            "only room 7 may promote: {promotions:?}"
+        );
+        assert_eq!(promotions[0].room_id, 7);
+        assert_eq!(promotions[0].client_id, 702);
+
+        // And a later sweep with nothing pending promotes nobody at all.
+        assert!(
+            rooms
+                .handle_timeout(now + Duration::from_secs(30))
+                .is_empty(),
+            "an idle sweep must not promote anyone"
+        );
     }
 
     #[test]
