@@ -52,6 +52,10 @@ var UI_CONSTANTS = {
   videosDiv: '#videos',
 };
 
+// How long the SFU grid may be held after the direct P2P transport connects, waiting for
+// the direct remote video to become playable, before the P2P layout takes over anyway.
+var P2P_LAYOUT_MEDIA_TIMEOUT_MS = 3000;
+
 // The controller that connects the Call with the UI.
 var AppController = function(loadingParams) {
   trace('Initializing; server= ' + loadingParams.roomServer + '.');
@@ -104,6 +108,9 @@ var AppController = function(loadingParams) {
     this.roomSelection_ = null;
     this.localStream_ = null;
     this.remoteVideoResetTimer_ = null;
+    this.p2pLayoutTimer_ = null;
+    this.p2pLayoutCanPlay_ = null;
+    this.p2pLayoutPending_ = false;
 
     // If the params has a roomId specified, we should connect to that room
     // immediately. If not, show the room selection UI.
@@ -252,6 +259,12 @@ AppController.prototype.hangup_ = function() {
 };
 
 AppController.prototype.onRemoteHangup_ = function() {
+  // The peer left while a downgrade was still waiting for its media: its video is never
+  // going to arrive, so retire the grid now rather than letting the fallback timer fire
+  // into the waiting layout.
+  if (this.p2pLayoutPending_) {
+    this.completeP2pLayout_();
+  }
   this.displayStatus_('The remote side hung up.');
   this.transitionToWaiting_();
 
@@ -259,7 +272,15 @@ AppController.prototype.onRemoteHangup_ = function() {
 };
 
 AppController.prototype.onRemoteSdpSet_ = function(hasRemoteVideo) {
-  if (this.call_.getMode() === 'upgrading' || this.call_.getMode() === 'sfu') {
+  var mode = this.call_.getMode();
+  // While a transition owns the screen, the stage must not activate under the grid;
+  // onModeChange_ finishes the transition once the new transport's media is ready.
+  // |p2pLayoutPending_| covers the tail of a downgrade: Call has already committed mode
+  // p2p, but the grid is still up and #local-video is still empty, so letting
+  // transitionToActive_ run here would blank the self-view (it copies #local-video's
+  // stream into #mini-video).
+  if (mode === 'upgrading' || mode === 'sfu' || mode === 'downgrading' ||
+      this.p2pLayoutPending_) {
     return;
   }
   if (hasRemoteVideo) {
@@ -423,31 +444,31 @@ AppController.prototype.onModeChange_ = function(mode) {
     this.displayStatus_('Switching to group call…');
     return;
   }
+  if (mode === 'downgrading') {
+    // SFU -> P2P downgrade in progress. Keep the grid exactly as it is: the retained SFU
+    // peer connection holds each tile's last frames while the direct P2P connection
+    // negotiates, so the participant never blinks out of existence mid-transition.
+    this.displayStatus_('Switching to direct call…');
+    return;
+  }
   if (mode === 'p2p') {
-    // SFU -> P2P downgrade: the room shrank to two, so tear down the per-publisher grid
-    // and return to the full-screen P2P layout. Only the remote view changes; the self-view
-    // and controls keep their P2P position. The direct remote video fills the stage when the
-    // new P2P peer connection's track arrives (onRemoteSdpSet_ -> transitionToActive_).
-    for (var tileKey in this.sfuTiles_) {
-      if (this.sfuTiles_.hasOwnProperty(tileKey)) {
-        this.sfuTiles_[tileKey].remove();
-      }
+    // The direct transport is up. Hold the grid — still showing the SFU's last frames —
+    // for the final stretch until the direct remote video can actually play, so the stage
+    // never appears blank. Bounded, because an audio-only or stalled peer must not leave a
+    // retired grid on screen forever.
+    if (this.sfuGrid_ && !this.sfuGrid_.classList.contains('hidden') &&
+        this.remoteVideo_.srcObject && this.remoteVideo_.readyState < 2) {
+      this.p2pLayoutPending_ = true;
+      // Use a listener rather than the .oncanplay property: transitionToActive_,
+      // transitionToWaiting_ and waitForRemoteVideo_ all overwrite that one property,
+      // and any of them would silently cancel this completion.
+      this.p2pLayoutCanPlay_ = this.completeP2pLayout_.bind(this);
+      this.remoteVideo_.addEventListener('canplay', this.p2pLayoutCanPlay_);
+      this.p2pLayoutTimer_ = setTimeout(
+          this.completeP2pLayout_.bind(this), P2P_LAYOUT_MEDIA_TIMEOUT_MS);
+      return;
     }
-    this.sfuTiles_ = {};
-    this.sfuGrid_.classList.add('hidden');
-    this.videosDiv_.classList.remove('sfu-mode');
-    // Restore the P2P container (which mirrors the self-view back to the right) and keep the
-    // self-view populated across the break-before-make gap.
-    this.activate_(this.videosDiv_);
-    if (this.localStream_) {
-      this.localVideo_.srcObject = this.localStream_;
-      this.miniVideo_.srcObject = this.localStream_;
-    }
-    this.activate_(this.miniVideo_);
-    this.deactivate_(this.remoteVideo_);
-    this.show_(this.icons_);
-    this.show_(this.hangupSvg_);
-    this.displayStatus_('');
+    this.completeP2pLayout_();
     return;
   }
   if (mode === 'sfu') {
@@ -466,6 +487,54 @@ AppController.prototype.onModeChange_ = function(mode) {
     this.show_(this.hangupSvg_);
     this.displayStatus_('');
   }
+};
+
+// Drop whatever is keeping the grid on screen for the tail of a downgrade.
+AppController.prototype.clearP2pLayoutHold_ = function() {
+  this.p2pLayoutPending_ = false;
+  if (this.p2pLayoutTimer_) {
+    clearTimeout(this.p2pLayoutTimer_);
+    this.p2pLayoutTimer_ = null;
+  }
+  if (this.p2pLayoutCanPlay_) {
+    this.remoteVideo_.removeEventListener('canplay', this.p2pLayoutCanPlay_);
+    this.p2pLayoutCanPlay_ = null;
+  }
+};
+
+// Retire the per-publisher grid and return to the full-screen P2P layout. Only the remote
+// view changes; the self-view and controls keep their P2P position. Idempotent, because it
+// is reached from whichever of the canplay callback and the fallback timer fires first.
+AppController.prototype.completeP2pLayout_ = function() {
+  this.clearP2pLayoutHold_();
+  for (var tileKey in this.sfuTiles_) {
+    if (this.sfuTiles_.hasOwnProperty(tileKey)) {
+      this.sfuTiles_[tileKey].remove();
+    }
+  }
+  this.sfuTiles_ = {};
+  this.sfuGrid_.classList.add('hidden');
+  this.videosDiv_.classList.remove('sfu-mode');
+  // Restore the P2P container, which mirrors the self-view back to the right.
+  this.activate_(this.videosDiv_);
+  if (this.localStream_) {
+    this.localVideo_.srcObject = this.localStream_;
+    this.miniVideo_.srcObject = this.localStream_;
+  }
+  this.activate_(this.miniVideo_);
+  this.show_(this.icons_);
+  this.show_(this.hangupSvg_);
+  this.displayStatus_('');
+  // onRemoteSdpSet_ suppresses the stage transition while the grid owns the screen, so
+  // finish it here: the direct remote stream is normally already attached by now.
+  if (this.remoteVideo_.srcObject) {
+    this.transitionToActive_();
+  } else {
+    this.deactivate_(this.remoteVideo_);
+  }
+  // The retired SFU connection's frames are off screen now, so its peer connection can go.
+  // Closing it ends its remote tracks, which is what the grid tiles were holding.
+  this.call_.releaseRetiredSfuTransport();
 };
 
 AppController.prototype.onLocalStreamAdded_ = function(stream) {
@@ -502,9 +571,11 @@ AppController.prototype.transitionToActive_ = function() {
   trace('Call setup time: ' + (connectTime - this.call_.startTime).toFixed(0) +
       'ms.');
 
-  // Prepare the remote video and PIP elements.
+  // Prepare the remote video and PIP elements. Prefer the captured stream over
+  // #local-video's: after any mode transition the full-screen local video has already been
+  // emptied, and copying its null srcObject here is what leaves the self-view black.
   trace('reattachMediaStream: ' + this.localVideo_.srcObject);
-  this.miniVideo_.srcObject = this.localVideo_.srcObject;
+  this.miniVideo_.srcObject = this.localStream_ || this.localVideo_.srcObject;
 
   // Transition opacity from 0 to 1 for the remote and mini videos.
   this.activate_(this.remoteVideo_);
@@ -535,8 +606,9 @@ AppController.prototype.transitionToWaiting_ = function() {
   }
 
   // Set localVideo.srcObject now so that the local stream won't be lost if the
-  // call is restarted before the timeout.
-  this.localVideo_.srcObject = this.miniVideo_.srcObject;
+  // call is restarted before the timeout. Prefer the captured stream: #mini-video may be
+  // empty if a mode transition was still in flight when the peer left.
+  this.localVideo_.srcObject = this.localStream_ || this.miniVideo_.srcObject;
 
   // Transition opacity from 0 to 1 for the local video.
   this.activate_(this.localVideo_);
@@ -546,8 +618,9 @@ AppController.prototype.transitionToWaiting_ = function() {
 };
 
 AppController.prototype.transitionToDone_ = function() {
-  // Stop waiting for remote video.
+  // Stop waiting for remote video, including a downgrade still holding the grid.
   this.remoteVideo_.oncanplay = undefined;
+  this.clearP2pLayoutHold_();
   this.deactivate_(this.localVideo_);
   this.deactivate_(this.remoteVideo_);
   this.deactivate_(this.miniVideo_);

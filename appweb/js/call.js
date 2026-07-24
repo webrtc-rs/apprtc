@@ -16,6 +16,10 @@
 
 'use strict';
 
+// How long the SFU -> P2P handoff may hold the grid waiting for direct media before it
+// gives up and switches to the P2P layout anyway.
+var DOWNGRADE_MEDIA_TIMEOUT_MS = 10000;
+
 var Call = function(params) {
   this.params_ = params;
   this.roomServer_ = params.roomServer || '';
@@ -27,7 +31,12 @@ var Call = function(params) {
   this.channel_.onerror = this.onError_.bind(this);
 
   this.pcClient_ = null;
+  // Retained during a mode transition so the outgoing transport keeps its media on
+  // screen until the incoming one is ready: the P2P client while upgrading, the SFU
+  // client while downgrading.
   this.p2pPcClient_ = null;
+  this.sfuPcClient_ = null;
+  this.downgradeTimer_ = null;
   this.createPcClientPromise_ = null;
   this.localStream_ = null;
   this.errorMessageQueue_ = [];
@@ -104,10 +113,7 @@ Call.prototype.hangup = function(async) {
     this.pcClient_ = null;
     this.createPcClientPromise_ = null;
   }
-  if (this.p2pPcClient_) {
-    this.p2pPcClient_.close();
-    this.p2pPcClient_ = null;
-  }
+  this.closeRetainedPcClients_();
 
   // Remove membership before closing signaling. V1 then sends its legacy BYE;
   // V2 relies on the authority's p2p-promote control to notify the survivor.
@@ -467,6 +473,9 @@ Call.prototype.createPcClient_ = function() {
   if (this.params_.sfuMode) {
     this.pcClient_.oniceconnectionstatechange =
         this.onSfuIceConnectionStateChange_.bind(this);
+  } else if (this.params_.mode === 'downgrading') {
+    this.pcClient_.oniceconnectionstatechange =
+        this.onDowngradeIceConnectionStateChange_.bind(this);
   }
   this.pcClient_.onnewicecandidate = this.onnewicecandidate;
   this.pcClient_.onerror = this.onerror;
@@ -589,32 +598,40 @@ Call.prototype.startSfuUpgrade_ = function() {
   }.bind(this));
 };
 
-// SFU -> P2P downgrade: the room shrank to two members, so signaling committed
-// direct P2P and told us to leave the SFU. Break-before-make (the design deliberately
-// permits a brief media gap): close the SFU peer connection, then build a direct P2P one
-// reusing the same local tracks. The elected initiator offers; the other answers.
+// SFU -> P2P downgrade: the room shrank to two members, so signaling committed direct
+// P2P and told us to leave the SFU. This mirrors the upgrade handoff. Signaling is
+// break-before-make (it has already retired both SFU legs on the worker), but the browser
+// is not: the SFU peer connection is retained so its last received frames keep the grid
+// populated while the direct P2P connection negotiates with the same local tracks. The
+// elected initiator offers; the other answers. The SFU client is closed and the layout
+// switches only once direct media is ready.
 Call.prototype.startSfuDowngrade_ = function(control) {
-  if (!this.params_.sfuMode && this.params_.mode === 'p2p') {
+  if (this.params_.mode === 'p2p' || this.params_.mode === 'downgrading') {
     return;
   }
   trace('Starting SFU to P2P downgrade at epoch ' + this.params_.signalEpoch + '.');
-  this.params_.mode = 'p2p';
+  this.params_.mode = 'downgrading';
+  // The new connection is a direct peer connection, so it must not use the SFU's
+  // always-polite negotiation role.
   this.params_.sfuMode = false;
   this.params_.isInitiator = control.is_initiator === true;
-  // Close both the live SFU peer connection and any P2P connection retained from a
-  // never-finished upgrade handoff.
-  if (this.pcClient_) {
-    this.pcClient_.close();
-    this.pcClient_ = null;
-  }
+  // Retain the SFU client for media continuity, and drop any P2P client still held from
+  // an upgrade handoff that never completed — it belongs to a retired epoch.
+  this.sfuPcClient_ = this.pcClient_;
+  this.retireSfuClientCallbacks_();
   if (this.p2pPcClient_) {
     this.p2pPcClient_.close();
     this.p2pPcClient_ = null;
   }
+  this.pcClient_ = null;
   this.createPcClientPromise_ = null;
   if (this.onmodechange) {
-    this.onmodechange('p2p');
+    this.onmodechange('downgrading');
   }
+  // The peer may never answer (it can leave during the handoff), and a retained SFU
+  // client shows nothing but frozen frames. Bound the transition so the UI cannot sit
+  // in "switching" forever.
+  this.startDowngradeTimer_();
   this.startTime = window.performance.now();
   this.maybeCreatePcClientAsync_().then(function() {
     if (this.localStream_) {
@@ -626,6 +643,7 @@ Call.prototype.startSfuDowngrade_ = function(control) {
       this.pcClient_.startAsCallee(this.params_.messages);
     }
   }.bind(this)).catch(function(error) {
+    this.finishSfuDowngrade_();
     this.onError_('SFU downgrade failed: ' + error.message);
   }.bind(this));
 };
@@ -646,6 +664,90 @@ Call.prototype.onSfuIceConnectionStateChange_ = function() {
   if (this.oniceconnectionstatechange) {
     this.oniceconnectionstatechange();
   }
+};
+
+// The downgrade counterpart of onSfuIceConnectionStateChange_: the direct P2P connection
+// is up, so the retained SFU client can go and the grid can give way to the P2P stage.
+Call.prototype.onDowngradeIceConnectionStateChange_ = function() {
+  var states = this.pcClient_ && this.pcClient_.getPeerConnectionStates();
+  if (states && (states.iceConnectionState === 'connected' ||
+      states.iceConnectionState === 'completed')) {
+    this.finishSfuDowngrade_();
+  }
+  if (this.oniceconnectionstatechange) {
+    this.oniceconnectionstatechange();
+  }
+};
+
+Call.prototype.startDowngradeTimer_ = function() {
+  this.clearDowngradeTimer_();
+  this.downgradeTimer_ = window.setTimeout(function() {
+    this.downgradeTimer_ = null;
+    if (this.params_.mode === 'downgrading') {
+      trace('Direct P2P media did not arrive; completing the downgrade anyway.');
+      this.finishSfuDowngrade_();
+    }
+  }.bind(this), DOWNGRADE_MEDIA_TIMEOUT_MS);
+};
+
+Call.prototype.clearDowngradeTimer_ = function() {
+  if (this.downgradeTimer_) {
+    window.clearTimeout(this.downgradeTimer_);
+    this.downgradeTimer_ = null;
+  }
+};
+
+// Complete the SFU -> P2P transition exactly once: hand the layout back to the full-screen
+// P2P stage. The retained SFU client is *not* closed here — closing it ends its remote
+// tracks, which empties the very grid tiles the UI is still showing. The UI releases it
+// through releaseRetiredSfuTransport() once the P2P layout has taken over.
+Call.prototype.finishSfuDowngrade_ = function() {
+  if (this.params_.mode !== 'downgrading') {
+    return;
+  }
+  this.clearDowngradeTimer_();
+  this.params_.mode = 'p2p';
+  if (this.onmodechange) {
+    this.onmodechange('p2p');
+  } else {
+    this.releaseRetiredSfuTransport();
+  }
+};
+
+// Called by the UI when the retired SFU connection's frames are no longer on screen.
+Call.prototype.releaseRetiredSfuTransport = function() {
+  if (this.sfuPcClient_) {
+    this.sfuPcClient_.close();
+    this.sfuPcClient_ = null;
+  }
+};
+
+// The retained SFU client is kept only so its already-received frames stay on screen. Its
+// callbacks still point at live handlers that read this.pcClient_ — which is now the direct
+// P2P client — so a late ICE or signaling event from the retired transport could otherwise
+// flip the session back to SFU mode or emit a retired-epoch frame. Silence it.
+Call.prototype.retireSfuClientCallbacks_ = function() {
+  if (!this.sfuPcClient_) {
+    return;
+  }
+  this.sfuPcClient_.oniceconnectionstatechange = null;
+  this.sfuPcClient_.onsignalingmessage = null;
+  this.sfuPcClient_.onsignalingstatechange = null;
+  this.sfuPcClient_.onremotehangup = null;
+  this.sfuPcClient_.onremotesdpset = null;
+  this.sfuPcClient_.onremotestreamadded = null;
+  this.sfuPcClient_.onremotetrack = null;
+  this.sfuPcClient_.onsfunegotiated = null;
+  this.sfuPcClient_.onnewicecandidate = null;
+};
+
+Call.prototype.closeRetainedPcClients_ = function() {
+  this.clearDowngradeTimer_();
+  if (this.p2pPcClient_) {
+    this.p2pPcClient_.close();
+    this.p2pPcClient_ = null;
+  }
+  this.releaseRetiredSfuTransport();
 };
 
 Call.prototype.sendSignalingMessage_ = function(message) {
