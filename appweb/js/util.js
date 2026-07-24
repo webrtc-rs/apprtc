@@ -8,8 +8,8 @@
 
 /* More information about these options at jshint.com/docs/options */
 
-/* exported calculateFps, setUpFullScreen, fullScreenElement, isFullScreen,
-   requestIceServers, sendAsyncUrlRequest, sendSyncUrlRequest,
+/* exported calculateFps, setUpFullScreen, onFullScreenChange, fullScreenElement,
+   isFullScreen, requestIceServers, sendAsyncUrlRequest, sendSyncUrlRequest,
    randomString, trace, $, queryStringToDictionary */
 
 'use strict';
@@ -152,23 +152,36 @@ function filterIceServersUrls(config, protocol) {
 
 // Start shims for fullscreen
 function setUpFullScreen() {
-  document.cancelFullScreen = document.webkitCancelFullScreen ||
-      document.mozCancelFullScreen || document.cancelFullScreen;
+  document.cancelFullScreen = document.exitFullscreen ||
+      document.webkitCancelFullScreen || document.mozCancelFullScreen ||
+      document.cancelFullScreen;
 
-  document.body.requestFullScreen = document.body.webkitRequestFullScreen ||
+  document.body.requestFullScreen = document.body.requestFullscreen ||
+      document.body.webkitRequestFullScreen ||
       document.body.mozRequestFullScreen || document.body.requestFullScreen;
+}
 
-  document.onfullscreenchange = document.onfullscreenchange ||
-        document.onwebkitfullscreenchange || document.onmozfullscreenchange;
+// Fullscreen is also left without the app being asked: Esc, F11, or the browser's own
+// controls. Only this event reports those, so a caller that shows fullscreen state must
+// sync from it instead of assuming its own button is the only way in and out.
+function onFullScreenChange(handler) {
+  ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange']
+      .forEach(function(eventName) {
+        document.addEventListener(eventName, handler);
+      });
 }
 
 function isFullScreen() {
-  return !!(document.webkitIsFullScreen || document.mozFullScreen ||
-    document.isFullScreen); // if any defined and true
+  // `fullscreenElement` is the standard property; the rest are legacy spellings.
+  return !!(document.fullscreenElement || document.webkitFullscreenElement ||
+      document.mozFullScreenElement || document.webkitIsFullScreen ||
+      document.mozFullScreen);
 }
 
 function fullScreenElement() {
-  return document.webkitFullScreenElement ||
+  return document.fullscreenElement ||
+      document.webkitFullscreenElement ||
+      document.webkitFullScreenElement ||
       document.webkitCurrentFullScreenElement ||
       document.mozFullScreenElement ||
       document.fullScreenElement;

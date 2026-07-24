@@ -8,7 +8,8 @@
 
 /* More information about these options at jshint.com/docs/options */
 
-/* globals trace, InfoBox, setUpFullScreen, isFullScreen, RoomSelection, $ */
+/* globals trace, InfoBox, setUpFullScreen, onFullScreenChange, isFullScreen,
+   RoomSelection, $ */
 /* exported AppController, remoteVideo */
 
 'use strict';
@@ -218,6 +219,9 @@ AppController.prototype.setupUi_ = function() {
   $(UI_CONSTANTS.hangupSvg).onclick = this.hangup_.bind(this);
 
   setUpFullScreen();
+  onFullScreenChange(this.onFullScreenChange_.bind(this));
+  // Adopt whatever state the browser is already in (for example an F11 window).
+  this.onFullScreenChange_();
 };
 
 AppController.prototype.finishCallSetup_ = function(roomId) {
@@ -731,16 +735,25 @@ AppController.prototype.toggleVideoMute_ = function() {
 AppController.prototype.toggleFullScreen_ = function() {
   if (isFullScreen()) {
     trace('Exiting fullscreen.');
-    document.querySelector('svg#fullscreen title').textContent =
-        'Enter fullscreen';
     document.cancelFullScreen();
   } else {
     trace('Entering fullscreen.');
-    document.querySelector('svg#fullscreen title').textContent =
-        'Exit fullscreen';
     document.body.requestFullScreen();
   }
-  this.fullscreenIconSet_.toggle();
+  // The button is deliberately not updated here. Entering fullscreen is asynchronous and
+  // can be refused, and the user can leave it with Esc, F11 or the browser's own controls
+  // without this handler running at all. onFullScreenChange_ is the single place that
+  // syncs the button, so it can never disagree with the actual state.
+};
+
+// Sync the fullscreen button to the browser's real fullscreen state. `on` is what paints
+// it blue (`svg.on circle` goes transparent, revealing `#fullscreen.on`'s background) and
+// swaps the enter/exit glyph.
+AppController.prototype.onFullScreenChange_ = function() {
+  var on = isFullScreen();
+  this.fullscreenIconSet_.set(on);
+  document.querySelector('svg#fullscreen title').textContent =
+      on ? 'Exit fullscreen' : 'Enter fullscreen';
 };
 
 AppController.prototype.toggleMiniVideo_ = function() {
@@ -828,11 +841,13 @@ AppController.IconSet_ = function(iconSelector) {
 };
 
 AppController.IconSet_.prototype.toggle = function() {
-  if (this.iconElement.classList.contains('on')) {
-    this.iconElement.classList.remove('on');
-    // turn it off: CSS hides `svg path.on` and displays `svg path.off`
-  } else {
-    // turn it on: CSS displays `svg.on path.on` and hides `svg.on path.off`
-    this.iconElement.classList.add('on');
-  }
+  this.set(!this.iconElement.classList.contains('on'));
+};
+
+// `on` is the whole visual state of an icon button, not just its colour: CSS uses it to
+// make `svg.on circle` transparent (revealing the button's blue background), to display
+// `svg.on path.on`, and to hide `svg.on path.off` — so the fill, the button style and the
+// glyph all follow from this one class.
+AppController.IconSet_.prototype.set = function(on) {
+  this.iconElement.classList.toggle('on', on);
 };
