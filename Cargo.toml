@@ -15,7 +15,7 @@ resolver = "2"
 opt-level = 0
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
 license = "MIT/Apache-2.0"
@@ -25,9 +25,9 @@ keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
 [workspace.dependencies]
-appweb = { version = "0.2.0", path = "appweb" }
-signaling = { version = "0.2.0", path = "signaling" }
-signaling-proto = { version = "0.2.0", path = "signaling-proto" }
+appweb = { version = "0.3.0", path = "appweb" }
+signaling = { version = "0.3.0", path = "signaling" }
+signaling-proto = { version = "0.3.0", path = "signaling-proto" }
 
 sfu = { version = "0.20.0-rc.4", path = "sfu" }
 webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
