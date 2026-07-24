@@ -26,12 +26,12 @@ The signaling process treats a browser's `msg` as opaque, so the SDP/candidate i
 recovered by parsing the logged body (`{"type":"offer","sdp":...}` etc.) here.
 
 Usage:
-    scripts/log_to_sequence_diagram.py \\
+    scripts/log2seq.py \\
         --appweb /private/tmp/logs/appweb.log \\
         --signaling /private/tmp/logs/signaling.log \\
         --sfu /private/tmp/logs/sfu.log
     # multiple SFU workers, HTML out, one room only:
-    scripts/log_to_sequence_diagram.py --appweb a.log --signaling s.log \\
+    scripts/log2seq.py --appweb a.log --signaling s.log \\
         --sfu w1.log w2.log -f html -o seq.html --room 42
 """
 

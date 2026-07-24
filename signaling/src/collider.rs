@@ -329,8 +329,8 @@ impl Collider {
             }),
         });
         // Early P2P signaling from the peer (typically the initiator's offer and its candidates)
-        // was queued before this client registered; it is delivered now. Log each body so
-        // log_to_sequence_diagram.py can show it (the same "V2 deliver" the relay path logs).
+        // was queued before this client registered; it is delivered now. Log each body to show
+        // it (the same "V2 deliver" the relay path logs).
         for message in registration.queued_messages {
             log::info!(
                 "V2 deliver: connection_id={connection_id} room_id={room_id} client_id={client_id} bytes={}\n{}",
@@ -384,7 +384,7 @@ impl Collider {
                     );
                     return Ok(());
                 };
-                // The full body follows on the next line so log_to_sequence_diagram.py can show the
+                // The full body follows on the next line to show the
                 // SDP/candidate under a click-to-expand [+]. signaling never parses this payload.
                 log::info!(
                     "V2 send: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} bytes={}\n{}",
