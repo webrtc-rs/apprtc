@@ -12,8 +12,9 @@ SFU 1   ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
 Browser <── ICE/DTLS/SRTP over UDP ──> SFU (appr.tc:3478-3497)
 ```
 
-V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers P2P→SFU upgrade.
-SFU→P2P downgrade is not implemented yet.
+V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers a P2P→SFU
+upgrade, and a room that falls back to two participants and stays there for `--downgrade-dwell` (default 2 seconds)
+downgrades to direct P2P again.
 
 ## DNS and firewall
 
@@ -211,4 +212,4 @@ sudo certbot renew --dry-run
 
 ## CLI reference
 
-Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb requires `--public-url` and `--ws-url`; it also supports `--host-ip`, `--port`, `--grpc-url`, `--insecure-tls`, `--web-root`, HTTP TLS certificate options, ICE options, banner configuration, and `--bypass-join-confirmation`. Signaling supports `--host-ip`, `--port`, `--grpc-port`, and one `--tls`/certificate configuration shared by both listeners; it has no `--public-url` option. SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, advertised capacities, and an optional process-incarnation `--instance-id`; its `--port`, `--redirect-url`, and TLS certificate options apply only to its optional HTTP redirect endpoint. All three binaries support `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb's `--ws-url` is the authoritative value returned to browsers. Keep port `50051` inaccessible from untrusted networks until mTLS client authentication is implemented.
+Run `appweb --help`, `signaling --help`, and `sfu --help` for the authoritative options. AppWeb requires `--public-url` and `--ws-url`; it also supports `--host-ip`, `--port`, `--grpc-url`, `--insecure-tls`, `--web-root`, HTTP TLS certificate options, ICE options, banner configuration, and `--bypass-join-confirmation`. Signaling supports `--host-ip`, `--port`, `--grpc-port`, `--downgrade-dwell`, and one `--tls`/certificate configuration shared by both listeners; it has no `--public-url` option. `--downgrade-dwell` is the number of seconds an SFU room must sit at no more than two members before signaling returns it to direct P2P; raise it if participants frequently drop out and rejoin, or set it to `0` to downgrade as soon as the next timer tick observes the room. SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, advertised capacities, and an optional process-incarnation `--instance-id`; its `--port`, `--redirect-url`, and TLS certificate options apply only to its optional HTTP redirect endpoint. All three binaries support `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`). AppWeb's `--ws-url` is the authoritative value returned to browsers. Keep port `50051` inaccessible from untrusted networks until mTLS client authentication is implemented.

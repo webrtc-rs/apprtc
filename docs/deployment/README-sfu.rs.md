@@ -11,8 +11,9 @@ SFU 2   ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
 Browser <── ICE/DTLS/SRTP over UDP ──> SFU (sfu.rs:3478-3497)
 ```
 
-V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers P2P→SFU upgrade.
-SFU→P2P downgrade is not implemented yet.
+V1 remains backward compatible. In V2, the first two participants use P2P; a third participant triggers a P2P→SFU
+upgrade, and a room that falls back to two participants and stays there for signaling's `--downgrade-dwell` window
+(default 2 seconds) downgrades to direct P2P again, releasing this worker's room and client slots.
 
 ## DNS and firewall
 

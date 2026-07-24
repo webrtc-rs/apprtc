@@ -38,7 +38,7 @@ to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the le
 signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
 offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe offers and republish after an offer collision. When an SFU room shrinks back to two members and stays there for a short dwell (`--downgrade-dwell`, default 2s), signaling automatically downgrades it to direct P2P: it break-before-make commits P2P with a new signal epoch, tears down both members' SFU legs, and tells the two browsers to close their SFU peer connections and negotiate directly again (grid → full-screen).
+The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe offers and republish after an offer collision. When an SFU room shrinks back to at most two members and stays there for a short dwell (`--downgrade-dwell`, default 2s), signaling automatically downgrades it to direct P2P: it commits P2P with a new signal epoch, tears down the members' SFU legs, and tells the browsers to negotiate directly again. Each browser keeps its SFU connection on screen while the direct one negotiates, so the grid gives way to the full-screen stage only once direct media is ready.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -60,22 +60,27 @@ injection, and status operations to signaling. Browser WebSocket traffic connect
 through AppWeb. Each SFU process owns one reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser
 media travels directly to the SFU over ICE/DTLS/SRTP and never passes through AppWeb or signaling.
 
-The signaling state is composed from Sans-I/O protocols:
+The signaling state is composed from Sans-I/O protocols. `Collider` owns two independent tables — the V1
+string-keyed one and the numeric V2 one that also holds SFU worker state:
 
 ```text
 Collider
-└── RoomTable
-    └── Room
-        └── Client
+├── RoomTable (V1)          signaling/src/room_table.rs
+│   └── Room                signaling/src/room.rs
+│       └── Client          signaling/src/client.rs
+└── V2 RoomTable            signaling/src/v2.rs — rooms, members, epochs, transitions, worker registry
+    └── SFU session model   signaling/src/sfu.rs — commands, results, events, lifecycle IDs
 ```
 
-Every layer implements the `sansio::Protocol` trait, so the whole signaling state machine is deterministic and testable
-in memory, without sockets or a wall clock.
+`Collider` and the V1 layers implement the `sansio::Protocol` trait; the V2 table exposes the same deterministic
+`handle_*`/`poll_timeout`/`poll_action` shape and is driven by `Collider`. Nothing in the crate owns a socket, thread,
+clock, or entropy source, so the whole signaling state machine is testable in memory.
 
 The root `apprtc` package keeps each runtime responsibility in a dedicated module:
 
 ```text
 src/
+├── lib.rs                shared certificate loading and TLS listener support
 ├── grpc_server.rs        private signaling gRPC service adapter
 ├── sfu_server.rs         signaling stream, UDP media shards, and Sans-I/O SFU adapter
 ├── signaling_server.rs   command channel and single-owner Collider event loop
@@ -136,11 +141,15 @@ SFU-capable V2 adds:
 - Reliable worker events, command result correlation and deduplication, health/capacity reporting, same-instance
   reconnect synchronization, and command replay.
 - Ordered worker-side joins and leaves for members admitted to or removed from an existing SFU room.
-- Automatic SFU→P2P downgrade: once an SFU room has sat at two members for the `--downgrade-dwell` window (default 2s), signaling commits P2P with a new
-  signal epoch, sends both members' worker leaves, elects the lower client id as the direct offerer, and pushes an
-  `sfu-downgrade` control so each browser closes its SFU peer connection and renegotiates directly (the UI returns from
-  the grid to the full-screen stage). The dwell absorbs brief churn so a third participant leaving and rejoining does not
-  flap the room between modes.
+- Automatic SFU→P2P downgrade: once an SFU room has sat at no more than two members for the `--downgrade-dwell` window
+  (default 2s) with no transition in flight, signaling commits P2P with a new signal epoch, releases the worker
+  assignment, sends each member's worker leave, elects the lowest client id as the direct offerer, and pushes an
+  `sfu-downgrade` control so each browser renegotiates directly. The dwell absorbs brief churn so a third participant
+  leaving and rejoining does not flap the room between modes.
+- A symmetric browser handoff in both directions: the outgoing peer connection stays on screen while the incoming one
+  negotiates with the same local tracks. Upgrading keeps the P2P stage until SFU ICE connects; downgrading keeps the grid
+  (holding the retired SFU connection's last frames) until direct media is playable, then returns to the full-screen
+  stage. Neither transition reloads the page, replaces the WebSocket, or reacquires the camera and microphone.
 - V2 perfect negotiation in the browser: it is polite toward the SFU, rolls back a colliding local offer, answers the SFU offer with its `requestid`, and creates a fresh publish offer afterward.
 
 Cross-worker migration of an established room is intentionally deferred. A disconnected worker may resume its rooms only by reconnecting with the same process-incarnation `instance_id` during the recovery grace period; otherwise signaling fails those rooms with `room-failed` rather than moving live WebRTC transports.
@@ -191,7 +200,27 @@ cargo test --test '*' -- --nocapture
 kill $(pgrep -f "target/debug/(appweb|signaling|sfu)") || true
 ```
 
-CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when the job finishes. The black-box suite covers V1 compatibility, V2 P2P relay, the real AppWeb→signaling→SFU third-member join barrier, three-client SFU data channels, and RTP/RTCP media forwarding.
+[`scripts/start.sh`](scripts/start.sh) and [`scripts/stop.sh`](scripts/stop.sh) run that sequence locally over TLS,
+rotating and writing per-process logs into `/tmp/logs/`.
+
+CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when the job finishes. The black-box suite covers V1 compatibility, V2 P2P relay, the real AppWeb→signaling→SFU third-member join barrier, the P2P→SFU→P2P mode round trip, three-client SFU data channels, and RTP/RTCP media forwarding.
+
+### Reading the logs as a sequence diagram
+
+[`scripts/log2seq.py`](scripts/log2seq.py) merges the three (or more) INFO logs by timestamp and renders one sequence
+diagram whose lanes are each browser client, AppWeb, signaling, and each SFU worker:
+
+```bash
+scripts/log2seq.py \
+  --appweb /tmp/logs/appweb.log \
+  --signaling /tmp/logs/signaling.log \
+  --sfu /tmp/logs/sfu.log \
+  -f html -o seq.html
+```
+
+`-f mermaid` (the default) prints a Markdown-embeddable diagram; `-f html` writes a self-contained page where every
+offer/answer has a clickable `[+]` that expands its full SDP inline. `--room` limits the output to one room, and
+`--sfu` accepts several worker logs.
 
 ## Run over HTTP and WebSocket
 
@@ -247,7 +276,7 @@ cargo run --bin appweb -- \
 ```
 
 Without certificate options, AppRTC uses the bundled development certificate at [
-`cert/cert.pem`](cert/cert.pem). Its subject alternative names include `localhost`, `127.0.0.1`, and
+`scripts/cert.pem`](scripts/cert.pem). Its subject alternative names include `localhost`, `127.0.0.1`, and
 `::1`, but it is self-signed. Trust that certificate in the browser or operating-system trust store before opening the
 page; otherwise HTTPS and WSS clients will reject it with `CertificateUnknown` or an equivalent certificate-authority
 error.
@@ -434,7 +463,20 @@ Every V2 signaling message carries the current epoch. The inner `msg` remains an
 }
 ```
 
-The server may send `p2p-promote`, `sfu-upgrade`, and `room-failed` controls. In SFU mode, subscribe offers contain a decimal-string `requestid`; the browser echoes it in the corresponding answer.
+The server may send `p2p-promote`, `sfu-upgrade`, `sfu-downgrade`, and `room-failed` controls. `sfu-upgrade` and
+`sfu-downgrade` carry the room's new epoch; `sfu-downgrade` and `p2p-promote` also carry `is_initiator`, which elects the
+single direct offerer:
+
+```json
+{
+  "control": "sfu-downgrade",
+  "roomid": "42",
+  "epoch": "2",
+  "is_initiator": true
+}
+```
+
+In SFU mode, subscribe offers contain a decimal-string `requestid`; the browser echoes it in the corresponding answer.
 
 ## Multiple SFU workers
 

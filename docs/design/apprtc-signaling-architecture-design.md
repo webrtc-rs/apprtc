@@ -4,7 +4,7 @@
 
 This architecture supports two browser protocols. V1 provides two-party P2P compatibility with HTTP join/leave, initiator election, queued messages, reconnect grace, and opaque string room/client IDs. V2 adds numeric `u64` IDs, token-bound browser registration, P2P→SFU mode transition, and multi-party SFU media. The Rust `sfu` crate is a signaling-agnostic `sansio::Protocol` media engine whose `RoomId` and `ClientId` are `u64` and whose `SFUEvent` API accepts joins, SDP, ICE candidates, and leaves.
 
-The current implementation preserves the V1 contract for existing AppRTC-compatible clients while adding a V2 protocol that starts as two-party P2P and upgrades to multi-party SFU media. SFU→P2P downgrade remains a planned extension and is explicitly labeled as such below. One signaling authority owns room state and routes browser SDP/ICE either to the P2P peer or to the assigned SFU worker.
+The current implementation preserves the V1 contract for existing AppRTC-compatible clients while adding a V2 protocol that starts as two-party P2P, upgrades to multi-party SFU media, and downgrades back to direct P2P once the room has shrunk to two members again. One signaling authority owns room state and routes browser SDP/ICE either to the P2P peer or to the assigned SFU worker.
 
 Browsers use long-lived, full-duplex WebSocket signaling channels, AppWeb uses unary gRPC calls multiplexed over a reusable HTTP/2 channel, and SFU workers use long-lived bidirectional gRPC streams. The media plane remains WebRTC between browser and SFU.
 
@@ -20,7 +20,7 @@ The implementation is organized as four core Rust crates plus the SFU crate:
 
 `appweb` and `signaling` are separate crates; the standalone `appweb` and `signaling` processes communicate through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while AppWeb and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
-The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate under `cert/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. `tls.rs` provides the shared certificate and listener support used by the binaries.
+The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. The crate root `src/lib.rs` provides the shared certificate loading and TLS listener support used by the binaries.
 
 ## 1. Topology and authority
 
@@ -44,13 +44,14 @@ V2Room {
   id: u64,
   mode: P2P | Upgrading | SFU | Failed,
   members: Map<u64, BrowserClient>,
-  signal_epoch: u64,                // increments when P2P→SFU commits
-  assigned_sfu: Option<InstanceId>, // selected SFU process incarnation
-  assignment_epoch: u64,            // assignment generation, stable across same-instance reconnect
+  signal_epoch: u64,                   // increments when P2P→SFU or SFU→P2P commits
+  assigned_sfu: Option<InstanceId>,    // selected SFU process incarnation, cleared at downgrade
+  assignment_epoch: u64,               // assignment generation, stable across same-instance reconnect
+  downgrade_deadline: Option<Instant>, // armed while an SFU room sits at ≤2 members
 }
 ```
 
-`Downgrading` remains reserved in the Protobuf enum and in the future design, but it is not a current signaling-core state.
+`Downgrading` remains reserved in the Protobuf `RoomMode` enum but is not a signaling-core state. The implemented downgrade needs no intermediate state: unlike an upgrade, which must wait for worker `MemberJoined` barriers, it commits `SFU → P2P` in one step and tears the worker legs down afterwards (§4.4).
 
 `BrowserClient` owns the registered WebSocket (if any), its bounded outbound queue, and its reconnect-grace timer. The
 SFU owns only a projection of members assigned to it. It must never decide occupancy, initiate a P2P→SFU upgrade, or
@@ -122,7 +123,7 @@ browser-visible text is the same.
 { "control": "registered",    "roomid": "42", "epoch": "0", "mode": "p2p", "is_initiator": true }  // v2 register acknowledgement
 { "control": "p2p-promote",   "roomid": "42", "epoch": "0", "is_initiator": true }
 { "control": "sfu-upgrade",   "roomid": "42", "epoch": "1" }
-{ "control": "sfu-downgrade", "roomid": "42", "epoch": "2", "is_initiator": true } // optional, disabled initially
+{ "control": "sfu-downgrade", "roomid": "42", "epoch": "2", "is_initiator": true }
 { "control": "room-failed",   "roomid": "42", "reason": "WORKER_UNAVAILABLE" }
 ```
 
@@ -169,7 +170,7 @@ The Rust `appweb` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`,
 while preserving the V1 HTTP response and WebSocket payloads. The Rust `signaling` hub preserves the V1 queue and
 reconnect-grace behavior.
 
-`sfu-upgrade`, worker frames, `Upgrading`, and all SFU assignment are V2-only. The future `sfu-downgrade`/`Downgrading` path is also V2-only but is not implemented. A stock V1 browser never receives a control it cannot process.
+`sfu-upgrade`, `sfu-downgrade`, worker frames, `Upgrading`, and all SFU assignment are V2-only. A stock V1 browser never receives a control it cannot process.
 
 For v2 validation, `POST /v2/join/{roomid}` returns `{result:"INVALID_ROOM_ID"}` when the path segment is not a
 canonical `u64`. The v2 browser WebSocket returns `{error:"INVALID_ROOM_ID"}` or `{error:"INVALID_CLIENT_ID"}` and
@@ -178,16 +179,17 @@ are forwarded as strings without numeric parsing.
 
 ### 3.1.2 Signal epochs
 
-Every V2 room carries a `signal_epoch`, a small monotonic counter starting at `0` that currently increments when P2P→SFU commits. A future downgrade commit would increment it again. It is distinct from `assignment_epoch`, which identifies the room-to-worker assignment generation and remains stable across a same-instance stream reconnect. The hub reports the current `epoch` in the V2 `registered` control, the `/v2/join` response, and `p2p-promote`/`sfu-upgrade` controls. A V2 browser stamps the epoch it currently knows on every `{cmd:"send"}` frame and adopts the new value when a control arrives.
+Every V2 room carries a `signal_epoch`, a small monotonic counter starting at `0` that increments on each committed mode transition — P2P→SFU and SFU→P2P alike. It is distinct from `assignment_epoch`, which identifies the room-to-worker assignment generation and remains stable across a same-instance stream reconnect. The hub reports the current `epoch` in the V2 `registered` control, the `/v2/join` response, and the `p2p-promote`/`sfu-upgrade`/`sfu-downgrade` controls. A V2 browser stamps the epoch it currently knows on every `{cmd:"send"}` frame and adopts the new value when a control arrives.
 
 The epoch is what makes mode transitions race-free: the transition states gate *joins*, but they cannot classify
 in-flight browser frames, which otherwise arrive after a commit and get routed by the wrong mode (a pre-upgrade P2P
 renegotiation offer becomes a bogus publish offer at the worker; an in-flight subscribe answer after a downgrade commit
 would be relayed to the surviving P2P peer). The rules:
 
-- The hub silently drops any V2 `send` whose `epoch` is not the room's current value or while the room is `Upgrading`. Such a frame belongs to the retired P2P transport or arrived before the transition committed.
+- The hub silently drops any V2 `send` whose `epoch` is not the room's current value or while the room is `Upgrading`. Such a frame belongs to the retired transport or arrived before the transition committed.
 - A missing or malformed `epoch` on a V2 `send` is dropped before the inner message is routed. V1 `send` frames never carry an epoch.
 - At upgrade commit, signaling increments the epoch, clears queued P2P messages, and enqueues `sfu-upgrade` to the two existing registered browsers before accepting new-epoch SFU signaling.
+- At downgrade commit, signaling increments the epoch and clears each member's queued messages before enqueueing `sfu-downgrade`, so a subscribe answer still in flight from the retired SFU transport is dropped rather than relayed to the surviving peer.
 - Each browser WebSocket has one bounded FIFO writer, so controls and `{msg}` frames produced by the serialized Collider event loop retain their output order.
 - The hub accepts worker→browser `signal` events only while the room is assigned to that worker in `SFU` mode with matching assignment and lifecycle IDs.
 - V1 rooms have no epoch and never transition modes.
@@ -308,15 +310,46 @@ a later feature.
 
 For member four and later, the hub sends `join` to the assigned worker, waits for `joined`, returns `mode:"sfu"`, and
 routes the new member's publish offer. On leave, the hub removes membership, sends idempotent `leave` to the worker, and
-routes the SFU's resulting subscribe re-offers to the remaining members.
-
-SFU→P2P downgrade is not implemented. The reserved future design uses a dwell timer at exactly two members and transitions `SFU → Downgrading → P2P`. It is intentionally break-before-make: commit P2P and its new signal epoch, send both SFU leaves immediately, then push `sfu-downgrade` with one elected initiator for direct negotiation. That future path deliberately permits a media gap.
+routes the SFU's resulting subscribe re-offers to the remaining members. A member's leave is also what re-evaluates the
+room for the SFU→P2P downgrade in §4.4.
 
 The current `Upgrading` state serializes membership changes: an additional join receives retryable `ROOM_TRANSITION`, and browser `send` frames are dropped until the ordered three-member worker join barrier commits or aborts. A successful commit increments the epoch and clears queued P2P messages; a failed upgrade removes the provisional third member and restores the original P2P pair without changing the epoch.
+
+### 4.4 SFU to P2P downgrade
+
+An SFU room that has shrunk back to a size a direct connection can carry returns to P2P automatically. Every worker
+`MemberLeft` result re-evaluates the room: if it is still in `SFU` mode, holds one or two members, and has no upgrade,
+join, or leave in flight, signaling arms a **dwell deadline** — `--downgrade-dwell`, 2 seconds by default. Arming is
+idempotent, so churn inside the window does not push the deadline out; anything that makes the room ineligible (a new
+admission, another transition) clears it. When the deadline fires, `handle_timeout` re-checks eligibility and either
+commits or drops the deadline.
+
+The commit is deliberately **break-before-make** and permits a brief media gap:
+
+1. Set `mode = P2P` and increment `signal_epoch`; clear the deadline.
+2. Elect the lowest client id as the direct offerer; every other member answers. Clear each member's queued messages so
+   retired-epoch SFU traffic cannot leak into the new P2P session.
+3. Release the worker assignment (`assigned_sfu = None`, decrement its assigned room/client counters) and queue one
+   `LeaveMember` per member with reason `ROOM_CLOSED`. These are fire-and-forget cleanup commands: the commit does not
+   wait for their results, because no browser-visible state depends on them.
+4. Push `{control:"sfu-downgrade", roomid, epoch, is_initiator}` to every registered member.
+
+Each browser then enters its own `Downgrading` state, builds a direct `RTCPeerConnection` from the same local tracks
+while keeping its SFU peer connection on screen, and the elected initiator offers (§6.2). There is no `Downgrading` *hub*
+state: the upgrade barrier exists because a browser offer must not reach a worker that has not created the client yet,
+while a downgrade only retires state that already exists. The browser needs the state anyway, because it is the side that
+must overlap the two transports.
+
+If the room empties instead of settling at two — the last member leaves — the room is removed outright and no downgrade
+runs.
 
 ## 5. Worker assignment, reconnect, and scale
 
 Workers register capacity and then become eligible after reporting `Ready` health. For the initial three-member upgrade, `signaling` filters out disconnected/draining workers and workers that have reached `max_rooms` or cannot accept three more assigned clients. It selects the minimum tuple `(assigned_clients, assigned_rooms, instance_id)`. The final `instance_id` comparison makes an exact tie deterministic; this is least-loaded placement rather than round-robin. The whole room remains affine to the selected worker until it empties or fails.
+
+The assignment is released when the room downgrades to P2P (§4.4) or empties, which returns its rooms/clients to the
+worker's load counters and makes that capacity available to the next placement. A room that later upgrades again runs the
+selector afresh and may land on a different worker.
 
 Later joins to an existing SFU room do not run the global selector again and cannot move the room. They are serialized through `JoinMember` on the assigned worker and succeed only after its result. The current authority uses advertised `max_clients` during initial three-member placement but does not pre-reject a later join from that counter; strict per-room growth enforcement is therefore a remaining capacity-control improvement.
 
@@ -334,7 +367,7 @@ the seam a later multi-hub design would shard along.
 
 ## 6. Browser and API work
 
-The implemented room-selection page exposes a checked **V2 P2P/SFU** checkbox, so V2 is the web UI default while V1 remains available by unchecking it. V1 navigates through `/r/{roomid}` and `/join/{roomid}`; V2 uses `/v2/r/{roomid}` and `/v2/join/{roomid}`. The V2 namespace is preserved in returned room links and embedded page parameters. The current browser implements P2P, Upgrading, and SFU modes, the responsive grid, transport handoff, and polite-peer perfect negotiation; Downgrading remains future work.
+The implemented room-selection page exposes a checked **V2 P2P/SFU** checkbox, so V2 is the web UI default while V1 remains available by unchecking it. V1 navigates through `/r/{roomid}` and `/join/{roomid}`; V2 uses `/v2/r/{roomid}` and `/v2/join/{roomid}`. The V2 namespace is preserved in returned room links and embedded page parameters. The current browser implements the P2P, Upgrading, and SFU modes, the responsive grid, transport handoff in both directions, and polite-peer perfect negotiation.
 
 ### 6.1 One browser application, two layouts
 
@@ -363,23 +396,50 @@ Each SFU tile has a stable participant key plus separate audio/video elements. T
 
 ### 6.2 Transport and layout transition behavior
 
-The browser owns its local mode state machine while `signaling` owns authoritative room mode. Their `Upgrading` lifetimes are intentionally different: hub `Upgrading` ends at commit before browsers learn of the transition, while browser `Upgrading` begins when `sfu-upgrade` arrives and ends when the SFU ICE state becomes connected/completed. `Downgrading` in the table is reserved future behavior.
+The browser owns its local mode state machine while `signaling` owns authoritative room mode. Their transition-state
+lifetimes are intentionally different: a hub transition state ends at commit, before browsers learn of it, while the
+browser's begins when the control arrives and ends when the incoming transport is carrying media. The two browser
+transitions are symmetric — each keeps the outgoing peer connection and its layout on screen while the incoming one
+negotiates, so the participant never blinks out. `Downgrading` is make-before-break in the browser even though the hub's
+half of it is break-before-make: the hub has already retired the worker legs, but the SFU peer connection's last
+received frames still hold the grid together for the length of the handoff.
 
 | Browser state | Active layout                                 | Transport behavior                                                 | UI behavior                                                                                                 |
 |---------------|-----------------------------------------------|--------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------|
 | `P2P`         | `full_template.html`                          | One direct P2P PC                                                  | Full-screen remote stage and persistent self-view.                                                          |
 | `Upgrading`   | Keep full layout visible                      | Keep P2P PC alive; create SFU PC and add the existing local tracks | Show non-blocking “Switching to group call” status; do not clear the remote stage.                          |
 | `SFU`         | `grid_template.html`                          | SFU PC publishes local tracks and receives all participants        | Cross-fade to grid after the SFU PC is connected and remote media is available; update tiles per publisher. |
-| `Downgrading` | Keep grid visible until direct media is ready | Begin/await direct P2P negotiation using the same local tracks     | Retain surviving participant tile or last-frame placeholder and show “Switching to direct call”.            |
+| `Downgrading` | Keep grid visible until direct media is ready | Keep SFU PC alive; begin/await direct P2P negotiation using the same local tracks | Retain the surviving participant tile as a last-frame placeholder and show “Switching to direct call”.      |
 
 For **P2P→SFU**, on `sfu-upgrade` the client adopts the control's `epoch` for every subsequent `send`, then creates a
 fresh `RTCPeerConnection` for the SFU and adds the *same* existing local `MediaStreamTrack` instances to it. A track may
 be sent by the old and new peer connections during the handoff; it must not be stopped or recaptured. The old P2P PC
 remains live until the SFU PC's ICE state is `connected` or `completed`. At that point, the implementation switches to the grid and closes the old P2P PC.
 
-For the future **SFU→P2P** path, the reserved protocol uses break-before-make. The intended client behavior is to preserve the grid DOM and self-view while closing the SFU PC and establishing the direct PC, then promote the surviving participant into the full-screen stage. No current browser control handler or signaling-core transition performs this downgrade.
+For **SFU→P2P**, `Call.startSfuDowngrade_` adopts the control's `epoch`, enters `Downgrading`, takes `is_initiator` from
+the control, and *retains* the SFU `PeerConnectionClient` as `sfuPcClient_` (closing only a P2P client left over from an
+unfinished upgrade handoff, which belongs to a retired epoch). It then builds one fresh `PeerConnectionClient` with
+`sfuMode` off — the direct connection must not use the SFU's always-polite role — adds the *same* local tracks, and
+either offers or waits to answer. `AppController.onModeChange_('downgrading')` changes nothing but the status text: the
+grid keeps its tiles, so each participant stays on screen as a frozen last frame instead of disappearing.
 
-Both current transports use the V2 `{cmd:"send",epoch,msg}` envelope for SDP and trickle ICE. During upgrade, `Call.pcClient_` is replaced by the new SFU `PeerConnectionClient` while the old P2P instance is retained separately only for media continuity, so subsequent inbound signaling is queued and processed by the SFU client. Its Promise-based drain preserves V2 wire order, which is required to apply a publish answer before a following subscribe offer. SFU subscribe answers alone echo `requestid`.
+`Call.onDowngradeIceConnectionStateChange_` is the mirror of `onSfuIceConnectionStateChange_`: when the direct PC reaches
+`connected`/`completed`, `finishSfuDowngrade_` commits mode `p2p` and fires `onModeChange_('p2p')`. That handler holds
+the grid for the last stretch — until the direct remote video is playable — then removes every tile, restores the
+full-screen layout, re-points the self-view at the retained local stream, and runs `transitionToActive_`. Only then does
+it call `Call.releaseRetiredSfuTransport()`. The ordering matters: closing the SFU peer connection ends its remote
+tracks, and those tracks are exactly what the held grid tiles are still displaying, so closing it any earlier would
+blank the screen the hold exists to preserve. Two bounded fallbacks keep the UI from sticking: the transition gives up
+after `DOWNGRADE_MEDIA_TIMEOUT_MS` if the peer never negotiates (it may have left mid-handoff), and the layout wait
+gives up after `P2P_LAYOUT_MEDIA_TIMEOUT_MS` for an audio-only or stalled peer.
+
+Retaining the SFU client needs one guard: its callbacks close over `Call` and read `this.pcClient_`, which is now the
+direct client, so `retireSfuClientCallbacks_` nulls them when the client is set aside. Otherwise a late ICE event on the
+retired transport would run `onSfuIceConnectionStateChange_` against the new connection and flip the session back to SFU
+mode. Because the hub has already cleared queued messages and bumped the epoch, no retired SFU frame can reach the new
+direct connection either.
+
+Both transports use the V2 `{cmd:"send",epoch,msg}` envelope for SDP and trickle ICE. In both transitions `Call.pcClient_` is replaced by the incoming `PeerConnectionClient` while the outgoing instance is retained separately for media continuity only — as `p2pPcClient_` during upgrade, `sfuPcClient_` during downgrade — so inbound signaling is always queued and processed by the incoming client alone. Its Promise-based drain preserves V2 wire order, which is required to apply a publish answer before a following subscribe offer. SFU subscribe answers alone echo `requestid`.
 
 The server's `registered` snapshot is suitable for P2P re-registration during grace, but the current JavaScript `SignalingChannel` contains a reconnect TODO and does not automatically reopen a closed browser WebSocket. Its per-peer-connection signaling queue is not explicitly bounded. Automatic browser reconnect, queue limits, and explicit transport-generation guards remain reliability work.
 
@@ -390,7 +450,8 @@ The server's `registered` snapshot is suitable for P2P re-registration during gr
   media remains visible until SFU media is ready.
 - In SFU, audio and video from the same publisher appear in one stable grid tile, and a leave/re-offer removes only that
   publisher's tile.
-- Future downgrade acceptance: keep self-view and controls responsive, show a transition state during the expected break-before-make gap, then promote the remaining peer to the full-screen P2P stage.
+- On a downgrade back to two members, hold the grid and self-view while the direct connection negotiates, then promote
+  the remaining peer to the full-screen P2P stage without reacquiring devices.
 - Remaining reliability work: automatically reconnect a P2P V2 WebSocket within server grace and reconcile `mode`, `epoch`, and `is_initiator` from the new `registered` snapshot.
 - Remaining reliability work: bound browser SDP/ICE queues and explicitly ignore callbacks from retired transport generations.
 - Current `room-failed` behavior surfaces the failure through the call error callback. Desired follow-up behavior is to tear down transports, clean up failed authority state, and support a fresh admission without reacquiring devices.
@@ -407,7 +468,7 @@ initiator model.
 - Validate V2 `u64` room/client IDs, request ownership, room assignment, command order, bounded queues, and lifecycle/assignment epochs before forwarding; leave V1 ID strings opaque.
 - Run a V1 wire-compatibility suite covering `call.js`, `/join` params/messages, initiator `/message`, `wss_post_url`
   POST/DELETE fallback, queued-offer flush, reconnect grace, and `FULL` at the third join.
-- The current suite covers V2 P2P relay, third-join upgrade ordering, stale-epoch drops, same-instance worker reconnect/sync, old-instance grace-expiry room failure, three-client data channels, and three-publisher RTP forwarding. Future downgrade tests are required when that state is implemented.
+- The current suite covers V2 P2P relay, third-join upgrade ordering, stale-epoch drops, same-instance worker reconnect/sync, old-instance grace-expiry room failure, three-client data channels, and three-publisher RTP forwarding. Downgrade coverage is a signaling-crate unit test for the dwell/commit rules plus the black-box `tests/sfu_v2_downgrade_signaling_test.rs`, which drives a full P2P→SFU→P2P round trip over real WebSocket signaling and SDP exchange.
 
 ## 8. Detailed wire-protocol definitions
 
@@ -542,7 +603,7 @@ enforced by the hub: an `admit` that collides with a live member returns `DUPLIC
 // signaling -> the sole P2P survivor after the other member leaves
 { "control": "p2p-promote", "roomid": "42", "epoch": "0", "is_initiator": true }
 
-// optional future downgrade only; is_initiator elects the single direct offerer
+// signaling -> both remaining members after the room downgrades; is_initiator elects the single direct offerer
 { "control": "sfu-downgrade", "roomid": "42", "epoch": "2", "is_initiator": true }
 
 // signaling -> every member when the assigned worker is lost (grace expiry or restart)
@@ -560,7 +621,8 @@ v1-compatible `{cmd:"send", msg}` envelope (with the new epoch); only their dest
 to the assigned SFU worker. The browser treats an SFU offer as a subscribe offer and returns an answer carrying the
 worker-issued `requestid`. In an SFU room, the browser leaves through `POST /v2/leave/{roomid}/{clientid}`; it does not
 send `{type:"bye"}` to the worker path. The hub then owns the ordered worker `leave` operation and any resulting
-subscribe re-offers.
+subscribe re-offers. After an `sfu-downgrade` control the envelope is unchanged again — only the destination reverts from
+the worker to the remaining browser — and the member whose control carried `is_initiator:true` is the sole offerer.
 
 ### 8.4 AppWeb unary gRPC API
 
@@ -593,7 +655,7 @@ Every AppWeb request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id,
 | `OccupancyV2` | numeric `room_id`                                   | `Occupancy{member_count,mode}` | Return V2 occupancy and the authority's current P2P, Upgrading, SFU, or Failed mode. |
 | `GetStatus`   | context only                                        | `Status`                      | Return V1 and V2 room/client/browser WebSocket counters plus connected and ready SFU worker counts. |
 
-V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages in P2P, preserves browser reconnect grace, and emits `registered` and `p2p-promote` controls. It also implements `OpenSfuSession`, worker selection, the P2P→SFU join barrier, SFU signal routing, later SFU joins and leaves, same-instance worker reconnection/synchronization, command replay, event acknowledgement/deduplication, and worker-loss room failure. SFU→P2P downgrade remains deferred.
+V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages in P2P, preserves browser reconnect grace, and emits `registered` and `p2p-promote` controls. It also implements `OpenSfuSession`, worker selection, the P2P→SFU join barrier, SFU signal routing, later SFU joins and leaves, the dwell-based SFU→P2P downgrade, same-instance worker reconnection/synchronization, command replay, event acknowledgement/deduplication, and worker-loss room failure.
 
 One tonic `Channel` is shared by all AppWeb requests. Concurrent unary calls are multiplexed as independent HTTP/2 streams, so no application pending-response map or registration handshake is required. The channel uses a 10-second connection timeout, a 15-second RPC timeout, HTTP/2 keepalive every 30 seconds with a 10-second acknowledgement timeout, and lazy connection establishment so AppWeb can start while signaling is unavailable. Tonic reconnects the underlying channel for later RPCs after a transport failure. Both sides log the operation, `instance_id` where available, `request_id`, result, safe reason metadata, and elapsed time without logging signaling payloads or credentials.
 
@@ -617,7 +679,7 @@ Every `SignalingToSfu.command` carries a signaling-allocated nonzero `request_id
 |---------------|------------------------------------------------------------------------|----------------|
 | `SyncRoom`    | `room_id`, `assignment_epoch`, repeated `{client_id,lifecycle_id}`      | Reconcile the local membership projection to the authoritative roster; accept no browser SDP/ICE for the room until synchronization succeeds. |
 | `JoinMember`  | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`             | Apply `SFUEvent::Join` once and return `MemberJoined` with all identity fields echoed. |
-| `LeaveMember` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, `reason`   | Apply `SFUEvent::Leave` once and return `MemberLeft` with all identity fields echoed. |
+| `LeaveMember` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, `reason`   | Apply `SFUEvent::Leave` once and return `MemberLeft` with all identity fields echoed. The reason is advisory: `USER` for `/v2/leave`, `DISCONNECTED` for a dropped browser socket, and `ROOM_CLOSED` for the leaves issued by an SFU→P2P downgrade. `LEAVE_REASON_DOWNGRADE` is reserved in the Protobuf enum and unused by the current authority. |
 | `SfuSignal`   | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, opaque `message_json` | Parse the inner AppRTC SDP/candidate/end-of-candidates JSON and apply it only to the matching current member lifecycle. An inner `bye` is ignored because membership is owned by `LeaveMember`. |
 | `DrainSfu`    | optional `deadline_unix_ms`                                            | Reserved by the Protobuf contract. The current adapter acknowledges it, but signaling does not issue it and the worker does not change readiness. |
 
@@ -769,23 +831,22 @@ sequenceDiagram
     end
 
     rect rgb(225,245,255)
-    Note over A,F: Future SFU to P2P downgrade - not implemented
-    opt Future downgrade is implemented and its dwell timer expires
-        S->>S: Transition SFU to Downgrading
-        S->>S: Commit room mode P2P and increment signal epoch
-        S->>F: A leaves room with lifecycle ID
-        F-->>S: A left room with lifecycle ID
-        S->>F: B leaves room with lifecycle ID
-        F-->>S: B left room and SFU room reaped
-        S-->>A: WS control sfu-downgrade epoch 2 initiator true
-        S-->>B: WS control sfu-downgrade epoch 2 initiator false
-        Note over A,B: SFU PCs are closed before direct negotiation
-        A->>S: WS send direct P2P offer
-        S-->>B: WS msg direct P2P offer
-        B->>S: WS send direct P2P answer
-        S-->>A: WS msg direct P2P answer
-        Note over A,B: Direct P2P media resumes
-    end
+    Note over A,F: SFU to P2P downgrade after the room settles at two members
+    S->>S: C left, room is SFU with two members: arm the downgrade dwell
+    Note over S: Dwell expires (--downgrade-dwell, default 2s) and the room is still eligible
+    S->>S: Commit room mode P2P, increment signal epoch, elect the lowest client ID
+    S->>S: Release the worker assignment and clear queued messages
+    S->>F: A leaves room with lifecycle ID, reason ROOM_CLOSED
+    S->>F: B leaves room with lifecycle ID, reason ROOM_CLOSED
+    S-->>A: WS control sfu-downgrade epoch 2 initiator true
+    S-->>B: WS control sfu-downgrade epoch 2 initiator false
+    F-->>S: A and B left room, SFU room reaped
+    Note over A,B: Each browser keeps its SFU PC on screen while negotiating directly
+    A->>S: WS send direct P2P offer at epoch 2
+    S-->>B: WS msg direct P2P offer
+    B->>S: WS send direct P2P answer at epoch 2
+    S-->>A: WS msg direct P2P answer
+    Note over A,B: Direct media arrives; each browser closes its SFU PC and returns to the P2P stage
     end
 ```
 
