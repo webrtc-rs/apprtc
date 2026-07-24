@@ -1040,6 +1040,7 @@ mod tests {
                 stop_rx,
                 receiver,
                 Duration::from_secs(10),
+                Duration::from_secs(2),
             ));
             Self {
                 stop,
@@ -1287,6 +1288,7 @@ mod tests {
             driver_stop_rx,
             command_rx,
             Duration::from_secs(10),
+            Duration::from_secs(2),
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

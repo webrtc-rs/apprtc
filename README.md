@@ -38,7 +38,7 @@ to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the le
 signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
 offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe offers and republish after an offer collision. SFU→P2P downgrade is not implemented yet.
+The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe offers and republish after an offer collision. When an SFU room shrinks back to two members and stays there for a short dwell (`--downgrade-dwell`, default 2s), signaling automatically downgrades it to direct P2P: it break-before-make commits P2P with a new signal epoch, tears down both members' SFU legs, and tells the two browsers to close their SFU peer connections and negotiate directly again (grid → full-screen).
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
@@ -136,9 +136,14 @@ SFU-capable V2 adds:
 - Reliable worker events, command result correlation and deduplication, health/capacity reporting, same-instance
   reconnect synchronization, and command replay.
 - Ordered worker-side joins and leaves for members admitted to or removed from an existing SFU room.
+- Automatic SFU→P2P downgrade: once an SFU room has sat at two members for the `--downgrade-dwell` window (default 2s), signaling commits P2P with a new
+  signal epoch, sends both members' worker leaves, elects the lower client id as the direct offerer, and pushes an
+  `sfu-downgrade` control so each browser closes its SFU peer connection and renegotiates directly (the UI returns from
+  the grid to the full-screen stage). The dwell absorbs brief churn so a third participant leaving and rejoining does not
+  flap the room between modes.
 - V2 perfect negotiation in the browser: it is polite toward the SFU, rolls back a colliding local offer, answers the SFU offer with its `requestid`, and creates a fresh publish offer afterward.
 
-SFU→P2P downgrade and cross-worker migration of an established room are intentionally deferred. A disconnected worker may resume its rooms only by reconnecting with the same process-incarnation `instance_id` during the recovery grace period; otherwise signaling fails those rooms with `room-failed` rather than moving live WebRTC transports.
+Cross-worker migration of an established room is intentionally deferred. A disconnected worker may resume its rooms only by reconnecting with the same process-incarnation `instance_id` during the recovery grace period; otherwise signaling fails those rooms with `room-failed` rather than moving live WebRTC transports.
 
 ## Current limitations
 
@@ -284,6 +289,7 @@ Run `cargo run --bin appweb -- --help`, `cargo run --bin signaling -- --help`, o
 | `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb` and `sfu`).                                              |
 | `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`appweb`, `sfu`).                           |
 | `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                                                        |
+| `--downgrade-dwell <SECONDS>`  |                      `2` | Seconds an SFU room dwells at two members before downgrading to direct P2P (`signaling`).         |
 | `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                                                      |
 | `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                                               |
 | `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                                               |

@@ -15,7 +15,7 @@ const EVENT_DEDUP_CAPACITY: usize = 4096;
 /// How long an SFU room must sit at ≤2 members before it downgrades back to
 /// direct P2P. The dwell absorbs brief membership churn (a third participant
 /// leaving and immediately rejoining) so the room does not flap between modes.
-const DOWNGRADE_DWELL: Duration = Duration::from_secs(15);
+const DOWNGRADE_DWELL: Duration = Duration::from_secs(2);
 
 pub type RoomId = u64;
 pub type ClientId = u64;
@@ -207,6 +207,7 @@ pub struct RoomTable {
     command_workers: HashMap<u64, String>,
     next_sfu_request_id: u64,
     reconnect_grace: Duration,
+    downgrade_dwell: Duration,
     actions: VecDeque<Action>,
 }
 
@@ -221,8 +222,15 @@ impl RoomTable {
             command_workers: HashMap::new(),
             next_sfu_request_id: 1,
             reconnect_grace,
+            downgrade_dwell: DOWNGRADE_DWELL,
             actions: VecDeque::new(),
         }
+    }
+
+    /// Override the SFU→P2P downgrade dwell (default [`DOWNGRADE_DWELL`]). Lets a deployment tune
+    /// how long a room lingers at two SFU members before returning to direct P2P.
+    pub fn set_downgrade_dwell(&mut self, dwell: Duration) {
+        self.downgrade_dwell = dwell;
     }
 
     pub fn admit(
@@ -1194,7 +1202,7 @@ impl RoomTable {
         if let Some(room) = self.rooms.get_mut(&room_id) {
             if eligible {
                 if room.downgrade_deadline.is_none() {
-                    room.downgrade_deadline = Some(now + DOWNGRADE_DWELL);
+                    room.downgrade_deadline = Some(now + self.downgrade_dwell);
                 }
             } else {
                 room.downgrade_deadline = None;

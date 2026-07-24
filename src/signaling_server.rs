@@ -49,8 +49,10 @@ pub async fn run(
     mut stop_rx: watch::Receiver<()>,
     mut commands: mpsc::Receiver<DriverCommand>,
     register_timeout: Duration,
+    downgrade_dwell: Duration,
 ) {
     let mut collider = Collider::new(register_timeout);
+    collider.set_downgrade_dwell(downgrade_dwell);
     let mut sockets: HashMap<ConnectionId, mpsc::Sender<SocketOutput>> = HashMap::new();
     let mut sfu_sessions = HashMap::new();
     let mut pending_authority = HashMap::new();
@@ -259,7 +261,12 @@ mod tests {
         fn spawn() -> Self {
             let (stop_tx, stop_rx) = watch::channel(());
             let (commands, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
-            let run = tokio::spawn(run(stop_rx, commands_rx, Duration::from_secs(10)));
+            let run = tokio::spawn(run(
+                stop_rx,
+                commands_rx,
+                Duration::from_secs(10),
+                Duration::from_secs(2),
+            ));
             Self {
                 stop_tx,
                 commands,

@@ -29,6 +29,9 @@ struct Cli {
     certificate: String,
     #[arg(long, default_value_t = String::new())]
     private_key: String,
+    /// Seconds an SFU room dwells at two members before it downgrades back to direct P2P.
+    #[arg(long, default_value_t = 2)]
+    downgrade_dwell: u64,
     #[arg(short, long)]
     debug: bool,
     #[arg(short, long, default_value = "info")]
@@ -118,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
         collider_stop_rx,
         commands_rx,
         REGISTER_TIMEOUT,
+        Duration::from_secs(cli.downgrade_dwell),
     ));
     let ws_handle = tokio::spawn(ws_server::run(
         transport_stop_rx.clone(),

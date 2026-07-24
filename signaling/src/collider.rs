@@ -175,6 +175,12 @@ impl Collider {
         }
     }
 
+    /// Override the SFU→P2P downgrade dwell (default 2 seconds). Applies to V2 rooms only; V1 has
+    /// no SFU mode.
+    pub fn set_downgrade_dwell(&mut self, dwell: Duration) {
+        self.v2_rooms.set_downgrade_dwell(dwell);
+    }
+
     fn handle_browser_text(
         &mut self,
         connection_id: ConnectionId,
