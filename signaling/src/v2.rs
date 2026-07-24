@@ -1328,15 +1328,15 @@ impl RoomTable {
         command: sfu::Command,
         pending: PendingCommand,
     ) {
+        let (operation, room_id, client_id) = match &command.command {
+            sfu::CommandKind::SyncRoom(c) => ("sync_room", c.room_id, 0),
+            sfu::CommandKind::Join(c) => ("join", c.room_id, c.client_id),
+            sfu::CommandKind::Leave(c) => ("leave", c.room_id, c.client_id),
+            sfu::CommandKind::Signal(c) => ("signal", c.room_id, c.client_id),
+        };
         log::info!(
-            "SFU command: instance_id={instance_id} connection_id={connection_id} request_id={} operation={}",
+            "SFU command: instance_id={instance_id} connection_id={connection_id} request_id={} operation={operation} room_id={room_id} client_id={client_id}",
             command.request_id,
-            match &command.command {
-                sfu::CommandKind::SyncRoom(_) => "sync_room",
-                sfu::CommandKind::Join(_) => "join",
-                sfu::CommandKind::Leave(_) => "leave",
-                sfu::CommandKind::Signal(_) => "signal",
-            }
         );
         self.pending_commands.insert(command.request_id, pending);
         self.command_workers.insert(command.request_id, instance_id);

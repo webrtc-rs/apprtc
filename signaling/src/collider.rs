@@ -371,9 +371,12 @@ impl Collider {
                     );
                     return Ok(());
                 };
+                // The full body follows on the next line so log_to_sequence_diagram.py can show the
+                // SDP/candidate under a click-to-expand [+]. signaling never parses this payload.
                 log::info!(
-                    "V2 send: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} bytes={}",
-                    msg.msg.len()
+                    "V2 send: connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} bytes={}\n{}",
+                    msg.msg.len(),
+                    msg.msg
                 );
                 if let v2::SendResult::P2p(Some(delivery)) =
                     self.v2_rooms
@@ -382,6 +385,13 @@ impl Collider {
                         .v2_connections
                         .get(&(delivery.room_id, delivery.client_id))
                 {
+                    log::info!(
+                        "V2 deliver: connection_id={peer_connection} room_id={} client_id={} bytes={}\n{}",
+                        delivery.room_id,
+                        delivery.client_id,
+                        delivery.message.len(),
+                        delivery.message
+                    );
                     self.browser_outputs.push_back(BrowserOutput::Text {
                         connection_id: peer_connection,
                         text: server_msg(&delivery.message),
@@ -454,6 +464,12 @@ impl Collider {
             .v2_connections
             .get(&(promotion.room_id, promotion.client_id))
         {
+            log::info!(
+                "V2 control: control=p2p-promote connection_id={connection_id} room_id={} client_id={} epoch={}",
+                promotion.room_id,
+                promotion.client_id,
+                promotion.signal_epoch
+            );
             self.browser_outputs.push_back(BrowserOutput::Text {
                 connection_id,
                 text: to_wire(&V2Promoted {
@@ -639,6 +655,9 @@ impl Collider {
                     for client_id in existing_clients {
                         if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
                         {
+                            log::info!(
+                                "V2 control: control=sfu-upgrade connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch}"
+                            );
                             self.browser_outputs.push_back(BrowserOutput::Text {
                                 connection_id,
                                 text: to_wire(&V2Upgrade {
@@ -659,6 +678,10 @@ impl Collider {
                     for client_id in clients {
                         if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
                         {
+                            log::info!(
+                                "V2 control: control=sfu-downgrade connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={signal_epoch} is_initiator={}",
+                                client_id == initiator_client_id
+                            );
                             self.browser_outputs.push_back(BrowserOutput::Text {
                                 connection_id,
                                 text: to_wire(&V2Downgrade {
@@ -676,6 +699,13 @@ impl Collider {
                         .v2_connections
                         .get(&(delivery.room_id, delivery.client_id))
                     {
+                        log::info!(
+                            "V2 deliver: connection_id={connection_id} room_id={} client_id={} bytes={}\n{}",
+                            delivery.room_id,
+                            delivery.client_id,
+                            delivery.message.len(),
+                            delivery.message
+                        );
                         self.browser_outputs.push_back(BrowserOutput::Text {
                             connection_id,
                             text: server_msg(&delivery.message),
@@ -690,6 +720,9 @@ impl Collider {
                     for client_id in clients {
                         if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
                         {
+                            log::info!(
+                                "V2 control: control=room-failed connection_id={connection_id} room_id={room_id} client_id={client_id} reason={reason}"
+                            );
                             self.browser_outputs.push_back(BrowserOutput::Text {
                                 connection_id,
                                 text: to_wire(&V2RoomFailed {
