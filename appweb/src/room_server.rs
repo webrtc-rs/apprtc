@@ -305,6 +305,15 @@ async fn v2_join(
         log::info!("HTTP V2 join: room_id={room_id} client_id={client_id} attempt={attempt}");
         match server.inner.authority.admit_v2(room_id, client_id).await {
             Ok(admission) => {
+                let mode = match admission.mode {
+                    signaling_proto::v2::RoomMode::P2p => "p2p",
+                    signaling_proto::v2::RoomMode::Sfu => "sfu",
+                    _ => unreachable!("gRPC authority filters transition modes"),
+                };
+                log::info!(
+                    "HTTP V2 join response: room_id={room_id} client_id={client_id} result=SUCCESS mode={mode} epoch={}",
+                    admission.signal_epoch
+                );
                 let params = server
                     .inner
                     .config
@@ -315,11 +324,7 @@ async fn v2_join(
                         client_id: client_id.to_string(),
                         room_id: roomid,
                         room_link: params.room_link,
-                        mode: match admission.mode {
-                            signaling_proto::v2::RoomMode::P2p => "p2p",
-                            signaling_proto::v2::RoomMode::Sfu => "sfu",
-                            _ => unreachable!("gRPC authority filters transition modes"),
-                        },
+                        mode,
                         epoch: admission.signal_epoch.to_string(),
                         wss_url: params.wss_url,
                         admission_token: admission.admission_token,

@@ -313,6 +313,11 @@ impl Collider {
         self.total_websocket_connections = self.total_websocket_connections.saturating_add(1);
 
         // The authoritative snapshot must precede any queued SDP/ICE messages.
+        log::info!(
+            "V2 control: control=registered connection_id={connection_id} room_id={room_id} client_id={client_id} epoch={} mode={}",
+            registration.signal_epoch,
+            room_mode_name(registration.mode)
+        );
         self.browser_outputs.push_back(BrowserOutput::Text {
             connection_id,
             text: to_wire(&V2Registered {
@@ -323,7 +328,15 @@ impl Collider {
                 is_initiator: registration.is_initiator,
             }),
         });
+        // Early P2P signaling from the peer (typically the initiator's offer and its candidates)
+        // was queued before this client registered; it is delivered now. Log each body so
+        // log_to_sequence_diagram.py can show it (the same "V2 deliver" the relay path logs).
         for message in registration.queued_messages {
+            log::info!(
+                "V2 deliver: connection_id={connection_id} room_id={room_id} client_id={client_id} bytes={}\n{}",
+                message.len(),
+                message
+            );
             self.browser_outputs.push_back(BrowserOutput::Text {
                 connection_id,
                 text: server_msg(&message),

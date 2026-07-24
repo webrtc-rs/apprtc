@@ -847,6 +847,15 @@ impl RoomTable {
                 {
                     return Err("STALE_ASSIGNMENT".into());
                 }
+                // The worker-originated SDP (a publish answer or a server-initiated subscribe
+                // re-offer) and its candidates. Log the body so log_to_sequence_diagram.py shows
+                // the worker->signaling leg (before signaling relays it on to the browser).
+                log::info!(
+                    "SFU event: instance_id={instance_id} operation=signal room_id={} client_id={}\n{}",
+                    signal.room_id,
+                    signal.client_id,
+                    signal.message_json
+                );
                 self.actions.push_back(Action::Deliver(Delivery {
                     room_id: signal.room_id,
                     client_id: signal.client_id,
@@ -1334,9 +1343,16 @@ impl RoomTable {
             sfu::CommandKind::Leave(c) => ("leave", c.room_id, c.client_id),
             sfu::CommandKind::Signal(c) => ("signal", c.room_id, c.client_id),
         };
+        // A signal command forwards the browser's opaque SDP/candidate to the worker; append it
+        // (like a browser send) so log_to_sequence_diagram.py can label the hop by type and expand
+        // the SDP. Other commands carry no such body.
+        let body = match &command.command {
+            sfu::CommandKind::Signal(c) => format!("\n{}", c.message_json),
+            _ => String::new(),
+        };
+        let request_id = command.request_id;
         log::info!(
-            "SFU command: instance_id={instance_id} connection_id={connection_id} request_id={} operation={operation} room_id={room_id} client_id={client_id}",
-            command.request_id,
+            "SFU command: instance_id={instance_id} connection_id={connection_id} request_id={request_id} operation={operation} room_id={room_id} client_id={client_id}{body}"
         );
         self.pending_commands.insert(command.request_id, pending);
         self.command_workers.insert(command.request_id, instance_id);
