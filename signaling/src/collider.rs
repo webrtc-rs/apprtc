@@ -2,8 +2,8 @@
 
 use crate::client::ClientId;
 use crate::messages::{
-    Message, V2Promoted, V2Registered, V2RoomFailed, V2Upgrade, WsClientMsg, server_err,
-    server_msg, to_wire,
+    Message, V2Downgrade, V2Promoted, V2Registered, V2RoomFailed, V2Upgrade, WsClientMsg,
+    server_err, server_msg, to_wire,
 };
 use crate::room::RoomId;
 use crate::room_table::RoomTable;
@@ -639,6 +639,27 @@ impl Collider {
                                     control: "sfu-upgrade",
                                     roomid: room_id.to_string(),
                                     epoch: signal_epoch.to_string(),
+                                }),
+                            });
+                        }
+                    }
+                }
+                v2::Action::Downgraded {
+                    room_id,
+                    signal_epoch,
+                    initiator_client_id,
+                    clients,
+                } => {
+                    for client_id in clients {
+                        if let Some(&connection_id) = self.v2_connections.get(&(room_id, client_id))
+                        {
+                            self.browser_outputs.push_back(BrowserOutput::Text {
+                                connection_id,
+                                text: to_wire(&V2Downgrade {
+                                    control: "sfu-downgrade",
+                                    roomid: room_id.to_string(),
+                                    epoch: signal_epoch.to_string(),
+                                    is_initiator: client_id == initiator_client_id,
                                 }),
                             });
                         }

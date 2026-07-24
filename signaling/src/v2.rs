@@ -12,6 +12,10 @@ const MAX_P2P_MEMBERS: usize = 2;
 const MAX_QUEUED_MESSAGES: usize = 1024;
 const HEALTH_INTERVAL_MS: u64 = 30_000;
 const EVENT_DEDUP_CAPACITY: usize = 4096;
+/// How long an SFU room must sit at ≤2 members before it downgrades back to
+/// direct P2P. The dwell absorbs brief membership churn (a third participant
+/// leaving and immediately rejoining) so the room does not flap between modes.
+const DOWNGRADE_DWELL: Duration = Duration::from_secs(15);
 
 pub type RoomId = u64;
 pub type ClientId = u64;
@@ -91,6 +95,14 @@ pub enum Action {
         signal_epoch: u64,
         existing_clients: Vec<ClientId>,
     },
+    Downgraded {
+        room_id: RoomId,
+        signal_epoch: u64,
+        /// The member elected to offer the direct P2P connection; every other
+        /// member becomes the answerer.
+        initiator_client_id: ClientId,
+        clients: Vec<ClientId>,
+    },
     Deliver(Delivery),
     RoomFailed {
         room_id: RoomId,
@@ -135,6 +147,11 @@ struct Room {
     upgrade: Option<Upgrade>,
     pending_join: Option<PendingJoin>,
     pending_leave: Option<PendingLeave>,
+    /// When an SFU room shrinks to at most two members it becomes eligible for a
+    /// downgrade back to direct P2P. This is the deadline after which the dwell
+    /// expires and `commit_downgrade` runs; cleared whenever the room stops being
+    /// a stable ≤2-member SFU room (a third joins, or a transition starts).
+    downgrade_deadline: Option<Instant>,
 }
 
 struct Worker {
@@ -248,6 +265,7 @@ impl RoomTable {
                     upgrade: None,
                     pending_join: None,
                     pending_leave: None,
+                    downgrade_deadline: None,
                 },
             );
             return Ok(AdmissionResult::Complete(Admission {
@@ -421,6 +439,8 @@ impl RoomTable {
             authority_request_id,
             client_id,
         });
+        // A new member is joining, so the room is no longer a downgrade candidate.
+        room.downgrade_deadline = None;
         let assignment_epoch = room.assignment_epoch;
         let request_id = self.next_command_id();
         self.queue_command(
@@ -615,7 +635,8 @@ impl RoomTable {
                 connection_id,
                 instance_id,
                 result,
-            } => self.handle_command_result(connection_id, &instance_id, result),
+                now,
+            } => self.handle_command_result(connection_id, &instance_id, result, now),
             sfu::Input::Event {
                 connection_id,
                 instance_id,
@@ -842,6 +863,7 @@ impl RoomTable {
         connection_id: sfu::ConnectionId,
         instance_id: &str,
         result: sfu::CommandResult,
+        now: Instant,
     ) -> Result<(), String> {
         let worker = self.workers.get(instance_id).ok_or("UNKNOWN_SFU")?;
         if worker.connection_id != Some(connection_id) {
@@ -1001,6 +1023,10 @@ impl RoomTable {
                     }
                     if room.members.is_empty() {
                         self.rooms.remove(&room_id);
+                    } else {
+                        // A member left an SFU room; if it has shrunk to at most two
+                        // members and is otherwise idle, start the downgrade dwell.
+                        self.arm_downgrade(room_id, now);
                     }
                 } else {
                     if let Some(authority_request_id) = pending_leave.authority_request_id {
@@ -1142,6 +1168,100 @@ impl RoomTable {
             } else {
                 reason
             }),
+        });
+        Ok(())
+    }
+
+    /// True when `room_id` is a stable SFU room small enough to run as direct P2P
+    /// again: SFU mode, at most two members, and no membership transition or
+    /// unfinished worker leave in flight.
+    fn is_downgrade_eligible(&self, room_id: RoomId) -> bool {
+        self.rooms.get(&room_id).is_some_and(|room| {
+            room.mode == RoomMode::Sfu
+                && !room.members.is_empty()
+                && room.members.len() <= MAX_P2P_MEMBERS
+                && room.upgrade.is_none()
+                && room.pending_join.is_none()
+                && room.pending_leave.is_none()
+        })
+    }
+
+    /// Arm (or leave armed) the downgrade dwell for an SFU room that has shrunk to
+    /// at most two members; clear it otherwise. Idempotent — an already-armed
+    /// deadline is preserved so churn within the dwell does not keep pushing it out.
+    fn arm_downgrade(&mut self, room_id: RoomId, now: Instant) {
+        let eligible = self.is_downgrade_eligible(room_id);
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            if eligible {
+                if room.downgrade_deadline.is_none() {
+                    room.downgrade_deadline = Some(now + DOWNGRADE_DWELL);
+                }
+            } else {
+                room.downgrade_deadline = None;
+            }
+        }
+    }
+
+    /// Break-before-make SFU→P2P downgrade. Commits P2P and a new signal epoch,
+    /// elects the lowest client id as the direct offerer, tears down every member's
+    /// SFU leg on the worker, frees the assignment, and emits `Downgraded` so each
+    /// browser is told to close its SFU peer connection and negotiate directly.
+    fn commit_downgrade(&mut self, room_id: RoomId) -> Result<(), String> {
+        let room = self.rooms.get_mut(&room_id).ok_or("ROOM_NOT_FOUND")?;
+        room.mode = RoomMode::P2p;
+        room.signal_epoch = room.signal_epoch.saturating_add(1);
+        room.downgrade_deadline = None;
+        let assignment_epoch = room.assignment_epoch;
+        let instance_id = room.assigned_instance.take();
+
+        let mut clients: Vec<ClientId> = room.members.keys().copied().collect();
+        clients.sort_unstable();
+        let initiator_client_id = *clients.first().ok_or("CLIENT_NOT_FOUND")?;
+        let mut leaving = Vec::with_capacity(clients.len());
+        for (&client_id, member) in room.members.iter_mut() {
+            member.is_initiator = client_id == initiator_client_id;
+            member.queued_messages.clear();
+            leaving.push((client_id, member.lifecycle_id));
+        }
+        let signal_epoch = room.signal_epoch;
+
+        // Tear down the SFU legs of every member and free the worker assignment.
+        if let Some(instance_id) = instance_id {
+            let connection_id = self
+                .workers
+                .get(&instance_id)
+                .and_then(|worker| worker.connection_id);
+            if let Some(worker) = self.workers.get_mut(&instance_id) {
+                worker.assigned_rooms.remove(&room_id);
+                worker.assigned_clients = worker.assigned_clients.saturating_sub(leaving.len());
+            }
+            if let Some(connection_id) = connection_id {
+                for (client_id, lifecycle_id) in &leaving {
+                    let request_id = self.next_command_id();
+                    self.queue_command(
+                        instance_id.clone(),
+                        connection_id,
+                        sfu::Command {
+                            request_id,
+                            command: sfu::CommandKind::Leave(sfu::LeaveMember {
+                                room_id,
+                                client_id: *client_id,
+                                lifecycle_id: *lifecycle_id,
+                                assignment_epoch,
+                                reason: sfu::LeaveReason::RoomClosed,
+                            }),
+                        },
+                        PendingCommand::Cleanup,
+                    );
+                }
+            }
+        }
+
+        self.actions.push_back(Action::Downgraded {
+            room_id,
+            signal_epoch,
+            initiator_client_id,
+            clients,
         });
         Ok(())
     }
@@ -1349,6 +1469,21 @@ impl RoomTable {
         }
         let room_ids = self.rooms.keys().copied().collect::<Vec<_>>();
         for room_id in room_ids {
+            // SFU→P2P downgrade: the ≤2-member dwell has expired. Re-check eligibility
+            // (a third member may have joined during the dwell) before committing.
+            let downgrade_due = self
+                .rooms
+                .get(&room_id)
+                .and_then(|room| room.downgrade_deadline)
+                .is_some_and(|deadline| deadline <= now);
+            if downgrade_due {
+                if self.is_downgrade_eligible(room_id) {
+                    let _ = self.commit_downgrade(room_id);
+                } else if let Some(room) = self.rooms.get_mut(&room_id) {
+                    room.downgrade_deadline = None;
+                }
+                continue;
+            }
             let expired_sfu_client = self.rooms.get(&room_id).and_then(|room| {
                 (room.mode == RoomMode::Sfu && room.pending_leave.is_none())
                     .then(|| {
@@ -1422,10 +1557,15 @@ impl RoomTable {
             .values()
             .filter_map(|worker| worker.disconnect_deadline)
             .min();
-        match (browser_timeout, worker_timeout) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left, right) => left.or(right),
-        }
+        let downgrade_timeout = self
+            .rooms
+            .values()
+            .filter_map(|room| room.downgrade_deadline)
+            .min();
+        [browser_timeout, worker_timeout, downgrade_timeout]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn poll_action(&mut self) -> Option<Action> {
@@ -1671,6 +1811,7 @@ mod tests {
                         request_id: command.request_id,
                         result: Ok(sfu::CommandOk::MemberJoined(join)),
                     },
+                    now,
                 })
                 .unwrap();
         }
@@ -1714,6 +1855,7 @@ mod tests {
                     request_id: command.request_id,
                     result: Ok(sfu::CommandOk::MemberJoined(join)),
                 },
+                now,
             })
             .unwrap();
         assert!(matches!(
@@ -1748,6 +1890,7 @@ mod tests {
                     request_id: command.request_id,
                     result: Ok(sfu::CommandOk::MemberLeft(leave)),
                 },
+                now,
             })
             .unwrap();
         assert!(matches!(
@@ -1813,6 +1956,7 @@ mod tests {
                         assignment_epoch: sync_room.assignment_epoch,
                     })),
                 },
+                now,
             })
             .unwrap();
         assert!(matches!(
@@ -1851,6 +1995,7 @@ mod tests {
                         request_id: command.request_id,
                         result: Ok(sfu::CommandOk::MemberJoined(join)),
                     },
+                    now,
                 })
                 .unwrap();
         }
@@ -1902,6 +2047,7 @@ mod tests {
                         request_id: command.request_id,
                         result: Ok(sfu::CommandOk::MemberJoined(join)),
                     },
+                    now,
                 })
                 .unwrap();
         }
@@ -1926,5 +2072,123 @@ mod tests {
         assert_eq!(leave.client_id, 101);
         assert!(matches!(leave.reason, sfu::LeaveReason::Disconnected));
         assert!(rooms.poll_action().is_none());
+    }
+
+    #[test]
+    fn sfu_room_downgrades_to_p2p_after_dwell_at_two_members() {
+        let now = Instant::now();
+        let mut rooms = RoomTable::new(Duration::from_secs(10));
+        register_ready_worker(&mut rooms);
+        let tokens = [(10, 101), (11, 102), (12, 103)].map(|(request, client)| {
+            match rooms
+                .admit(request, now, 42, client, format!("token-{client}"))
+                .unwrap()
+            {
+                AdmissionResult::Complete(admission) => (client, admission.admission_token),
+                AdmissionResult::Pending => (client, format!("token-{client}")),
+            }
+        });
+        for _ in 0..3 {
+            let command = match rooms.poll_action().unwrap() {
+                Action::Sfu(sfu::Output::Command { command, .. }) => command,
+                action => panic!("unexpected action: {action:?}"),
+            };
+            let join = match command.command {
+                sfu::CommandKind::Join(join) => join,
+                _ => panic!("expected join"),
+            };
+            rooms
+                .handle_sfu_input(sfu::Input::CommandResult {
+                    connection_id: 9,
+                    instance_id: "worker-1".into(),
+                    result: sfu::CommandResult {
+                        request_id: command.request_id,
+                        result: Ok(sfu::CommandOk::MemberJoined(join)),
+                    },
+                    now,
+                })
+                .unwrap();
+        }
+        assert_eq!(rooms.occupancy(42), (3, RoomMode::Sfu));
+        // Register the members so they carry no reconnect deadline (as real SFU members do).
+        for (client, token) in &tokens {
+            rooms.register(42, *client, token).unwrap();
+        }
+        while rooms.poll_action().is_some() {}
+
+        // The third member leaves; drive its MemberLeft so the room shrinks to two.
+        assert_eq!(
+            rooms.remove(14, 42, 103, "token-103").unwrap(),
+            RemovalResult::Pending
+        );
+        let command = match rooms.poll_action().unwrap() {
+            Action::Sfu(sfu::Output::Command { command, .. }) => command,
+            action => panic!("unexpected action: {action:?}"),
+        };
+        let leave = match command.command {
+            sfu::CommandKind::Leave(leave) => leave,
+            _ => panic!("expected leave"),
+        };
+        rooms
+            .handle_sfu_input(sfu::Input::CommandResult {
+                connection_id: 9,
+                instance_id: "worker-1".into(),
+                result: sfu::CommandResult {
+                    request_id: command.request_id,
+                    result: Ok(sfu::CommandOk::MemberLeft(leave)),
+                },
+                now,
+            })
+            .unwrap();
+        while rooms.poll_action().is_some() {}
+        assert_eq!(rooms.occupancy(42), (2, RoomMode::Sfu));
+
+        // The dwell is armed and does not fire early.
+        assert!(rooms.poll_timeout().is_some());
+        rooms.handle_timeout(now + Duration::from_secs(1));
+        assert_eq!(
+            rooms.occupancy(42),
+            (2, RoomMode::Sfu),
+            "downgrade must wait out the dwell"
+        );
+        assert!(rooms.poll_action().is_none());
+
+        // After the dwell, the room downgrades to direct P2P.
+        rooms.handle_timeout(now + DOWNGRADE_DWELL + Duration::from_secs(1));
+        assert_eq!(rooms.occupancy(42), (2, RoomMode::P2p));
+
+        let mut leaves = 0;
+        let mut downgraded = false;
+        while let Some(action) = rooms.poll_action() {
+            match action {
+                Action::Sfu(sfu::Output::Command { command, .. }) => {
+                    assert!(matches!(command.command, sfu::CommandKind::Leave(_)));
+                    leaves += 1;
+                }
+                Action::Downgraded {
+                    room_id,
+                    signal_epoch,
+                    initiator_client_id,
+                    mut clients,
+                } => {
+                    assert_eq!(room_id, 42);
+                    assert_eq!(signal_epoch, 2, "P2P->SFU->P2P bumps the epoch twice");
+                    assert_eq!(initiator_client_id, 101, "lowest client id offers");
+                    clients.sort_unstable();
+                    assert_eq!(clients, vec![101, 102]);
+                    downgraded = true;
+                }
+                other => panic!("unexpected action after downgrade: {other:?}"),
+            }
+        }
+        assert_eq!(leaves, 2, "both remaining members' SFU legs must be left");
+        assert!(downgraded, "a Downgraded control must be emitted");
+
+        // A fresh third join can upgrade the room again.
+        assert_eq!(
+            rooms.admit(20, now, 42, 104, "token-104".into()).unwrap(),
+            AdmissionResult::Pending
+        );
+        assert!(matches!(rooms.occupancy(42), (3, RoomMode::Upgrading)));
     }
 }

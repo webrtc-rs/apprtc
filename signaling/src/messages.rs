@@ -58,6 +58,14 @@ pub struct V2Upgrade {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct V2Downgrade {
+    pub control: &'static str,
+    pub roomid: String,
+    pub epoch: String,
+    pub is_initiator: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct V2RoomFailed {
     pub control: &'static str,
     pub roomid: String,

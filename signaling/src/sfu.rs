@@ -147,6 +147,7 @@ pub enum Input {
         connection_id: ConnectionId,
         instance_id: String,
         result: CommandResult,
+        now: Instant,
     },
     Event {
         connection_id: ConnectionId,

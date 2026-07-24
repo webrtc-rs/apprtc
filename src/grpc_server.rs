@@ -810,6 +810,7 @@ fn decode_sfu_input(
                     request_id: result.request_id,
                     result: result_value,
                 },
+                now: std::time::Instant::now(),
             })
         }
         Some(v2::sfu_to_signaling::Message::Event(event)) => {
