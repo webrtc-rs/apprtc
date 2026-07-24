@@ -22,8 +22,8 @@ pub mod ws_server;
 pub fn tls_pem(certificate: &str, private_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     if certificate.is_empty() && private_key.is_empty() {
         Ok((
-            include_bytes!("../cert/cert.pem").to_vec(),
-            include_bytes!("../cert/key.pem").to_vec(),
+            include_bytes!("../scripts/cert.pem").to_vec(),
+            include_bytes!("../scripts/key.pem").to_vec(),
         ))
     } else if !certificate.is_empty() && !private_key.is_empty() {
         Ok((
