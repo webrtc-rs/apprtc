@@ -557,6 +557,8 @@ Call.prototype.onRecvSignalingControl_ = function(control) {
     }
   } else if (control.control === 'sfu-upgrade') {
     this.startSfuUpgrade_();
+  } else if (control.control === 'sfu-downgrade') {
+    this.startSfuDowngrade_(control);
   } else if (control.control === 'room-failed') {
     this.onError_('SFU room failed: ' + (control.reason || 'worker unavailable'));
   }
@@ -584,6 +586,47 @@ Call.prototype.startSfuUpgrade_ = function() {
     this.pcClient_.startAsCaller(this.params_.offerOptions);
   }.bind(this)).catch(function(error) {
     this.onError_('SFU upgrade failed: ' + error.message);
+  }.bind(this));
+};
+
+// SFU -> P2P downgrade: the room shrank to two members, so signaling committed
+// direct P2P and told us to leave the SFU. Break-before-make (the design deliberately
+// permits a brief media gap): close the SFU peer connection, then build a direct P2P one
+// reusing the same local tracks. The elected initiator offers; the other answers.
+Call.prototype.startSfuDowngrade_ = function(control) {
+  if (!this.params_.sfuMode && this.params_.mode === 'p2p') {
+    return;
+  }
+  trace('Starting SFU to P2P downgrade at epoch ' + this.params_.signalEpoch + '.');
+  this.params_.mode = 'p2p';
+  this.params_.sfuMode = false;
+  this.params_.isInitiator = control.is_initiator === true;
+  // Close both the live SFU peer connection and any P2P connection retained from a
+  // never-finished upgrade handoff.
+  if (this.pcClient_) {
+    this.pcClient_.close();
+    this.pcClient_ = null;
+  }
+  if (this.p2pPcClient_) {
+    this.p2pPcClient_.close();
+    this.p2pPcClient_ = null;
+  }
+  this.createPcClientPromise_ = null;
+  if (this.onmodechange) {
+    this.onmodechange('p2p');
+  }
+  this.startTime = window.performance.now();
+  this.maybeCreatePcClientAsync_().then(function() {
+    if (this.localStream_) {
+      this.pcClient_.addStream(this.localStream_);
+    }
+    if (this.params_.isInitiator) {
+      this.pcClient_.startAsCaller(this.params_.offerOptions);
+    } else {
+      this.pcClient_.startAsCallee(this.params_.messages);
+    }
+  }.bind(this)).catch(function(error) {
+    this.onError_('SFU downgrade failed: ' + error.message);
   }.bind(this));
 };
 

@@ -423,6 +423,33 @@ AppController.prototype.onModeChange_ = function(mode) {
     this.displayStatus_('Switching to group call…');
     return;
   }
+  if (mode === 'p2p') {
+    // SFU -> P2P downgrade: the room shrank to two, so tear down the per-publisher grid
+    // and return to the full-screen P2P layout. Only the remote view changes; the self-view
+    // and controls keep their P2P position. The direct remote video fills the stage when the
+    // new P2P peer connection's track arrives (onRemoteSdpSet_ -> transitionToActive_).
+    for (var tileKey in this.sfuTiles_) {
+      if (this.sfuTiles_.hasOwnProperty(tileKey)) {
+        this.sfuTiles_[tileKey].remove();
+      }
+    }
+    this.sfuTiles_ = {};
+    this.sfuGrid_.classList.add('hidden');
+    this.videosDiv_.classList.remove('sfu-mode');
+    // Restore the P2P container (which mirrors the self-view back to the right) and keep the
+    // self-view populated across the break-before-make gap.
+    this.activate_(this.videosDiv_);
+    if (this.localStream_) {
+      this.localVideo_.srcObject = this.localStream_;
+      this.miniVideo_.srcObject = this.localStream_;
+    }
+    this.activate_(this.miniVideo_);
+    this.deactivate_(this.remoteVideo_);
+    this.show_(this.icons_);
+    this.show_(this.hangupSvg_);
+    this.displayStatus_('');
+    return;
+  }
   if (mode === 'sfu') {
     this.videosDiv_.classList.remove('active');
     this.videosDiv_.classList.add('sfu-mode');
