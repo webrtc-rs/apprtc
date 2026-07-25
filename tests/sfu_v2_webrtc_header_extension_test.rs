@@ -156,7 +156,7 @@ struct Active {
     _audio: Arc<TrackLocalStaticRTP>,
 }
 
-// Run explicitly against a live signaling + sfu + appweb stack:
+// Run explicitly against a live signaling + sfu + apprtc stack:
 //   cargo test --test sfu_v2_webrtc_header_extension_test -- --nocapture
 //
 // The SFU never makes the first offer: it answers each client's initial offer (learning that

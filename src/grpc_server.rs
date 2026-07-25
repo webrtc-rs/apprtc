@@ -1,4 +1,4 @@
-//! Private gRPC adapter for AppWeb and SFU workers.
+//! Private gRPC adapter for AppRTC and SFU workers.
 
 use crate::signaling_server::{COMMAND_CAPACITY, DriverCommand};
 use crate::tls_pem;
@@ -115,9 +115,9 @@ impl GrpcSignalingService {
 
     fn app_context(context: Option<RequestContext>) -> Result<RequestContext, GrpcStatus> {
         let context = context.ok_or_else(|| GrpcStatus::invalid_argument("missing context"))?;
-        if context.app_id != AppId::Appweb as i32 {
+        if context.app_id != AppId::Apprtc as i32 {
             return Err(GrpcStatus::permission_denied(
-                "AppWeb RPC requires APP_ID_APPWEB",
+                "AppRTC RPC requires APP_ID_APPRTC",
             ));
         }
         if context.instance_id.is_empty() {
@@ -153,7 +153,7 @@ impl GrpcSignalingService {
                         ));
                     }
                     log::info!(
-                        "gRPC response replayed: app_id=APPWEB instance_id={} operation={} request_id={request_id}",
+                        "gRPC response replayed: app_id=APPRTC instance_id={} operation={} request_id={request_id}",
                         context.instance_id,
                         operation_name
                     );
@@ -191,7 +191,7 @@ impl GrpcSignalingService {
             .fetch_add(1, Ordering::Relaxed)
             .max(1);
         log::info!(
-            "gRPC request: app_id=APPWEB instance_id={} operation={} request_id={request_id}",
+            "gRPC request: app_id=APPRTC instance_id={} operation={} request_id={request_id}",
             context.instance_id,
             operation_name
         );
@@ -329,13 +329,13 @@ fn domain_error(reason: String) -> Error {
 fn log_result(context: &RequestContext, operation: &str, response: &AuthorityResponse) {
     match &response.result {
         AuthorityResult::Error { result } => log::info!(
-            "gRPC response: app_id=APPWEB instance_id={} operation={} request_id={} result=ERR reason={result}",
+            "gRPC response: app_id=APPRTC instance_id={} operation={} request_id={} result=ERR reason={result}",
             context.instance_id,
             operation,
             context.request_id
         ),
         _ => log::info!(
-            "gRPC response: app_id=APPWEB instance_id={} operation={} request_id={} result=OK",
+            "gRPC response: app_id=APPRTC instance_id={} operation={} request_id={} result=OK",
             context.instance_id,
             operation,
             context.request_id
@@ -1057,8 +1057,8 @@ mod tests {
 
     fn context(request_id: u64) -> RequestContext {
         RequestContext {
-            app_id: AppId::Appweb as i32,
-            instance_id: "appweb-test-instance".into(),
+            app_id: AppId::Apprtc as i32,
+            instance_id: "apprtc-test-instance".into(),
             request_id,
         }
     }

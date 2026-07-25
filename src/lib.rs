@@ -14,9 +14,16 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
+pub mod config;
+pub mod dashboard;
+pub mod grpc_client;
 pub mod grpc_server;
+pub mod params;
+pub mod room_server;
 pub mod sfu_server;
 pub mod signaling_server;
+pub mod templates;
+mod tls;
 pub mod ws_server;
 
 pub fn tls_pem(certificate: &str, private_key: &str) -> Result<(Vec<u8>, Vec<u8>)> {

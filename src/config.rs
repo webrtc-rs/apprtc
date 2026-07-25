@@ -31,7 +31,7 @@ pub struct Config {
     pub force_tls: bool,
 
     /// Complete public signaling WebSocket URL ending in `/ws` (for split
-    /// AppWeb/signaling deployments). When empty, the AppWeb origin is used.
+    /// AppRTC/Signaling deployments). When empty, the AppRTC origin is used.
     pub signaling_ws_url: String,
 
     /// If non-empty, returned verbatim from `/v1alpha/iceconfig` and used as the

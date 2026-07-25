@@ -1,4 +1,4 @@
-//! AppWeb client for the private signaling gRPC service.
+//! AppRTC client for the private signaling gRPC service.
 
 use async_trait::async_trait;
 use signaling_proto::v2::signaling_service_client::SignalingServiceClient;
@@ -99,7 +99,7 @@ impl GrpcAuthority {
                     .map_err(|error| error.to_string())?
             };
         }
-        let instance_id = format!("appweb-{:032x}", rand::random::<u128>());
+        let instance_id = format!("apprtc-{:032x}", rand::random::<u128>());
         log::info!(
             "Signaling gRPC channel configured: url={url} instance_id={instance_id} insecure_tls={insecure_tls}"
         );
@@ -118,7 +118,7 @@ impl GrpcAuthority {
             }
         };
         RequestContext {
-            app_id: AppId::Appweb as i32,
+            app_id: AppId::Apprtc as i32,
             instance_id: self.instance_id.to_string(),
             request_id,
         }

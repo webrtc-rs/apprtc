@@ -1,9 +1,9 @@
-//! Standalone AppWeb HTTP/API server using a remote signaling authority.
+//! Standalone HTTP/API server using a remote signaling authority.
 use anyhow::{Result, bail};
+use apprtc::config::Config;
+use apprtc::grpc_client::GrpcAuthority;
+use apprtc::room_server::RoomServer;
 use apprtc::{TlsListener, tls_config};
-use appweb::config::Config;
-use appweb::grpc_client::GrpcAuthority;
-use appweb::room_server::RoomServer;
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;
@@ -19,14 +19,14 @@ struct Cli {
     host_ip: String,
     #[arg(short, long, default_value_t = 8080)]
     port: u16,
-    #[arg(long, default_value = "appweb")]
+    #[arg(long, default_value = "web")]
     web_root: String,
     #[arg(long)]
     public_url: String,
     /// Public browser signaling WebSocket URL ending in /ws.
     #[arg(long)]
     ws_url: String,
-    /// Private signaling gRPC origin used by AppWeb room operations.
+    /// Private signaling gRPC origin used by room operations.
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     grpc_url: String,
     /// Disable signaling gRPC certificate verification for local development.
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let address: SocketAddr = format!("{}:{}", cli.host_ip, cli.port).parse()?;
     let listener = TcpListener::bind(address).await?;
-    println!("AppWeb listening on {public}");
+    println!("AppRTC listening on {public}");
     let app = server.router();
     if cli.tls {
         axum::serve(

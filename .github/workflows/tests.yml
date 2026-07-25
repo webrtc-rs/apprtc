@@ -32,21 +32,21 @@ jobs:
       - name: Create logs directory
         run: mkdir -p logs
 
-      - name: Build AppWeb, signaling, SFU, and tests
+      - name: Build AppRTC, signaling, SFU, and tests
         run: cargo build --release --bins --tests
 
-      - name: Start AppWeb before signaling and verify startup recovery
+      - name: Start AppRTC before signaling and verify startup recovery
         run: |
-          ./target/release/appweb \
-            --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+          ./target/release/apprtc \
+            --host-ip 127.0.0.1 --port 8080 --web-root web \
             --public-url https://127.0.0.1:8080 \
             --ws-url wss://127.0.0.1:8081/ws \
             --grpc-url https://127.0.0.1:50051 \
             --insecure-tls --tls \
-            --debug --level info > ./logs/appweb.log 2>&1 &
-          appweb_pid=$!
+            --debug --level info > ./logs/apprtc.log 2>&1 &
+          apprtc_pid=$!
           sleep 2
-          kill -0 "$appweb_pid"
+          kill -0 "$apprtc_pid"
           ./target/release/signaling \
             --host-ip 127.0.0.1 --port 8081 \
             --grpc-port 50051 --tls \
@@ -62,12 +62,12 @@ jobs:
             fi
             sleep 1
           done
-          echo "AppWeb failed to become ready"
+          echo "AppRTC failed to become ready"
           cat ./logs/signaling.log
-          cat ./logs/appweb.log
+          cat ./logs/apprtc.log
           exit 1
 
-      - name: Verify AppWeb reconnects after signaling restart
+      - name: Verify AppRTC reconnects after signaling restart
         run: |
           pkill -x signaling || true
           curl --silent --insecure https://127.0.0.1:8080/status >/dev/null || true
@@ -81,20 +81,20 @@ jobs:
             fi
             sleep 1
           done
-          echo "AppWeb failed to reconnect to signaling"
+          echo "AppRTC failed to reconnect to signaling"
           cat ./logs/signaling.log
-          cat ./logs/appweb.log
+          cat ./logs/apprtc.log
           exit 1
 
       - name: Run tests
         run: cargo test --no-fail-fast --test '*' -- --nocapture
 
-      - name: Stop signaling and AppWeb servers
+      - name: Stop signaling and AppRTC servers
         if: always()
         run: |
           pkill -x sfu || true
           pkill -x signaling || true
-          pkill -x appweb || true
+          pkill -x apprtc || true
 
       - name: Upload logs as artifact
         if: always()

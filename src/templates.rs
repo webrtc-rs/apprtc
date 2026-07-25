@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn load_reads_index_and_full_templates_from_web_root() {
-        let root = std::env::temp_dir().join(format!("appweb-templates-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!("apprtc-templates-{}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join("html")).unwrap();
         std::fs::write(root.join("html/index_template.html"), "index").unwrap();
         std::fs::write(root.join("html/full_template.html"), "full").unwrap();
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn load_returns_error_when_template_is_missing() {
-        let root = std::env::temp_dir().join(format!("appweb-missing-{}", rand::random::<u64>()));
+        let root = std::env::temp_dir().join(format!("apprtc-missing-{}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join("html")).unwrap();
         std::fs::write(root.join("html/index_template.html"), "index").unwrap();
         assert!(Templates::load(root.to_str().unwrap()).is_err());

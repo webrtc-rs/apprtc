@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Render apprtc appweb/signaling/sfu INFO logs as one sequence diagram.
+"""Render apprtc/signaling/sfu INFO logs as one sequence diagram.
 
 apprtc is three (or more) processes:
 
-    client ──HTTP──> appweb ──gRPC──> signaling <──gRPC session──> sfu worker 1..N
+    client ──HTTP──> apprtc ──gRPC──> signaling <──gRPC session──> sfu worker 1..N
     client ──────────WebSocket──────> signaling (register / SDP relay / controls)
 
 Each binary logs one line per event as::
@@ -13,7 +13,7 @@ Each binary logs one line per event as::
 and a browser `send`/`deliver` additionally logs the opaque SDP/candidate body on
 the next line. This script parses those INFO lines from every log, merges them by
 timestamp, and draws a sequence diagram whose lanes are, left to right, each
-client (by id), AppWeb, Signaling, and each SFU worker (by instance id).
+client (by id), AppRTC, Signaling, and each SFU worker (by instance id).
 
 Two output formats:
 
@@ -27,11 +27,11 @@ recovered by parsing the logged body (`{"type":"offer","sdp":...}` etc.) here.
 
 Usage:
     scripts/log2seq.py \\
-        --appweb /private/tmp/logs/appweb.log \\
+        --apprtc /private/tmp/logs/apprtc.log \\
         --signaling /private/tmp/logs/signaling.log \\
         --sfu /private/tmp/logs/sfu.log
     # multiple SFU workers, HTML out, one room only:
-    scripts/log2seq.py --appweb a.log --signaling s.log \\
+    scripts/log2seq.py --apprtc a.log --signaling s.log \\
         --sfu w1.log w2.log -f html -o seq.html --room 42
 """
 
@@ -48,8 +48,8 @@ LINE_RE = re.compile(
     r"(?P<src>\S+?):(?P<ln>\d+) - (?P<msg>.*)$"
 )
 
-# ── appweb.log ──────────────────────────────────────────────────────────────
-APPWEB = [
+# ── apprtc.log ──────────────────────────────────────────────────────────────
+APPRTC = [
     ("join", re.compile(r"^HTTP V2 join: room_id=(?P<room>\d+) client_id=(?P<client>\d+)")),
     ("leave", re.compile(r"^HTTP V2 leave: room_id=(?P<room>\d+) client_id=(?P<client>\d+)")),
 ]
@@ -194,13 +194,13 @@ def parse(path, service, ctx, room_filter):
             continue
         ts, msg = m["ts"], m["msg"]
 
-        if service == "appweb":
+        if service == "apprtc":
             done = False
-            for kind, rx in APPWEB:
+            for kind, rx in APPRTC:
                 h = rx.match(msg)
                 if h and keep(h["room"]):
                     c = h["client"]
-                    events.append(Event(ts, f"c{c}", "appweb", kind, client=c, room=h["room"], kind=kind))
+                    events.append(Event(ts, f"c{c}", "apprtc", kind, client=c, room=h["room"], kind=kind))
                     done = True
                     break
             if done:
@@ -209,20 +209,20 @@ def parse(path, service, ctx, room_filter):
             if h and keep(h["room"]):
                 c = h["client"]
                 lbl = f"join {h['mode']}" if h["result"] == "SUCCESS" else f"join {h['result']}"
-                events.append(Event(ts, "appweb", f"c{c}", lbl, dashed=True, client=c, room=h["room"]))
+                events.append(Event(ts, "apprtc", f"c{c}", lbl, dashed=True, client=c, room=h["room"]))
                 continue
             h = GRPC_REQ.match(msg)
             if h:
                 ctx.grpc[h["rid"]] = (h["op"], h["room"], h["client"])
                 if h["client"] and keep(h["room"]):
-                    events.append(Event(ts, "appweb", "signaling", h["op"], client=h["client"], room=h["room"]))
+                    events.append(Event(ts, "apprtc", "signaling", h["op"], client=h["client"], room=h["room"]))
                 continue
             h = GRPC_RESP.match(msg)
             if h:
                 op, room, client = ctx.grpc.get(h["rid"], (h["op"], "", ""))
                 if client and keep(room):
                     lbl = f"{op} ✓" if h["result"] == "OK" else f"{op} ✗"
-                    events.append(Event(ts, "signaling", "appweb", lbl, dashed=True, client=client, room=room))
+                    events.append(Event(ts, "signaling", "apprtc", lbl, dashed=True, client=client, room=room))
                 continue
 
         elif service == "signaling":
@@ -327,15 +327,15 @@ def parse(path, service, ctx, room_filter):
 # ─────────────────────────── lanes / participants ───────────────────────────
 
 def build_lanes(events):
-    """Ordered lane keys (clients, appweb, signaling, workers) with display labels."""
+    """Ordered lane keys (clients, apprtc, signaling, workers) with display labels."""
     clients, workers = [], []
-    have_appweb = have_signaling = False
+    have_apprtc = have_signaling = False
     for ev in events:
         for lane in (ev.src, ev.dst, ev.note_lane):
             if not lane:
                 continue
-            if lane == "appweb":
-                have_appweb = True
+            if lane == "apprtc":
+                have_apprtc = True
             elif lane == "signaling":
                 have_signaling = True
             elif lane.startswith("c") and lane not in clients:
@@ -345,9 +345,9 @@ def build_lanes(events):
 
     order = list(clients)
     label = {c: f"client {c[1:]}" for c in clients}
-    if have_appweb:
-        order.append("appweb")
-        label["appweb"] = "AppWeb"
+    if have_apprtc:
+        order.append("apprtc")
+        label["apprtc"] = "AppRTC"
     if have_signaling:
         order.append("signaling")
         label["signaling"] = "Signaling"
@@ -366,7 +366,7 @@ PALETTE = [
 def colors(lanes):
     out, ci = {}, 0
     for key in lanes:
-        if key == "appweb":
+        if key == "apprtc":
             out[key] = "#0891b2"
         elif key == "signaling":
             out[key] = "#334155"
@@ -495,7 +495,7 @@ def render_html(events, lanes, label, room_filter):
 
     heads = []
     for key in lanes:
-        cls = "lane hub" if key in ("appweb", "signaling") else "lane"
+        cls = "lane hub" if key in ("apprtc", "signaling") else "lane"
         heads.append(f'<div class="{cls}" style="--c:{color_of[key]}"><b>{html.escape(label[key])}</b></div>')
     lifelines = "".join(f'<div class="lifeline" style="--c:{color_of[k]}"></div>' for k in lanes)
 
@@ -569,7 +569,7 @@ def _divider(steps, column, color, text):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--appweb", help="path to appweb INFO log")
+    ap.add_argument("--apprtc", help="path to apprtc INFO log")
     ap.add_argument("--signaling", help="path to signaling INFO log")
     ap.add_argument("--sfu", nargs="+", default=[], help="one or more SFU worker INFO logs")
     ap.add_argument("-f", "--format", choices=["mermaid", "html"], default="mermaid")
@@ -577,14 +577,14 @@ def main():
     ap.add_argument("--room", help="only include this room id")
     args = ap.parse_args()
 
-    if not (args.appweb or args.signaling or args.sfu):
-        ap.error("provide at least one of --appweb, --signaling, --sfu")
+    if not (args.apprtc or args.signaling or args.sfu):
+        ap.error("provide at least one of --apprtc, --signaling, --sfu")
 
     ctx = Ctx()
     events = []
-    # Parse appweb + signaling before the sfu logs so command request_ids are correlated.
-    if args.appweb:
-        events += parse(args.appweb, "appweb", ctx, args.room)
+    # Parse apprtc + signaling before the sfu logs so command request_ids are correlated.
+    if args.apprtc:
+        events += parse(args.apprtc, "apprtc", ctx, args.room)
     if args.signaling:
         events += parse(args.signaling, "signaling", ctx, args.room)
     for path in args.sfu:

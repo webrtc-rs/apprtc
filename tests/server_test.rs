@@ -1,6 +1,6 @@
 //! Black-box compatibility tests against a separately running AppRTC server.
 //!
-//! Start the AppWeb, signaling, and SFU processes before running this test target:
+//! Start the AppRTC, signaling, and SFU processes before running this test target:
 //!
 //! ```text
 //! ./scripts/start.sh

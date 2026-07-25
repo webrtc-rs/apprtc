@@ -1,4 +1,4 @@
-//! Standalone browser/AppWeb signaling endpoint.
+//! Standalone browser/AppRTC signaling endpoint.
 //!
 //! All I/O lives here (async Tokio tasks + `tokio-tungstenite`, keeping the SFU `chat`
 //! example's architecture); the `signaling` crate is a pure Sans-I/O state machine.

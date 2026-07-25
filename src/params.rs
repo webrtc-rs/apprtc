@@ -282,8 +282,8 @@ mod tests {
             ..Default::default()
         };
         let params = config.build_room_parameters(
-            "appweb.example".into(),
-            &url("https://appweb.example/params"),
+            "apprtc.example".into(),
+            &url("https://apprtc.example/params"),
             "",
             "",
             None,

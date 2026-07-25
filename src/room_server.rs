@@ -610,7 +610,7 @@ mod tests {
 
     fn app() -> Router {
         let config = Config {
-            web_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            web_root: concat!(env!("CARGO_MANIFEST_DIR"), "/web").to_string(),
             ..Default::default()
         };
         RoomServer::new(config, MockAuthority::default())
@@ -818,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn params_honor_query_options_and_request_host() {
         let config = Config {
-            web_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            web_root: concat!(env!("CARGO_MANIFEST_DIR"), "/web").to_string(),
             force_tls: true,
             ..Default::default()
         };

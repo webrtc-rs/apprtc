@@ -1,4 +1,4 @@
-//! Black-box P2P V2 AppWeb/gRPC/WebSocket signaling flow.
+//! Black-box P2P V2 AppRTC/gRPC/WebSocket signaling flow.
 
 mod common;
 

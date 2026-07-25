@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "appweb", # app/web server
     "signaling", # signaling hub
     "signaling-proto", # signaling protobuf
 ]
@@ -25,7 +24,6 @@ keywords = ["signaling", "networking", "protocols"]
 categories = ["network-programming"]
 
 [workspace.dependencies]
-appweb = { version = "0.3.0", path = "appweb" }
 signaling = { version = "0.3.0", path = "signaling" }
 signaling-proto = { version = "0.3.0", path = "signaling-proto" }
 
@@ -78,12 +76,11 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
-appweb.workspace = true
 signaling.workspace = true
 signaling-proto.workspace = true
+
 sfu.workspace = true
 rtc.workspace = true
-
 sansio.workspace = true
 
 tokio.workspace = true
@@ -105,7 +102,11 @@ tokio-stream.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+minijinja.workspace = true
+async-trait.workspace = true
+tower-http.workspace = true
 
 [dev-dependencies]
 webrtc.workspace = true
 async-trait.workspace = true
+tower.workspace = true

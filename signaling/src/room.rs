@@ -9,7 +9,7 @@ const MAX_ROOM_CAPACITY: usize = 2;
 
 /// The synthetic peer added in loopback debug mode (was `constants.LOOPBACK_CLIENT_ID`).
 /// This is a room concept — only `add_client`'s loopback branch uses it — so it lives
-/// here rather than crossing the `signaling`/`appweb` crate boundary.
+/// here rather than crossing the `signaling`/`apprtc` crate boundary.
 const LOOPBACK_CLIENT_ID: &str = "LOOPBACK_CLIENT_ID";
 
 pub type RoomId = String;

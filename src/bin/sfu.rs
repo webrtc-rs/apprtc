@@ -31,7 +31,7 @@ struct Cli {
     tls: bool,
 
     /// When set, run a server on `--host-ip:--port` (HTTPS if `--tls`, else HTTP) that redirects
-    /// every request to this URL — e.g. the AppWeb landing page. Disabled when empty.
+    /// every request to this URL — e.g. the AppRTC landing page. Disabled when empty.
     #[arg(long, default_value_t = String::new())]
     redirect_url: String,
 

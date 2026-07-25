@@ -112,7 +112,7 @@ struct Active {
     _track: Arc<TrackLocalStaticRTP>,
 }
 
-// End-to-end SFU multi-party media forwarding. Requires a live signaling + sfu + appweb stack.
+// End-to-end SFU multi-party media forwarding. Requires a live signaling + sfu + apprtc stack.
 // All three clients upgrade to SFU, connect, and publish through WebRTC perfect negotiation (the
 // polite-peer rollback + re-publish that recovers from the worker's glare rejection), and the
 // SFU forwards every publisher's track to the other two members — each member receives two

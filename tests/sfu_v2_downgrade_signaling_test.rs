@@ -1,4 +1,4 @@
-//! Black-box V2 mode-transition flow through the real AppWeb → signaling → SFU-worker stack:
+//! Black-box V2 mode-transition flow through the real AppRTC → Signaling → SFU-worker stack:
 //! two members run **P2P**, a third join **upgrades** the room to **SFU**, and after that third
 //! member leaves and the room dwells at two members it **downgrades** back to direct **P2P**.
 //!

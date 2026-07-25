@@ -4,7 +4,7 @@ package signaling.v2;
 
 // Private gRPC API exposed by the signaling service.
 //
-// AppWeb uses unary RPCs. An SFU process owns one OpenSfuSession stream for its
+// AppRTC uses unary RPCs. An SFU process owns one OpenSfuSession stream for its
 // process lifetime and reconnects that stream with the same instance_id after
 // a transient transport failure.
 service SignalingService {
@@ -31,7 +31,7 @@ service SignalingService {
 // authorize the mTLS identity for the declared role.
 enum AppId {
   APP_ID_UNSPECIFIED = 0;
-  APP_ID_APPWEB = 1;
+  APP_ID_APPRTC = 1;
   APP_ID_SFU = 2;
 }
 
@@ -119,7 +119,7 @@ message OccupancyResponse {
 }
 
 // ---------------------------------------------------------------------------
-// AppWeb V1 RPCs
+// AppRTC V1 RPCs
 // ---------------------------------------------------------------------------
 
 message AdmitV1Request {
@@ -168,7 +168,7 @@ message InjectV1Request {
 }
 
 // ---------------------------------------------------------------------------
-// AppWeb V2 RPCs
+// AppRTC V2 RPCs
 // ---------------------------------------------------------------------------
 
 message AdmitV2Request {

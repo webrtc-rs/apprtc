@@ -10,11 +10,11 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn v2_appweb_request_round_trips_as_protobuf() {
+    fn v2_apprtc_request_round_trips_as_protobuf() {
         let request = AdmitV1Request {
             context: Some(RequestContext {
-                app_id: AppId::Appweb as i32,
-                instance_id: "appweb-test".into(),
+                app_id: AppId::Apprtc as i32,
+                instance_id: "apprtc-test".into(),
                 request_id: 7,
             }),
             room_id: "opaque-room".into(),
