@@ -1,33 +1,18 @@
-[workspace]
-members = [
-]
-exclude = [
-    "sfu",
-    "sfu/webrtc",
-    "sfu/webrtc/rtc",
-    "signaling",
-    "signaling/signaling-proto",
-]
-resolver = "2"
-
-[profile.dev]
-opt-level = 0
-
-[workspace.package]
+[package]
+name = "apprtc"
 version = "0.3.0"
-authors = ["Rain Liu <y@liu.mx>"]
 edition = "2024"
 license = "MIT/Apache-2.0"
-homepage = "https://webrtc.rs"
+authors = ["Rain Liu <y@liu.mx>"]
 repository = "https://github.com/webrtc-rs/apprtc"
-keywords = ["signaling", "networking", "protocols"]
-categories = ["network-programming"]
+homepage = "https://appr.tc"
+keywords = ["signaling", "networking", "protocols", "sans-io"]
+categories = ["network-programming", "asynchronous", "multimedia"]
 
-[workspace.dependencies]
+[dependencies]
 signaling = { version = "0.3.0", path = "signaling" }
 signaling-proto = { version = "0.3.0", path = "signaling/signaling-proto" }
 sfu = { version = "0.20.0-rc.4", path = "sfu" }
-webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
 rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
 sansio = "1.0.1"
 
@@ -40,7 +25,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 tower-http = { version = "0.6", features = ["fs"] }
-tower = { version = "0.5", features = ["util"] }
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.11"
 chrono = "0.4.45"
@@ -50,57 +34,11 @@ rustls = { version = "0.23.41", default-features = false, features = ["ring", "s
 rustls-pemfile = "2.2.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
-async-trait = "0.1"
 bytes = "1"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-
-[package]
-name = "apprtc"
-description = "AppRTC P2P/SFU Signaling Server in Rust"
-documentation = "https://docs.rs/apprtc"
-version.workspace = true
-authors.workspace = true
-edition.workspace = true
-license.workspace = true
-homepage.workspace = true
-repository.workspace = true
-keywords.workspace = true
-categories.workspace = true
-readme = "README.md"
-
-[dependencies]
-signaling.workspace = true
-signaling-proto.workspace = true
-
-sfu.workspace = true
-rtc.workspace = true
-sansio.workspace = true
-
-tokio.workspace = true
-axum.workspace = true
-clap.workspace = true
-env_logger.workspace = true
-chrono.workspace = true
-anyhow.workspace = true
-log.workspace = true
-rand.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
-tokio-rustls.workspace = true
-url.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
-tonic.workspace = true
-tokio-stream.workspace = true
-bytes.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-minijinja.workspace = true
-async-trait.workspace = true
-tower-http.workspace = true
+async-trait = "0.1"
 
 [dev-dependencies]
-webrtc.workspace = true
-async-trait.workspace = true
-tower.workspace = true
+webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
+tower = { version = "0.5", features = ["util"] }
