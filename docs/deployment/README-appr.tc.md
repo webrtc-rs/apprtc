@@ -57,9 +57,11 @@ The binaries accept the certificate and key directly:
 
 ## Install and build
 
-Copy the repository to the host:
+The `signaling` and `sfu` crates are git submodules and are path dependencies of `apprtc`, so initialize them locally
+before copying — the host builds from the copied tree and never fetches them itself:
 
 ```bash
+git submodule update --init --recursive
 rsync -avz --exclude target --exclude .git --exclude .idea ./ root@173.249.199.192:/opt/apprtc/
 ```
 

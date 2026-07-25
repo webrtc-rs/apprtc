@@ -54,13 +54,17 @@ repository's `go` branch.
 
 ## Architecture
 
-The repository root is both the `apprtc` package and the Cargo workspace root. The workspace has three Rust crates:
+This repository is the single `apprtc` Cargo package. The Sans-I/O protocol crates it builds on are separate
+repositories, vendored as git submodules and consumed as path dependencies:
 
-| Crate                                | Responsibility                                                                                                                                                                                                                                                                                                                                                           |
-|--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](.)                        | Root package containing the standalone `apprtc`, `signaling`, and `sfu` binaries. It owns the HTTP room API, configuration parameters, Jinja templates, the gRPC client for the signaling authority, and every runtime adapter: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
-| [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own.                                                                                                                                           |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by the `apprtc` web server, signaling, and SFU workers.                                                                                                                                                                                                                                                                     |
+| Crate                                                    | Source                             | Responsibility                                                                                                                                                                                                                                                                                                        |
+|----------------------------------------------------------|------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [`apprtc`](.)                                            | this repository                    | Builds the `apprtc`, `signaling`, and `sfu` binaries. It owns the HTTP room API, configuration parameters, Jinja templates, the gRPC client for the signaling authority, and every runtime adapter: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
+| [`signaling`](signaling)                                 | submodule, `webrtc-rs/signaling`   | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own.                                                                                          |
+| [`signaling-proto`](signaling/signaling-proto)           | inside the `signaling` submodule   | Generated Protobuf and tonic contract shared by the `apprtc` web server, signaling, and SFU workers.                                                                                                                                                                                                                   |
+| [`sfu`](sfu) and [`rtc`](sfu/webrtc/rtc)                 | submodule, `webrtc-rs/sfu`         | Sans-I/O WebRTC media engine and stack driven by the `sfu` binary.                                                                                                                                                                                                                                                    |
+
+Only `apprtc` is built from this repository's `Cargo.toml`; each submodule keeps its own manifest and tests.
 
 The three binaries are separate processes and may run on different machines. `apprtc` is the web server: it serves
 HTTP(S) and the browser application from [`web/`](web), and uses concurrent unary gRPC calls over one reusable HTTP/2
@@ -85,12 +89,13 @@ Collider
 `handle_*`/`poll_timeout`/`poll_action` shape and is driven by `Collider`. Nothing in the crate owns a socket, thread,
 clock, or entropy source, so the whole signaling state machine is testable in memory.
 
-The root `apprtc` package keeps each runtime responsibility in a dedicated module:
+The `apprtc` package keeps each runtime responsibility in a dedicated module:
 
 ```text
 src/
-├── lib.rs                shared certificate loading and TLS listener support
+├── lib.rs                module declarations only
 ├── bin/                  the apprtc, signaling, and sfu entry points
+├── tls.rs                shared certificate loading and TLS listener support
 ├── room_server.rs        HTTP room API, page routes, and static-asset serving
 ├── params.rs             AppRTC room/ICE parameter construction
 ├── templates.rs          Jinja index/full/grid page templates loaded from the web root
@@ -103,8 +108,8 @@ src/
 └── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ```
 
-The first group belongs to the `apprtc` web-server binary; the rest are the signaling and SFU runtime adapters. The
-browser application it serves lives under [`web/`](web) (`html/`, `js/`, `css/`, `images/`).
+`room_server.rs` through `grpc_client.rs` are the web server; the rest are the signaling and SFU runtime adapters. The
+browser application the web server serves lives under [`web/`](web) (`html/`, `js/`, `css/`, `images/`).
 
 [`src/ws_server.rs`](src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
 events and text frames into driver commands. [`src/grpc_server.rs`](src/grpc_server.rs) adapts private
@@ -197,16 +202,23 @@ fails those rooms with `room-failed` rather than moving live WebRTC transports.
 
 Use a Rust toolchain with Edition 2024 support.
 
+The `signaling` and `sfu` crates are git submodules, so initialize them before the first build:
+
 ```bash
 git submodule update --init --recursive
-cargo build --workspace
-cargo test --workspace --lib --bins
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build
+cargo test --lib --bins
+cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The root `Cargo.toml` defines both the `apprtc` package and the workspace. Commands for the root package can therefore
-omit `-p apprtc`; use `--workspace` when a command must also cover `signaling` and `signaling-proto`.
+These commands cover the `apprtc` package only — it is the sole member of this repository's Cargo workspace. Each
+submodule owns its manifest and test suite, so run theirs from inside it:
+
+```bash
+cd signaling && cargo test --workspace --lib   # signaling and signaling-proto
+cd sfu && cargo test                           # SFU media engine
+```
 
 The integration tests are black-box clients of real standalone `apprtc` and signaling TLS servers:
 

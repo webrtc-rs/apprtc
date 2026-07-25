@@ -8,11 +8,13 @@ The current implementation preserves the V1 contract for existing AppRTC-compati
 
 Browsers use long-lived, full-duplex WebSocket signaling channels, `apprtc` uses unary gRPC calls multiplexed over a reusable HTTP/2 channel, and SFU workers use long-lived bidirectional gRPC streams. The media plane remains WebRTC between browser and SFU.
 
-The implementation is organized as three core Rust crates plus the SFU crate, and deployed as three processes:
+The implementation is organized as one binary-producing crate plus three Sans-I/O protocol crates, and deployed as three
+processes. Only `apprtc` lives in this repository; `signaling` (which contains `signaling-proto`) and `sfu` are separate
+repositories vendored as git submodules and consumed as path dependencies:
 
 | Component         | Network role                                              | Owns                                                                                                                 |
 |-------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| `apprtc`          | root Cargo package; also the web-server binary            | the HTTP room API, static assets, ICE config, templates, and client-id minting, plus the standalone `apprtc`, `signaling`, and `sfu` binaries and every runtime adapter: TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
+| `apprtc`          | the only crate in this repository; also the web-server binary | the HTTP room API, static assets, ICE config, templates, and client-id minting, plus the standalone `apprtc`, `signaling`, and `sfu` binaries and every runtime adapter: TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
 | `signaling`       | no network role; Sans-I/O signaling authority             | authoritative V1/V2 room model, queue/reconnect grace, P2P relay, SFU worker registry, room assignment, upgrade barrier, and recovery state |
 | `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated web-server/signaling/SFU gRPC request, response, command, result, and event types                          |
 | `sfu`             | no network role; Sans-I/O WebRTC media engine             | per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding; the `sfu` binary in the root package supplies UDP and gRPC I/O |
@@ -20,7 +22,7 @@ The implementation is organized as three core Rust crates plus the SFU crate, an
 Throughout this document `apprtc` names the web-server process — the gRPC **client** of `signaling` — as distinct from
 AppRTC the project. It and `signaling` are separate processes communicating through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol, even though the web server now lives in the root package rather than a crate of its own. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while `apprtc` and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
-The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `room_server.rs`, `params.rs`, `templates.rs`, `config.rs`, and `grpc_client.rs` are the web server; `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The browser application it serves lives under `web/`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. The crate root `src/lib.rs` provides the shared certificate loading and TLS listener support used by the binaries.
+The repository root is the `apprtc` package. Within its `src/` directory, `room_server.rs`, `params.rs`, `templates.rs`, `config.rs`, and `grpc_client.rs` are the web server; `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The browser application it serves lives under `web/`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. `src/tls.rs` provides the shared certificate loading and TLS listener support used by the binaries, and `src/lib.rs` only declares the modules.
 
 ## 1. Topology and authority
 
@@ -472,7 +474,7 @@ initiator model.
 
 ## 8. Detailed wire-protocol definitions
 
-This section is normative. All browser WebSocket frames are UTF-8 JSON text frames; `msg` is a JSON **string** containing a second JSON application-signaling object. The outer hub never parses that inner object. Unknown mandatory fields or commands are errors; unknown optional fields are ignored. The private service protocol uses Protobuf messages over gRPC as defined by `signaling-proto/proto/signaling.v2.proto`. Numbers in browser JSON are represented as strings where `u64` precision is required.
+This section is normative. All browser WebSocket frames are UTF-8 JSON text frames; `msg` is a JSON **string** containing a second JSON application-signaling object. The outer hub never parses that inner object. Unknown mandatory fields or commands are errors; unknown optional fields are ignored. The private service protocol uses Protobuf messages over gRPC as defined by `signaling/signaling-proto/proto/signaling.v2.proto`. Numbers in browser JSON are represented as strings where `u64` precision is required.
 
 §8.4 and §8.5 are the cross-process bindings used by the current three-process deployment. Only the browser protocols (§8.2 and §8.3) are public wire protocols.
 
@@ -626,7 +628,7 @@ the worker to the remaining browser — and the member whose control carried `is
 
 ### 8.4 apprtc unary gRPC API
 
-`apprtc` keeps HTTP request/response compatibility but delegates every room query and mutation to `signaling.v2.SignalingService` through concurrent unary RPCs over one reusable tonic HTTP/2 channel. Browser `send`/`msg` relay traffic still terminates at signaling's public `/ws` endpoint and never routes through apprtc. The normative schema is `signaling-proto/proto/signaling.v2.proto`; both processes compile against its generated tonic types.
+`apprtc` keeps HTTP request/response compatibility but delegates every room query and mutation to `signaling.v2.SignalingService` through concurrent unary RPCs over one reusable tonic HTTP/2 channel. Browser `send`/`msg` relay traffic still terminates at signaling's public `/ws` endpoint and never routes through `apprtc`. The normative schema is `signaling/signaling-proto/proto/signaling.v2.proto`; both processes compile against its generated tonic types.
 
 ```proto
 service SignalingService {
