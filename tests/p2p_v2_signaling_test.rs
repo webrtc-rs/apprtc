@@ -25,34 +25,34 @@ fn admission(response: &Value) -> Result<(u64, &str)> {
 #[tokio::test]
 async fn completes_p2p_v2_http_websocket_relay_and_leave_flow() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>();
+    let room_id = common::new_room_id();
 
     let page = http("GET", &format!("/v2/r/{room_id}"), &[]).await?;
     assert_eq!(page.status, 200);
     assert!(page.text()?.contains("signalingVersion: 2"));
 
-    let first = join_v2(room_id).await?;
+    let first = join_v2(&room_id).await?;
     let (first_id, first_token) = admission(&first)?;
     assert_eq!(first["params"]["mode"], "p2p");
     assert_eq!(first["params"]["epoch"], "0");
     assert_eq!(first["params"]["is_initiator"], true);
-    let (mut first_ws, first_registered) = ws_register_v2(room_id, first_id, first_token).await?;
+    let (mut first_ws, first_registered) = ws_register_v2(&room_id, first_id, first_token).await?;
     assert_eq!(
         first_registered,
         json!({
             "control": "registered",
-            "roomid": room_id.to_string(),
+            "roomid": room_id,
             "epoch": "0",
             "mode": "p2p",
             "is_initiator": true,
         })
     );
 
-    let second = join_v2(room_id).await?;
+    let second = join_v2(&room_id).await?;
     let (second_id, second_token) = admission(&second)?;
     assert_eq!(second["params"]["is_initiator"], false);
     let (mut second_ws, second_registered) =
-        ws_register_v2(room_id, second_id, second_token).await?;
+        ws_register_v2(&room_id, second_id, second_token).await?;
     assert_eq!(second_registered["control"], "registered");
     assert_eq!(second_registered["is_initiator"], false);
 
@@ -95,7 +95,7 @@ async fn completes_p2p_v2_http_websocket_relay_and_leave_flow() -> Result<()> {
         ws_receive_json(&mut first_ws).await?,
         json!({
             "control": "p2p-promote",
-            "roomid": room_id.to_string(),
+            "roomid": room_id,
             "epoch": "0",
             "is_initiator": true,
         })

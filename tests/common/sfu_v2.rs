@@ -172,7 +172,7 @@ fn parse_member(joined: &Value) -> Result<(u64, String)> {
 /// Drive a room through the P2P -> SFU upgrade and return three registered members, all in
 /// SFU mode at epoch 1. The first two join as P2P and are pushed `sfu-upgrade`; the third
 /// join blocks until the worker has joined all three and the room commits to SFU.
-pub async fn upgrade_three(room_id: u64) -> Result<[Member; 3]> {
+pub async fn upgrade_three(room_id: &str) -> Result<[Member; 3]> {
     let first = join_v2(room_id).await?;
     let second = join_v2(room_id).await?;
     assert_eq!(first["params"]["mode"], "p2p", "first join should be P2P");

@@ -251,6 +251,11 @@ fn drain_authority_responses(
 mod tests {
     use super::*;
 
+    /// A deterministic, valid V2 room id for tests.
+    fn room(seed: u128) -> signaling::v2::RoomId {
+        uuid::Uuid::new_v8(seed.to_be_bytes())
+    }
+
     struct Harness {
         stop_tx: watch::Sender<()>,
         commands: mpsc::Sender<DriverCommand>,
@@ -387,7 +392,7 @@ mod tests {
             .authority(
                 1,
                 AuthorityOperation::AdmitV2 {
-                    room_id: 42,
+                    room_id: room(42),
                     client_id: 101,
                     admission_token: "token-101".into(),
                     now: Instant::now(),
@@ -404,7 +409,7 @@ mod tests {
             .authority(
                 2,
                 AuthorityOperation::AdmitV2 {
-                    room_id: 42,
+                    room_id: room(42),
                     client_id: 102,
                     admission_token: "token-102".into(),
                     now: Instant::now(),
@@ -423,7 +428,8 @@ mod tests {
             .text(
                 1,
                 &format!(
-                    r#"{{"cmd":"register","roomid":"42","clientid":"101","ver":2,"token":"{first_token}"}}"#
+                    r#"{{"cmd":"register","roomid":"{}","clientid":"101","ver":2,"token":"{first_token}"}}"#,
+                    signaling::v2::format_room_token(&room(42))
                 ),
             )
             .await;
@@ -432,7 +438,8 @@ mod tests {
             .text(
                 2,
                 &format!(
-                    r#"{{"cmd":"register","roomid":"42","clientid":"102","ver":2,"token":"{second_token}"}}"#
+                    r#"{{"cmd":"register","roomid":"{}","clientid":"102","ver":2,"token":"{second_token}"}}"#,
+                    signaling::v2::format_room_token(&room(42))
                 ),
             )
             .await;

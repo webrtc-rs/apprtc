@@ -1,5 +1,6 @@
 //! Runtime adapter between the signaling gRPC stream and the Sans-I/O SFU.
 
+use crate::room_id::{room_id_from_bytes, room_id_to_bytes};
 use bytes::BytesMut;
 use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use rtc::peer_connection::transport::RTCIceCandidateInit;
@@ -254,7 +255,9 @@ async fn dispatch_command(
             "unsupported command",
         );
     };
-    let Some(shard) = media.get((room_id as usize) % media.len()) else {
+    // Spread rooms across the media shards by the low bits of the room UUID.
+    let shard_index = (room_id.as_u128() % media.len().max(1) as u128) as usize;
+    let Some(shard) = media.get(shard_index) else {
         return command_error(
             request_id,
             v2::ErrorCode::WorkerUnavailable,
@@ -307,14 +310,23 @@ fn proto_command_name(command: &v2::SfuCommand) -> &'static str {
     }
 }
 
-fn command_room_id(command: &v2::SfuCommand) -> Option<u64> {
-    match command.command.as_ref()? {
-        v2::sfu_command::Command::SyncRoom(value) => Some(value.room_id),
-        v2::sfu_command::Command::Join(value) => Some(value.room_id),
-        v2::sfu_command::Command::Leave(value) => Some(value.room_id),
-        v2::sfu_command::Command::Signal(value) => Some(value.room_id),
-        v2::sfu_command::Command::Drain(_) => None,
-    }
+fn invalid_room_id(request_id: u64) -> v2::SfuCommandResult {
+    command_error(
+        request_id,
+        v2::ErrorCode::InvalidRequest,
+        "room_id must be the 16 bytes of a UUIDv8",
+    )
+}
+
+fn command_room_id(command: &v2::SfuCommand) -> Option<sfu::RoomId> {
+    let bytes = match command.command.as_ref()? {
+        v2::sfu_command::Command::SyncRoom(value) => &value.room_id,
+        v2::sfu_command::Command::Join(value) => &value.room_id,
+        v2::sfu_command::Command::Leave(value) => &value.room_id,
+        v2::sfu_command::Command::Signal(value) => &value.room_id,
+        v2::sfu_command::Command::Drain(_) => return None,
+    };
+    room_id_from_bytes(bytes)
 }
 
 async fn media_loop(
@@ -327,7 +339,7 @@ async fn media_loop(
     next_event_id: Arc<AtomicU64>,
 ) {
     let mut engine = sfu::Sfu::new(rand::random(), advertised_addr);
-    let mut projection = HashMap::new();
+    let mut projection: HashMap<(sfu::RoomId, u64), (u64, u64)> = HashMap::new();
     let mut command_cache: HashMap<u64, v2::SfuCommandResult> = HashMap::new();
     let mut command_order = VecDeque::new();
     let mut packet = vec![0_u8; 2048];
@@ -392,7 +404,7 @@ async fn media_loop(
 
 fn apply_command(
     engine: &mut sfu::Sfu,
-    projection: &mut HashMap<(u64, u64), (u64, u64)>,
+    projection: &mut HashMap<(sfu::RoomId, u64), (u64, u64)>,
     command: v2::SfuCommand,
 ) -> v2::SfuCommandResult {
     let request_id = command.request_id;
@@ -405,11 +417,14 @@ fn apply_command(
     }
     let result = match command.command {
         Some(v2::sfu_command::Command::Join(join)) => {
-            let key = (join.room_id, join.client_id);
+            let Some(room_id) = room_id_from_bytes(&join.room_id) else {
+                return invalid_room_id(request_id);
+            };
+            let key = (room_id, join.client_id);
             match projection.get(&key) {
                 Some(current) if *current == (join.lifecycle_id, join.assignment_epoch) => Ok(
                     v2::sfu_command_ok::Payload::MemberJoined(v2::MemberJoined {
-                        room_id: join.room_id,
+                        room_id: join.room_id.clone(),
                         client_id: join.client_id,
                         lifecycle_id: join.lifecycle_id,
                         assignment_epoch: join.assignment_epoch,
@@ -422,7 +437,7 @@ fn apply_command(
                 None => engine
                     .handle_event(sfu::SFUEvent::Join {
                         request_id,
-                        room_id: join.room_id,
+                        room_id,
                         client_id: join.client_id,
                     })
                     .map(|()| {
@@ -438,10 +453,13 @@ fn apply_command(
             }
         }
         Some(v2::sfu_command::Command::Leave(leave)) => {
-            let key = (leave.room_id, leave.client_id);
+            let Some(room_id) = room_id_from_bytes(&leave.room_id) else {
+                return invalid_room_id(request_id);
+            };
+            let key = (room_id, leave.client_id);
             match projection.get(&key) {
                 None => Ok(v2::sfu_command_ok::Payload::MemberLeft(v2::MemberLeft {
-                    room_id: leave.room_id,
+                    room_id: leave.room_id.clone(),
                     client_id: leave.client_id,
                     lifecycle_id: leave.lifecycle_id,
                     assignment_epoch: leave.assignment_epoch,
@@ -458,7 +476,7 @@ fn apply_command(
                 Some(_) => engine
                     .handle_event(sfu::SFUEvent::Leave {
                         request_id,
-                        room_id: leave.room_id,
+                        room_id,
                         client_id: leave.client_id,
                         reason: format!(
                             "{:?}",
@@ -468,7 +486,7 @@ fn apply_command(
                     .map(|()| {
                         projection.remove(&key);
                         v2::sfu_command_ok::Payload::MemberLeft(v2::MemberLeft {
-                            room_id: leave.room_id,
+                            room_id: leave.room_id.clone(),
                             client_id: leave.client_id,
                             lifecycle_id: leave.lifecycle_id,
                             assignment_epoch: leave.assignment_epoch,
@@ -478,11 +496,14 @@ fn apply_command(
             }
         }
         Some(v2::sfu_command::Command::Signal(signal)) => {
-            let key = (signal.room_id, signal.client_id);
+            let Some(room_id) = room_id_from_bytes(&signal.room_id) else {
+                return invalid_room_id(request_id);
+            };
+            let key = (room_id, signal.client_id);
             if projection.get(&key) != Some(&(signal.lifecycle_id, signal.assignment_epoch)) {
                 Err((v2::ErrorCode::StaleLifecycle, "stale signal lifecycle"))
             } else {
-                apply_signal(engine, request_id, signal)
+                apply_signal(engine, request_id, room_id, signal)
                     .map(|()| v2::sfu_command_ok::Payload::Acknowledged(v2::Empty {}))
             }
         }
@@ -507,10 +528,16 @@ fn apply_command(
 
 fn sync_room(
     engine: &mut sfu::Sfu,
-    projection: &mut HashMap<(u64, u64), (u64, u64)>,
+    projection: &mut HashMap<(sfu::RoomId, u64), (u64, u64)>,
     request_id: u64,
     sync: v2::SyncRoom,
 ) -> Result<v2::sfu_command_ok::Payload, (v2::ErrorCode, &'static str)> {
+    let Some(room_id) = room_id_from_bytes(&sync.room_id) else {
+        return Err((
+            v2::ErrorCode::InvalidRequest,
+            "room_id must be the 16 bytes of a UUIDv8",
+        ));
+    };
     let wanted = sync
         .members
         .iter()
@@ -518,8 +545,8 @@ fn sync_room(
         .collect::<HashMap<_, _>>();
     let stale = projection
         .iter()
-        .filter(|((room_id, client_id), _)| {
-            *room_id == sync.room_id && !wanted.contains_key(client_id)
+        .filter(|((candidate, client_id), _)| {
+            *candidate == room_id && !wanted.contains_key(client_id)
         })
         .map(|((_, client_id), _)| *client_id)
         .collect::<Vec<_>>();
@@ -527,20 +554,20 @@ fn sync_room(
         engine
             .handle_event(sfu::SFUEvent::Leave {
                 request_id,
-                room_id: sync.room_id,
+                room_id,
                 client_id,
                 reason: "room synchronization".into(),
             })
             .map_err(|_| (v2::ErrorCode::Internal, "SFU room sync leave failed"))?;
-        projection.remove(&(sync.room_id, client_id));
+        projection.remove(&(room_id, client_id));
     }
     for member in sync.members {
-        let key = (sync.room_id, member.client_id);
+        let key = (room_id, member.client_id);
         if !projection.contains_key(&key) {
             engine
                 .handle_event(sfu::SFUEvent::Join {
                     request_id,
-                    room_id: sync.room_id,
+                    room_id,
                     client_id: member.client_id,
                 })
                 .map_err(|_| (v2::ErrorCode::Internal, "SFU room sync join failed"))?;
@@ -548,7 +575,7 @@ fn sync_room(
         projection.insert(key, (member.lifecycle_id, sync.assignment_epoch));
     }
     Ok(v2::sfu_command_ok::Payload::RoomSynced(v2::RoomSynced {
-        room_id: sync.room_id,
+        room_id: sync.room_id.clone(),
         assignment_epoch: sync.assignment_epoch,
     }))
 }
@@ -570,6 +597,7 @@ struct AppSignal {
 fn apply_signal(
     engine: &mut sfu::Sfu,
     command_request_id: u64,
+    room_id: sfu::RoomId,
     signal: v2::SfuSignal,
 ) -> Result<(), (v2::ErrorCode, &'static str)> {
     let value: serde_json::Value = serde_json::from_str(&signal.message_json)
@@ -593,7 +621,7 @@ fn apply_signal(
             engine
                 .handle_event(sfu::SFUEvent::SessionDescription {
                     request_id,
-                    room_id: signal.room_id,
+                    room_id,
                     client_id: signal.client_id,
                     sdp,
                 })
@@ -602,7 +630,7 @@ fn apply_signal(
         "candidate" => engine
             .handle_event(sfu::SFUEvent::IceCandidate {
                 request_id: command_request_id,
-                room_id: signal.room_id,
+                room_id,
                 client_id: signal.client_id,
                 candidate: RTCIceCandidateInit {
                     candidate: envelope.candidate,
@@ -616,7 +644,7 @@ fn apply_signal(
         "end-of-candidates" => engine
             .handle_event(sfu::SFUEvent::IceCandidate {
                 request_id: command_request_id,
-                room_id: signal.room_id,
+                room_id,
                 client_id: signal.client_id,
                 candidate: RTCIceCandidateInit::default(),
             })
@@ -632,7 +660,7 @@ fn apply_signal(
 async fn drain_engine(
     engine: &mut sfu::Sfu,
     socket: &UdpSocket,
-    projection: &HashMap<(u64, u64), (u64, u64)>,
+    projection: &HashMap<(sfu::RoomId, u64), (u64, u64)>,
     events: &mpsc::Sender<v2::SfuEvent>,
     next_event_id: &AtomicU64,
 ) {
@@ -670,7 +698,7 @@ async fn drain_engine(
                     object.insert("requestid".into(), request_id.to_string().into());
                 }
                 v2::sfu_event::Event::Signal(v2::SfuSignal {
-                    room_id,
+                    room_id: room_id_to_bytes(&room_id),
                     client_id,
                     lifecycle_id,
                     assignment_epoch,
@@ -680,7 +708,7 @@ async fn drain_engine(
             }
             sfu::SFUEvent::IceCandidate { candidate, .. } => {
                 v2::sfu_event::Event::Signal(v2::SfuSignal {
-                    room_id,
+                    room_id: room_id_to_bytes(&room_id),
                     client_id,
                     lifecycle_id,
                     assignment_epoch,
@@ -701,7 +729,7 @@ async fn drain_engine(
                         retryable: false,
                         retry_after_ms: None,
                     }),
-                    room_id: Some(room_id),
+                    room_id: Some(room_id_to_bytes(&room_id)),
                     client_id: Some(client_id),
                     lifecycle_id: Some(lifecycle_id),
                     sdp_request_id: Some(request_id),
@@ -736,7 +764,7 @@ fn cache_command(
 }
 
 fn update_metrics(
-    projection: &HashMap<(u64, u64), (u64, u64)>,
+    projection: &HashMap<(sfu::RoomId, u64), (u64, u64)>,
     metrics: &Metrics,
     previous_rooms: &mut u64,
     previous_clients: &mut u64,
@@ -920,6 +948,15 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use super::*;
 
+    /// A deterministic V2 room id for tests: the decoded form and its 16-byte wire form.
+    fn room(seed: u128) -> sfu::RoomId {
+        uuid::Uuid::new_v8(seed.to_be_bytes())
+    }
+
+    fn wire_room(seed: u128) -> Vec<u8> {
+        room_id_to_bytes(&room(seed))
+    }
+
     fn engine() -> sfu::Sfu {
         sfu::Sfu::new(1, "127.0.0.1:3478".parse().unwrap())
     }
@@ -927,9 +964,9 @@ mod tests {
     #[test]
     fn join_signal_leave_commands_update_the_worker_projection() {
         let mut engine = engine();
-        let mut projection = HashMap::new();
+        let mut projection: HashMap<(sfu::RoomId, u64), (u64, u64)> = HashMap::new();
         let join = v2::JoinMember {
-            room_id: 42,
+            room_id: wire_room(42),
             client_id: 101,
             lifecycle_id: 1,
             assignment_epoch: 1,
@@ -948,7 +985,7 @@ mod tests {
                 payload: Some(v2::sfu_command_ok::Payload::MemberJoined(_)),
             }))
         ));
-        assert_eq!(projection.get(&(42, 101)), Some(&(1, 1)));
+        assert_eq!(projection.get(&(room(42), 101)), Some(&(1, 1)));
 
         let bye = apply_command(
             &mut engine,
@@ -956,7 +993,7 @@ mod tests {
             v2::SfuCommand {
                 request_id: 11,
                 command: Some(v2::sfu_command::Command::Signal(v2::SfuSignal {
-                    room_id: 42,
+                    room_id: wire_room(42),
                     client_id: 101,
                     lifecycle_id: 1,
                     assignment_epoch: 1,
@@ -976,7 +1013,7 @@ mod tests {
             v2::SfuCommand {
                 request_id: 12,
                 command: Some(v2::sfu_command::Command::Leave(v2::LeaveMember {
-                    room_id: 42,
+                    room_id: wire_room(42),
                     client_id: 101,
                     lifecycle_id: 1,
                     assignment_epoch: 1,
@@ -997,11 +1034,11 @@ mod tests {
     fn stale_signal_is_rejected_before_it_reaches_the_sfu() {
         let result = apply_command(
             &mut engine(),
-            &mut HashMap::from([((42, 101), (5, 7))]),
+            &mut HashMap::from([((room(42), 101), (5, 7))]),
             v2::SfuCommand {
                 request_id: 20,
                 command: Some(v2::sfu_command::Command::Signal(v2::SfuSignal {
-                    room_id: 42,
+                    room_id: wire_room(42),
                     client_id: 101,
                     lifecycle_id: 4,
                     assignment_epoch: 7,

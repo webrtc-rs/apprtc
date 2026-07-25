@@ -1,5 +1,6 @@
 //! Private gRPC adapter for AppRTC and SFU workers.
 
+use crate::room_id::{room_id_from_bytes, room_id_to_bytes};
 use crate::signaling_server::{COMMAND_CAPACITY, DriverCommand};
 use crate::tls::tls_pem;
 use rand::RngExt;
@@ -525,7 +526,7 @@ impl SignalingService for GrpcSignalingService {
             .execute(
                 &context,
                 AuthorityOperation::AdmitV2 {
-                    room_id: request.room_id,
+                    room_id: parse_wire_room_id(&request.room_id)?,
                     client_id: request.client_id,
                     admission_token: new_admission_token(),
                     now: Instant::now(),
@@ -571,7 +572,7 @@ impl SignalingService for GrpcSignalingService {
             .execute(
                 &context,
                 AuthorityOperation::RemoveV2 {
-                    room_id: request.room_id,
+                    room_id: parse_wire_room_id(&request.room_id)?,
                     client_id: request.client_id,
                     admission_token: request.admission_token,
                 },
@@ -594,7 +595,7 @@ impl SignalingService for GrpcSignalingService {
             .execute(
                 &context,
                 AuthorityOperation::OccupancyV2 {
-                    room_id: request.room_id,
+                    room_id: parse_wire_room_id(&request.room_id)?,
                 },
                 "occupancy_v2",
             )
@@ -731,6 +732,14 @@ impl SignalingService for GrpcSignalingService {
     }
 }
 
+/// Decode a V2 `bytes room_id` field, rejecting anything that is not the 16 bytes of a
+/// UUIDv8. Both ends validate: the edge checked the token it decoded from the URL, and
+/// signaling checks again rather than trusting its caller.
+fn parse_wire_room_id(bytes: &[u8]) -> Result<signaling::v2::RoomId, GrpcStatus> {
+    room_id_from_bytes(bytes)
+        .ok_or_else(|| GrpcStatus::invalid_argument("room_id must be the 16 bytes of a UUIDv8"))
+}
+
 fn sfu_context(context: Option<RequestContext>) -> Result<RequestContext, GrpcStatus> {
     let context = context.ok_or_else(|| GrpcStatus::invalid_argument("missing context"))?;
     if context.app_id != AppId::Sfu as i32 {
@@ -772,7 +781,7 @@ fn decode_sfu_input(
                         }
                         Some(v2::sfu_command_ok::Payload::MemberJoined(joined)) => {
                             signaling::sfu::CommandOk::MemberJoined(signaling::sfu::JoinMember {
-                                room_id: joined.room_id,
+                                room_id: parse_wire_room_id(&joined.room_id)?,
                                 client_id: joined.client_id,
                                 lifecycle_id: joined.lifecycle_id,
                                 assignment_epoch: joined.assignment_epoch,
@@ -780,7 +789,7 @@ fn decode_sfu_input(
                         }
                         Some(v2::sfu_command_ok::Payload::MemberLeft(left)) => {
                             signaling::sfu::CommandOk::MemberLeft(signaling::sfu::LeaveMember {
-                                room_id: left.room_id,
+                                room_id: parse_wire_room_id(&left.room_id)?,
                                 client_id: left.client_id,
                                 lifecycle_id: left.lifecycle_id,
                                 assignment_epoch: left.assignment_epoch,
@@ -789,7 +798,7 @@ fn decode_sfu_input(
                         }
                         Some(v2::sfu_command_ok::Payload::RoomSynced(synced)) => {
                             signaling::sfu::CommandOk::RoomSynced(signaling::sfu::RoomSynced {
-                                room_id: synced.room_id,
+                                room_id: parse_wire_room_id(&synced.room_id)?,
                                 assignment_epoch: synced.assignment_epoch,
                             })
                         }
@@ -851,7 +860,7 @@ fn decode_sfu_input(
                             reason: error.reason,
                             retryable: error.retryable,
                         },
-                        room_id: failure.room_id,
+                        room_id: failure.room_id.as_deref().and_then(room_id_from_bytes),
                         client_id: failure.client_id,
                         lifecycle_id: failure.lifecycle_id,
                         sdp_request_id: failure.sdp_request_id,
@@ -879,7 +888,7 @@ fn decode_signal(signal: v2::SfuSignal) -> Result<signaling::sfu::Signal, GrpcSt
         ));
     }
     Ok(signaling::sfu::Signal {
-        room_id: signal.room_id,
+        room_id: parse_wire_room_id(&signal.room_id)?,
         client_id: signal.client_id,
         lifecycle_id: signal.lifecycle_id,
         assignment_epoch: signal.assignment_epoch,
@@ -916,7 +925,7 @@ fn encode_sfu_output(output: signaling::sfu::Output) -> SignalingToSfu {
             let command_kind = match command.command {
                 signaling::sfu::CommandKind::SyncRoom(sync) => {
                     v2::sfu_command::Command::SyncRoom(v2::SyncRoom {
-                        room_id: sync.room_id,
+                        room_id: room_id_to_bytes(&sync.room_id),
                         assignment_epoch: sync.assignment_epoch,
                         members: sync
                             .members
@@ -930,7 +939,7 @@ fn encode_sfu_output(output: signaling::sfu::Output) -> SignalingToSfu {
                 }
                 signaling::sfu::CommandKind::Join(join) => {
                     v2::sfu_command::Command::Join(v2::JoinMember {
-                        room_id: join.room_id,
+                        room_id: room_id_to_bytes(&join.room_id),
                         client_id: join.client_id,
                         lifecycle_id: join.lifecycle_id,
                         assignment_epoch: join.assignment_epoch,
@@ -938,7 +947,7 @@ fn encode_sfu_output(output: signaling::sfu::Output) -> SignalingToSfu {
                 }
                 signaling::sfu::CommandKind::Leave(leave) => {
                     v2::sfu_command::Command::Leave(v2::LeaveMember {
-                        room_id: leave.room_id,
+                        room_id: room_id_to_bytes(&leave.room_id),
                         client_id: leave.client_id,
                         lifecycle_id: leave.lifecycle_id,
                         assignment_epoch: leave.assignment_epoch,
@@ -968,7 +977,7 @@ fn encode_sfu_output(output: signaling::sfu::Output) -> SignalingToSfu {
 
 fn encode_signal(signal: signaling::sfu::Signal) -> v2::SfuSignal {
     v2::SfuSignal {
-        room_id: signal.room_id,
+        room_id: room_id_to_bytes(&signal.room_id),
         client_id: signal.client_id,
         lifecycle_id: signal.lifecycle_id,
         assignment_epoch: signal.assignment_epoch,
@@ -1018,6 +1027,13 @@ fn proto_room_mode(mode: signaling::v2::RoomMode) -> RoomMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deterministic V2 room id for tests, in the 16-byte wire form. `new_v8` stamps the
+    /// version and variant, so these pass the same validation production traffic does.
+    fn wire_room(seed: u128) -> Vec<u8> {
+        room_id_to_bytes(&uuid::Uuid::new_v8(seed.to_be_bytes()))
+    }
+
     use crate::signaling_server::{self, COMMAND_CAPACITY};
     use signaling_proto::v2::signaling_service_client::SignalingServiceClient;
     use signaling_proto::v2::{
@@ -1190,7 +1206,7 @@ mod tests {
             .service
             .admit_v2(Request::new(AdmitV2Request {
                 context: Some(context(10)),
-                room_id: 42,
+                room_id: wire_room(42),
                 client_id: 101,
             }))
             .await
@@ -1209,7 +1225,7 @@ mod tests {
             .service
             .occupancy_v2(Request::new(OccupancyV2Request {
                 context: Some(context(11)),
-                room_id: 42,
+                room_id: wire_room(42),
             }))
             .await
             .unwrap()
@@ -1225,7 +1241,7 @@ mod tests {
             .service
             .admit_v2(Request::new(AdmitV2Request {
                 context: Some(context(14)),
-                room_id: 42,
+                room_id: wire_room(42),
                 client_id: 102,
             }))
             .await
@@ -1234,7 +1250,7 @@ mod tests {
             .service
             .admit_v2(Request::new(AdmitV2Request {
                 context: Some(context(15)),
-                room_id: 42,
+                room_id: wire_room(42),
                 client_id: 103,
             }))
             .await
@@ -1266,7 +1282,7 @@ mod tests {
             .service
             .remove_v2(Request::new(RemoveV2Request {
                 context: Some(context(13)),
-                room_id: 42,
+                room_id: wire_room(42),
                 client_id: 101,
                 admission_token: token,
             }))
@@ -1357,7 +1373,7 @@ mod tests {
             let response = client
                 .admit_v2(Request::new(AdmitV2Request {
                     context: Some(context(request_id)),
-                    room_id: 42,
+                    room_id: wire_room(42),
                     client_id,
                 }))
                 .await
@@ -1375,7 +1391,7 @@ mod tests {
             admission_client
                 .admit_v2(Request::new(AdmitV2Request {
                     context: Some(context(12)),
-                    room_id: 42,
+                    room_id: wire_room(42),
                     client_id: 103,
                 }))
                 .await
@@ -1419,7 +1435,7 @@ mod tests {
                             result: Some(v2::sfu_command_result::Result::Ok(v2::SfuCommandOk {
                                 payload: Some(v2::sfu_command_ok::Payload::MemberJoined(
                                     v2::MemberJoined {
-                                        room_id: join.room_id,
+                                        room_id: join.room_id.clone(),
                                         client_id: join.client_id,
                                         lifecycle_id: join.lifecycle_id,
                                         assignment_epoch: join.assignment_epoch,
@@ -1463,7 +1479,7 @@ mod tests {
             .service
             .remove_v2(Request::new(RemoveV2Request {
                 context: Some(context(1)),
-                room_id: 1,
+                room_id: wire_room(1),
                 client_id: 2,
                 admission_token: String::new(),
             }))

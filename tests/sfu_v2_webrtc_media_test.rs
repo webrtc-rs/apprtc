@@ -123,9 +123,9 @@ struct Active {
 #[tokio::test]
 async fn forwards_each_publisher_to_every_other_member_over_the_sfu() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>().max(1);
+    let room_id = common::new_room_id();
 
-    let members = upgrade_three(room_id).await?;
+    let members = upgrade_three(&room_id).await?;
 
     // Bring the publishers up one at a time: each member's SFU peer connection must reach
     // Connected before the next one publishes. This builds the forwarding graph incrementally

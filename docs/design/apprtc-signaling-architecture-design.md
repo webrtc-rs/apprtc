@@ -125,7 +125,7 @@ browser-visible text is the same.
 { "control": "registered",    "roomid": "42", "epoch": "0", "mode": "p2p", "is_initiator": true }  // v2 register acknowledgement
 { "control": "p2p-promote",   "roomid": "42", "epoch": "0", "is_initiator": true }
 { "control": "sfu-upgrade",   "roomid": "42", "epoch": "1" }
-{ "control": "sfu-downgrade", "roomid": "42", "epoch": "2", "is_initiator": true }
+{ "control": "sfu-downgrade", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "2", "is_initiator": true }
 { "control": "room-failed",   "roomid": "42", "reason": "WORKER_UNAVAILABLE" }
 ```
 
@@ -484,7 +484,7 @@ This section is normative. All browser WebSocket frames are UTF-8 JSON text fram
 ```text
 LegacyId       = any non-empty JSON string                 // v1 only
 U64Decimal     = "0" | ("1".."9") { "0".."9" }          // must parse as u64
-RoomIdV2       = U64Decimal
+RoomIdV2       = 22 base64url characters                // a UUIDv8, unpadded (see below)
 ClientIdV2     = U64Decimal
 requestid      = U64Decimal on browser messages
 lifecycle_id   = Protobuf uint64 on the SFU gRPC session
@@ -496,8 +496,13 @@ The spelling of browser JSON fields is deliberately `roomid`, `clientid`, and `r
 The adapter converts between browser `requestid` and the current Rust core's `SFUEvent::request_id`; `lifecycle_id` is
 adapter/hub state and is never supplied to `Sfu`.
 
-V2 rejects leading zeroes other than `"0"`, signs, whitespace, decimal points, and values exceeding
-`18446744073709551615`. The HTTP API returns a JSON result code; a WebSocket returns one error frame and closes. V1
+A `RoomIdV2` is the room's UUIDv8 rendered base64url without padding, and it is validated strictly: exactly 22
+characters, canonical trailing bits (so the final character is one of `A`, `Q`, `g`, `w`), version 8, and the RFC 9562
+variant. Because 128 bits is not a multiple of 6, skipping the trailing-bits check would let sixteen spellings decode to
+the same UUID and become sixteen different rooms. Room ids are minted by the service, never chosen by a client. For
+`ClientIdV2` and the other numeric fields, V2 rejects leading zeroes other than `"0"`, signs, whitespace, decimal
+points, and values exceeding `18446744073709551615`. The HTTP API returns a JSON result code; a WebSocket returns one
+error frame and closes. V1
 never applies this numeric validation.
 
 ```jsonc
@@ -576,8 +581,8 @@ V2 uses a separate route namespace and numeric room table so that a V1 client ca
 
 | Method and path                        | Request                                                                            | Response/behavior |
 |----------------------------------------|------------------------------------------------------------------------------------|-------------------|
-| `POST /v2/join/{roomid}`               | empty; path must be `RoomIdV2`                                                     | `{result:"SUCCESS", params:{client_id,room_id,room_link,mode,epoch,wss_url,admission_token,...}}`; `mode` is `"p2p"` or `"sfu"` and `is_initiator` is present only for P2P. Domain failures include `INVALID_ROOM_ID`, `NO_SFU_AVAILABLE`, `ROOM_TRANSITION`, and `WORKER_UNAVAILABLE`. |
-| `POST /v2/leave/{roomid}/{clientid}`   | empty; both IDs must be `U64Decimal`; `Authorization: Bearer <admission_token>`     | `{result:"SUCCESS"}` or an ID/authorization/worker error. |
+| `POST /v2/join/{roomid}`               | empty; path must be a `RoomIdV2` room token                                                     | `{result:"SUCCESS", params:{client_id,room_id,room_link,mode,epoch,wss_url,admission_token,...}}`; `mode` is `"p2p"` or `"sfu"` and `is_initiator` is present only for P2P. Domain failures include `INVALID_ROOM_ID`, `NO_SFU_AVAILABLE`, `ROOM_TRANSITION`, and `WORKER_UNAVAILABLE`. |
+| `POST /v2/leave/{roomid}/{clientid}`   | empty; `roomid` must be a `RoomIdV2` token and `clientid` a `U64Decimal`; `Authorization: Bearer <admission_token>`     | `{result:"SUCCESS"}` or an ID/authorization/worker error. |
 | `GET /v2/params`, `GET /v2/r/{roomid}` | V2 validation                                                                      | V2 configuration and room-page response; `/v2/params` carries ICE/TURN configuration. |
 
 There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `apprtc` as a random `u64`, returned
@@ -588,10 +593,10 @@ enforced by the hub: an `admit` that collides with a live member returns `DUPLIC
 
 ```jsonc
 // client -> signaling, first frame
-{ "cmd": "register", "roomid": "42", "clientid": "101", "ver": 2, "token": "admission-token" }
+{ "cmd": "register", "roomid": "grYp2g1QjrKVXUZLph46kA", "clientid": "101", "ver": 2, "token": "admission-token" }
 
 // signaling -> client; explicit v2 register acknowledgement and authoritative state
-{ "control": "registered", "roomid": "42", "epoch": "0", "mode": "p2p", "is_initiator": true }
+{ "control": "registered", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "0", "mode": "p2p", "is_initiator": true }
 
 // client -> signaling after register; v1 envelope plus the required epoch
 { "cmd": "send", "epoch": "0", "msg": "{\"type\":\"offer\",\"sdp\":\"v=0\\r\\n...\"}" }
@@ -601,16 +606,16 @@ enforced by the hub: an `admit` that collides with a live member returns `DUPLIC
 { "msg": "{\"type\":\"answer\",\"sdp\":\"v=0\\r\\n...\"}" }
 
 // signaling -> existing P2P participants after an upgrade commits
-{ "control": "sfu-upgrade", "roomid": "42", "epoch": "1" }
+{ "control": "sfu-upgrade", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "1" }
 
 // signaling -> the sole P2P survivor after the other member leaves
-{ "control": "p2p-promote", "roomid": "42", "epoch": "0", "is_initiator": true }
+{ "control": "p2p-promote", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "0", "is_initiator": true }
 
 // signaling -> both remaining members after the room downgrades; is_initiator elects the single direct offerer
-{ "control": "sfu-downgrade", "roomid": "42", "epoch": "2", "is_initiator": true }
+{ "control": "sfu-downgrade", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "2", "is_initiator": true }
 
 // signaling -> every member when the assigned worker is lost (grace expiry or restart)
-{ "control": "room-failed", "roomid": "42", "reason": "WORKER_UNAVAILABLE" }
+{ "control": "room-failed", "roomid": "grYp2g1QjrKVXUZLph46kA", "reason": "WORKER_UNAVAILABLE" }
 ```
 
 The hub validates canonical `u64` IDs, token binding, and that the admitted member matches the registering socket, then

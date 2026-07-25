@@ -47,7 +47,7 @@ async fn relay(
     Ok(())
 }
 
-async fn leave(room_id: u64, client_id: u64, token: &str) -> Result<()> {
+async fn leave(room_id: &str, client_id: u64, token: &str) -> Result<()> {
     let authorization = format!("Bearer {token}");
     let left = http_with_headers(
         "POST",
@@ -63,28 +63,28 @@ async fn leave(room_id: u64, client_id: u64, token: &str) -> Result<()> {
 #[tokio::test]
 async fn p2p_upgrades_to_sfu_then_downgrades_to_p2p() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>();
+    let room_id = common::new_room_id();
 
     let page = http("GET", &format!("/v2/r/{room_id}"), &[]).await?;
     assert_eq!(page.status, 200);
     assert!(page.text()?.contains("signalingVersion: 2"));
 
     // ---- Phase 1: two members negotiate a direct P2P call at epoch 0 ----
-    let first = join_v2(room_id).await?;
+    let first = join_v2(&room_id).await?;
     assert_eq!(first["params"]["mode"], "p2p");
     assert_eq!(first["params"]["epoch"], "0");
     assert_eq!(first["params"]["is_initiator"], true);
     let (first_id, first_token) = admission(&first)?;
-    let (mut first_ws, first_registered) = ws_register_v2(room_id, first_id, &first_token).await?;
+    let (mut first_ws, first_registered) = ws_register_v2(&room_id, first_id, &first_token).await?;
     assert_eq!(first_registered["mode"], "p2p");
     assert_eq!(first_registered["is_initiator"], true);
 
-    let second = join_v2(room_id).await?;
+    let second = join_v2(&room_id).await?;
     assert_eq!(second["params"]["mode"], "p2p");
     assert_eq!(second["params"]["is_initiator"], false);
     let (second_id, second_token) = admission(&second)?;
     let (mut second_ws, second_registered) =
-        ws_register_v2(room_id, second_id, &second_token).await?;
+        ws_register_v2(&room_id, second_id, &second_token).await?;
     assert_eq!(second_registered["is_initiator"], false);
 
     // Initiator offers + trickles a candidate; callee answers. Signaling relays opaquely.
@@ -113,14 +113,14 @@ async fn p2p_upgrades_to_sfu_then_downgrades_to_p2p() -> Result<()> {
     // ---- Phase 2: a third join upgrades the room to SFU at epoch 1 ----
     // join_v2 blocks until signaling has driven the worker's JoinMember barrier for all three
     // members and committed SFU mode.
-    let third = join_v2(room_id).await?;
+    let third = join_v2(&room_id).await?;
     assert_eq!(
         third["params"]["mode"], "sfu",
         "third join must upgrade to SFU: {third}"
     );
     assert_eq!(third["params"]["epoch"], "1");
     let (third_id, third_token) = admission(&third)?;
-    let (mut third_ws, third_registered) = ws_register_v2(room_id, third_id, &third_token).await?;
+    let (mut third_ws, third_registered) = ws_register_v2(&room_id, third_id, &third_token).await?;
     assert_eq!(third_registered["mode"], "sfu");
     assert_eq!(third_registered["epoch"], "1");
 
@@ -130,14 +130,14 @@ async fn p2p_upgrades_to_sfu_then_downgrades_to_p2p() -> Result<()> {
             ws_receive_json(ws).await?,
             json!({
                 "control": "sfu-upgrade",
-                "roomid": room_id.to_string(),
+                "roomid": room_id,
                 "epoch": "1",
             })
         );
     }
 
     // ---- Phase 3: the third member leaves; the room dwells at two and downgrades to P2P ----
-    leave(room_id, third_id, &third_token).await?;
+    leave(&room_id, third_id, &third_token).await?;
     ws_expect_close(&mut third_ws).await?;
 
     // signaling elects the lower client id as the direct offerer. The dwell (default 2s) is well
@@ -149,7 +149,7 @@ async fn p2p_upgrades_to_sfu_then_downgrades_to_p2p() -> Result<()> {
             control,
             json!({
                 "control": "sfu-downgrade",
-                "roomid": room_id.to_string(),
+                "roomid": room_id,
                 "epoch": "2",
                 "is_initiator": id == initiator_id,
             }),
@@ -184,9 +184,9 @@ async fn p2p_upgrades_to_sfu_then_downgrades_to_p2p() -> Result<()> {
     } else {
         (second_id, second_token, first_id, first_token)
     };
-    leave(room_id, offerer_id, &offerer_token).await?;
+    leave(&room_id, offerer_id, &offerer_token).await?;
     ws_expect_close(&mut offerer_ws).await?;
-    leave(room_id, answerer_id, &answerer_token).await?;
+    leave(&room_id, answerer_id, &answerer_token).await?;
     ws_expect_close(&mut answerer_ws).await?;
     Ok(())
 }

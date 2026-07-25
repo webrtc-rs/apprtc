@@ -25,9 +25,9 @@ struct Active {
 #[tokio::test]
 async fn upgrades_three_v2_clients_to_sfu_and_opens_data_channels() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>().max(1);
+    let room_id = common::new_room_id();
 
-    let members = upgrade_three(room_id).await?;
+    let members = upgrade_three(&room_id).await?;
 
     // Each member publishes to the SFU with its own data channel.
     let mut actives: Vec<Active> = Vec::new();

@@ -1,6 +1,9 @@
 //! AppRTC client for the private signaling gRPC service.
 
 use async_trait::async_trait;
+
+use crate::room_id::room_id_to_bytes;
+use signaling::v2::{RoomId, format_room_token};
 use signaling_proto::v2::signaling_service_client::SignalingServiceClient;
 use signaling_proto::v2::{
     self, AdmitV1Request, AdmitV2Request, AppId, InjectV1Request, OccupancyV1Request,
@@ -29,14 +32,14 @@ pub trait RoomAuthority: Send + Sync {
     async fn remove(&self, roomid: String, clientid: String) -> Result<(), String>;
     async fn occupancy(&self, roomid: String) -> Result<usize, String>;
     async fn inject(&self, roomid: String, clientid: String, msg: String) -> Result<(), String>;
-    async fn admit_v2(&self, room_id: u64, client_id: u64) -> Result<V2Admission, String>;
+    async fn admit_v2(&self, room_id: RoomId, client_id: u64) -> Result<V2Admission, String>;
     async fn remove_v2(
         &self,
-        room_id: u64,
+        room_id: RoomId,
         client_id: u64,
         admission_token: String,
     ) -> Result<(), String>;
-    async fn occupancy_v2(&self, room_id: u64) -> Result<usize, String>;
+    async fn occupancy_v2(&self, room_id: RoomId) -> Result<usize, String>;
     async fn status(&self) -> Result<StatusSnapshot, String>;
 }
 
@@ -275,18 +278,19 @@ impl RoomAuthority for GrpcAuthority {
         operation_result(response.result, "inject_v1", request_id, started)
     }
 
-    async fn admit_v2(&self, room_id: u64, client_id: u64) -> Result<V2Admission, String> {
+    async fn admit_v2(&self, room_id: RoomId, client_id: u64) -> Result<V2Admission, String> {
         let context = self.context();
         let request_id = context.request_id;
         let started = Instant::now();
         log::info!(
-            "Signaling gRPC request: operation=admit_v2 request_id={request_id} room_id={room_id} client_id={client_id}"
+            "Signaling gRPC request: operation=admit_v2 request_id={request_id} room_id={} client_id={client_id}",
+            format_room_token(&room_id)
         );
         let mut client = self.client.clone();
         let response = client
             .admit_v2(AdmitV2Request {
                 context: Some(context),
-                room_id,
+                room_id: room_id_to_bytes(&room_id),
                 client_id,
             })
             .await
@@ -325,7 +329,7 @@ impl RoomAuthority for GrpcAuthority {
 
     async fn remove_v2(
         &self,
-        room_id: u64,
+        room_id: RoomId,
         client_id: u64,
         admission_token: String,
     ) -> Result<(), String> {
@@ -333,13 +337,14 @@ impl RoomAuthority for GrpcAuthority {
         let request_id = context.request_id;
         let started = Instant::now();
         log::info!(
-            "Signaling gRPC request: operation=remove_v2 request_id={request_id} room_id={room_id} client_id={client_id}"
+            "Signaling gRPC request: operation=remove_v2 request_id={request_id} room_id={} client_id={client_id}",
+            format_room_token(&room_id)
         );
         let mut client = self.client.clone();
         let response = client
             .remove_v2(RemoveV2Request {
                 context: Some(context),
-                room_id,
+                room_id: room_id_to_bytes(&room_id),
                 client_id,
                 admission_token,
             })
@@ -350,18 +355,19 @@ impl RoomAuthority for GrpcAuthority {
         operation_result(response.result, "remove_v2", request_id, started)
     }
 
-    async fn occupancy_v2(&self, room_id: u64) -> Result<usize, String> {
+    async fn occupancy_v2(&self, room_id: RoomId) -> Result<usize, String> {
         let context = self.context();
         let request_id = context.request_id;
         let started = Instant::now();
         log::info!(
-            "Signaling gRPC request: operation=occupancy_v2 request_id={request_id} room_id={room_id}"
+            "Signaling gRPC request: operation=occupancy_v2 request_id={request_id} room_id={}",
+            format_room_token(&room_id)
         );
         let mut client = self.client.clone();
         let response = client
             .occupancy_v2(OccupancyV2Request {
                 context: Some(context),
-                room_id,
+                room_id: room_id_to_bytes(&room_id),
             })
             .await
             .map_err(|error| Self::grpc_error("occupancy_v2", request_id, error, started))?

@@ -167,9 +167,9 @@ struct Active {
 #[tokio::test]
 async fn every_local_description_has_a_browser_valid_bundle_extmap() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>().max(1);
+    let room_id = common::new_room_id();
 
-    let members = upgrade_three(room_id).await?;
+    let members = upgrade_three(&room_id).await?;
 
     // Bring members up one at a time (each must reach Connected before the next publishes), each
     // publishing audio + video like a browser.

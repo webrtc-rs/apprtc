@@ -1,6 +1,6 @@
 [package]
 name = "apprtc"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT/Apache-2.0"
 authors = ["Rain Liu <y@liu.mx>"]
@@ -10,16 +10,18 @@ keywords = ["signaling", "networking", "protocols", "sans-io"]
 categories = ["network-programming", "asynchronous", "multimedia"]
 
 [dependencies]
-signaling = { version = "0.3.0", path = "signaling" }
-signaling-proto = { version = "0.3.0", path = "signaling/signaling-proto" }
-sfu = { version = "0.20.0-rc.4", path = "sfu" }
-rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
-sansio = "1.0.1"
+signaling = { version = "0.4.0", path = "signaling" }
+signaling-proto = { version = "0.4.0", path = "signaling/signaling-proto" }
+sfu = { version = "0.4.0", path = "sfu" }
 
+rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
+
+sansio = "1.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 url = "2"
 rand = "0.10.1"
+uuid = { version = "1", features = ["v4", "v8"] }
 minijinja = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["ws"] }
@@ -41,4 +43,5 @@ async-trait = "0.1"
 
 [dev-dependencies]
 webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
+
 tower = { version = "0.5", features = ["util"] }

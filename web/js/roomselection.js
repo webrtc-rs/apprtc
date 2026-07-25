@@ -13,6 +13,37 @@
 
 'use strict';
 
+
+// ── V2 room tokens ───────────────────────────────────────────────────────────────────
+//
+// A V2 room id is a UUIDv8 (RFC 9562 §5.8) carried in links as 22 base64url characters.
+// This is the browser half of the codec in `signaling/src/v2.rs`; the two must agree, so
+// the rules are the same: exactly 22 characters, canonical trailing bits, version 8 and
+// the RFC 9562 variant.
+
+var ROOM_TOKEN_LENGTH = 22;
+
+function base64UrlEncode(bytes) {
+  var binary = '';
+  for (var i = 0; i < bytes.length; ++i) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(token) {
+  var padded = token.replace(/-/g, '+').replace(/_/g, '/');
+  while (padded.length % 4 !== 0) {
+    padded += '=';
+  }
+  var binary = atob(padded);
+  var bytes = new Uint8Array(binary.length);
+  for (var i = 0; i < binary.length; ++i) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 var RoomSelection = function(roomSelectionDiv,
   uiConstants, recentRoomsKey, setupCompletedCallback) {
   this.roomSelectionDiv_ = roomSelectionDiv;
@@ -32,9 +63,9 @@ var RoomSelection = function(roomSelectionDiv,
   this.signalingV2Checkbox_ = this.roomSelectionDiv_.querySelector(
       uiConstants.roomSelectionV2Checkbox);
 
-  this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
-  // Call onRoomIdInput_ now to validate initial state of input box.
-  this.onRoomIdInput_();
+  this.instructions_ = document.querySelector('#instructions');
+  // Seed the input for whichever protocol the checkbox starts on, then validate it.
+  this.applySignalingVersionUi_();
 
   this.roomIdInputListener_ = this.onRoomIdInput_.bind(this);
   this.roomIdInput_.addEventListener('input', this.roomIdInputListener_, false);
@@ -61,8 +92,49 @@ var RoomSelection = function(roomSelectionDiv,
   this.startBuildingRecentRoomList_();
 };
 
+// Mint a room id: 122 random bits with the version and variant nibbles stamped in.
+RoomSelection.generateRoomToken = function() {
+  var bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  bytes[6] = (bytes[6] & 0x0f) | 0x80;   // version 8
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;   // RFC 9562 variant
+  return base64UrlEncode(bytes);
+};
+
+// True only for a canonical encoding of a UUIDv8. 128 bits is not a multiple of 6, so the
+// final character carries 4 must-be-zero bits — without that check one room would answer
+// to sixteen different links.
+RoomSelection.isRoomToken = function(value) {
+  if (typeof value !== 'string' || value.length !== ROOM_TOKEN_LENGTH) {
+    return false;
+  }
+  if (!/^[A-Za-z0-9_-]{21}[AQgw]$/.test(value)) {
+    return false;
+  }
+  try {
+    var bytes = base64UrlDecode(value);
+    return bytes.length === 16 &&
+        (bytes[6] & 0xf0) === 0x80 &&
+        (bytes[8] & 0xc0) === 0x80;
+  } catch (e) {
+    return false;
+  }
+};
+
+// Accept either a bare token or a full room link, so a pasted link works.
+RoomSelection.roomTokenFrom = function(value) {
+  var text = (value || '').trim();
+  var match = text.match(/\/v2\/r\/([A-Za-z0-9_-]+)/);
+  if (match) {
+    text = match[1];
+  }
+  return RoomSelection.isRoomToken(text) ? text : null;
+};
+
+// A machine-generated room name, which the confirm-join prompt hides rather than reading
+// back at the user: a V1 nine-digit random room, or any V2 minted token.
 RoomSelection.matchRandomRoomPattern = function(input) {
-  return input.match(/^\d{9}$/) !== null;
+  return input.match(/^\d{9}$/) !== null || RoomSelection.isRoomToken(input);
 };
 
 RoomSelection.prototype.removeEventListeners = function() {
@@ -111,20 +183,22 @@ RoomSelection.prototype.buildRecentRoomList_ = function(recentRooms) {
 };
 
 RoomSelection.prototype.onRoomIdInput_ = function() {
-  // Validate room id, enable/disable join button.
-  // Limit to only numbers, and value must be valid uint64 (0 to 18446744073709551615).
   var room = this.roomIdInput_.value;
-  var re = /^\d+$/;
-  var valid = re.test(room);
-  if (valid) {
-    try {
-      var val = BigInt(room);
-      valid = val >= 0n && val <= 18446744073709551615n;
-      if (this.signalingV2Checkbox_.checked && room !== '0' && room[0] === '0') {
+  var valid;
+  if (this.signalingV2Checkbox_.checked) {
+    // V2 rooms are minted, not typed: the field holds a room link (or a bare token
+    // someone pasted), and anything else is rejected rather than turned into a room.
+    valid = RoomSelection.roomTokenFrom(room) !== null;
+  } else {
+    // V1 is unchanged: any uint64 room id, typed freely.
+    valid = /^\d+$/.test(room);
+    if (valid) {
+      try {
+        var val = BigInt(room);
+        valid = val >= 0n && val <= 18446744073709551615n;
+      } catch (e) {
         valid = false;
       }
-    } catch (e) {
-      valid = false;
     }
   }
 
@@ -140,7 +214,7 @@ RoomSelection.prototype.onRoomIdInput_ = function() {
 };
 
 RoomSelection.prototype.onSignalingVersionChange_ = function() {
-  this.onRoomIdInput_();
+  this.applySignalingVersionUi_();
   this.recentlyUsedList_.getRecentRooms().then(function(recentRooms) {
     this.buildRecentRoomList_(recentRooms);
   }.bind(this));
@@ -153,12 +227,59 @@ RoomSelection.prototype.onRoomIdKeyPress_ = function(event) {
   this.onJoinButton_();
 };
 
+/// Shape the room-selection controls for the selected protocol. V2 mints a link and shows
+/// it read-only; V1 keeps the free-form numeric room id it has always had.
+RoomSelection.prototype.applySignalingVersionUi_ = function() {
+  var v2 = this.signalingV2Checkbox_.checked;
+  if (v2) {
+    if (this.instructions_) {
+      this.instructions_.textContent =
+          'Join the room link or generate a new room link';
+    }
+    this.roomIdInput_.readOnly = true;
+    this.roomRandomButton_.textContent = 'GENERATE';
+    this.roomIdInputLabel_.textContent = 'Enter a valid room link, or generate one.';
+    if (RoomSelection.roomTokenFrom(this.roomIdInput_.value) === null) {
+      this.roomIdInput_.value = this.roomLink_(RoomSelection.generateRoomToken());
+    }
+  } else {
+    if (this.instructions_) {
+      this.instructions_.textContent = 'Please enter a room id:';
+    }
+    this.roomIdInput_.readOnly = false;
+    this.roomRandomButton_.textContent = 'RANDOM';
+    this.roomIdInputLabel_.textContent =
+        'Room id must be a valid number (up to 18446744073709551615).';
+    if (!/^\d+$/.test(this.roomIdInput_.value)) {
+      this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
+    }
+  }
+  this.onRoomIdInput_();
+};
+
+/// The absolute link a room token is shared as.
+RoomSelection.prototype.roomLink_ = function(token) {
+  return location.origin + '/v2/r/' + encodeURIComponent(token);
+};
+
 RoomSelection.prototype.onRandomButton_ = function() {
-  this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
+  if (this.signalingV2Checkbox_.checked) {
+    this.roomIdInput_.value = this.roomLink_(RoomSelection.generateRoomToken());
+  } else {
+    this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
+  }
   this.onRoomIdInput_();
 };
 
 RoomSelection.prototype.onJoinButton_ = function() {
+  if (this.signalingV2Checkbox_.checked) {
+    var token = RoomSelection.roomTokenFrom(this.roomIdInput_.value);
+    if (token === null) {
+      return;
+    }
+    this.loadRoom_(token);
+    return;
+  }
   this.loadRoom_(this.roomIdInput_.value);
 };
 

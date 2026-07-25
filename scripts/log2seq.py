@@ -50,16 +50,16 @@ LINE_RE = re.compile(
 
 # ── apprtc.log ──────────────────────────────────────────────────────────────
 APPRTC = [
-    ("join", re.compile(r"^HTTP V2 join: room_id=(?P<room>\d+) client_id=(?P<client>\d+)")),
-    ("leave", re.compile(r"^HTTP V2 leave: room_id=(?P<room>\d+) client_id=(?P<client>\d+)")),
+    ("join", re.compile(r"^HTTP V2 join: room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+)")),
+    ("leave", re.compile(r"^HTTP V2 leave: room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+)")),
 ]
 JOIN_RESP = re.compile(
-    r"^HTTP V2 join response: room_id=(?P<room>\d+) client_id=(?P<client>\d+) "
+    r"^HTTP V2 join response: room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+) "
     r"result=(?P<result>\w+) mode=(?P<mode>\w+)"
 )
 GRPC_REQ = re.compile(
     r"^Signaling gRPC request: operation=(?P<op>\w+) request_id=(?P<rid>\d+) "
-    r"room_id=(?P<room>\d+)(?: client_id=(?P<client>\d+))?"
+    r"room_id=(?P<room>[A-Za-z0-9_-]+)(?: client_id=(?P<client>\d+))?"
 )
 GRPC_RESP = re.compile(
     r"^Signaling gRPC response: operation=(?P<op>\w+) request_id=(?P<rid>\d+) result=(?P<result>\w+)"
@@ -67,29 +67,29 @@ GRPC_RESP = re.compile(
 
 # ── signaling.log ───────────────────────────────────────────────────────────
 REGISTER = re.compile(
-    r"^V2 register: connection_id=\d+ room_id=(?P<room>\d+) client_id=(?P<client>\d+) epoch=(?P<epoch>\S+)"
+    r"^V2 register: connection_id=\d+ room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+) epoch=(?P<epoch>\S+)"
 )
 SEND = re.compile(
-    r"^V2 send: connection_id=\d+ room_id=(?P<room>\d+) client_id=(?P<client>\d+) epoch=(?P<epoch>\S+) bytes=\d+"
+    r"^V2 send: connection_id=\d+ room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+) epoch=(?P<epoch>\S+) bytes=\d+"
 )
 DELIVER = re.compile(
-    r"^V2 deliver: connection_id=\d+ room_id=(?P<room>\d+) client_id=(?P<client>\d+) bytes=\d+"
+    r"^V2 deliver: connection_id=\d+ room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+) bytes=\d+"
 )
 SEND_DROP = re.compile(
-    r"^V2 send dropped: connection_id=\d+ room_id=(?P<room>\d+) client_id=(?P<client>\d+) reason=(?P<reason>\S+)"
+    r"^V2 send dropped: connection_id=\d+ room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+) reason=(?P<reason>\S+)"
 )
 SFU_CMD = re.compile(
     r"^SFU command: instance_id=(?P<inst>\S+) connection_id=\d+ request_id=(?P<rid>\d+) "
-    r"operation=(?P<op>\w+) room_id=(?P<room>\d+) client_id=(?P<client>\d+)"
+    r"operation=(?P<op>\w+) room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+)"
 )
 SFU_RES = re.compile(
     r"^SFU command result: instance_id=(?P<inst>\S+) connection_id=\d+ request_id=(?P<rid>\d+) result=(?P<result>\w+)"
 )
 SFU_EVENT = re.compile(
-    r"^SFU event: instance_id=(?P<inst>\S+) operation=signal room_id=(?P<room>\d+) client_id=(?P<client>\d+)"
+    r"^SFU event: instance_id=(?P<inst>\S+) operation=signal room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+)"
 )
 CONTROL = re.compile(
-    r"^V2 control: control=(?P<ctrl>\S+) connection_id=\d+ room_id=(?P<room>\d+) client_id=(?P<client>\d+)"
+    r"^V2 control: control=(?P<ctrl>\S+) connection_id=\d+ room_id=(?P<room>[A-Za-z0-9_-]+) client_id=(?P<client>\d+)"
     r"(?P<rest>.*)$"
 )
 SESSION_OPEN = re.compile(

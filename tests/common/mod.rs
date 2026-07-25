@@ -109,7 +109,13 @@ pub async fn http_with_headers(
     parse_http_response(&bytes)
 }
 
-pub async fn join_v2(room_id: u64) -> Result<Value> {
+/// Mint a V2 room id. Rooms are UUIDv8 tokens now, so tests generate one rather than
+/// picking a number.
+pub fn new_room_id() -> String {
+    signaling::v2::format_room_token(&signaling::v2::new_room_id())
+}
+
+pub async fn join_v2(room_id: &str) -> Result<Value> {
     let response = http("POST", &format!("/v2/join/{room_id}"), &[]).await?;
     if response.status != 200 {
         bail!(
@@ -152,7 +158,7 @@ pub async fn ws_register(room_id: &str, client_id: &str) -> Result<WsStream> {
 }
 
 pub async fn ws_register_v2(
-    room_id: u64,
+    room_id: &str,
     client_id: u64,
     admission_token: &str,
 ) -> Result<(WsStream, Value)> {
@@ -161,7 +167,7 @@ pub async fn ws_register_v2(
         &mut socket,
         serde_json::json!({
             "cmd": "register",
-            "roomid": room_id.to_string(),
+            "roomid": room_id,
             "clientid": client_id.to_string(),
             "ver": 2,
             "token": admission_token,

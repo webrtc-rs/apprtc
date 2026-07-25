@@ -143,7 +143,7 @@ P2P V2 adds:
 
 - A checked **V2 P2P/SFU** room-selection checkbox by default; unchecking it selects the legacy V1 flow.
 - `/v2/r/{roomid}`, `/v2/join/{roomid}`, `/v2/leave/{roomid}/{clientid}`, and `/v2/params` routes.
-- Canonical decimal `u64` room and client IDs.
+- Room ids are UUIDv8 values minted by the service and carried in links as 22-character base64url tokens; client ids remain canonical decimal `u64`.
 - A signaling-issued admission token bound to the room/client pair.
 - Explicit `{control:"registered"}` acknowledgement before signaling starts.
 - An `epoch` on every browser `send` frame; stale or malformed epochs are dropped.
@@ -405,7 +405,7 @@ cargo run --bin apprtc -- \
 | `POST /{roomid}/{clientid}`                       | V1 `wss_post_url` fallback: inject a raw signaling message.                            |
 | `DELETE /{roomid}/{clientid}`                     | V1 `wss_post_url` fallback: remove the client.                                         |
 | `POST` or `DELETE /_internal/{roomid}/{clientid}` | Compatibility alias for the fallback bridge.                                           |
-| `GET /v2/r/{roomid}`                              | Render the V2 P2P/SFU call page; `roomid` must be canonical decimal `u64`.             |
+| `GET /v2/r/{roomid}`                              | Render the V2 P2P/SFU call page; `roomid` must be a base64url room token (UUIDv8).     |
 | `POST /v2/join/{roomid}`                          | Admit a V2 member; a third member initiates the SFU join barrier.                      |
 | `POST /v2/leave/{roomid}/{clientid}`              | Remove a V2 member using its bearer admission token.                                   |
 | `GET /v2/params`                                  | Return room-independent V2 parameters and ICE configuration.                           |
@@ -476,12 +476,13 @@ object. V1 signaling treats it as an opaque UTF-8 string.
 
 ## V2 WebSocket protocol
 
-V2 uses the same `/ws` endpoint but requires numeric identifiers, an admission token, and `ver: 2`:
+V2 uses the same `/ws` endpoint but requires a room token, a numeric client id, an admission token, and
+`ver: 2`:
 
 ```json
 {
   "cmd": "register",
-  "roomid": "42",
+  "roomid": "grYp2g1QjrKVXUZLph46kA",
   "clientid": "101",
   "ver": 2,
   "token": "admission-token"
@@ -493,7 +494,7 @@ Successful registration returns an authoritative snapshot before any queued sign
 ```json
 {
   "control": "registered",
-  "roomid": "42",
+  "roomid": "grYp2g1QjrKVXUZLph46kA",
   "epoch": "0",
   "mode": "p2p",
   "is_initiator": true
@@ -519,7 +520,7 @@ single direct offerer:
 ```json
 {
   "control": "sfu-downgrade",
-  "roomid": "42",
+  "roomid": "grYp2g1QjrKVXUZLph46kA",
   "epoch": "2",
   "is_initiator": true
 }

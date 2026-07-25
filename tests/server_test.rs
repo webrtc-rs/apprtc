@@ -263,10 +263,10 @@ async fn completes_the_stock_v1_join_queue_and_websocket_relay_flow() -> Result<
 #[tokio::test]
 async fn upgrades_a_three_member_v2_room_through_the_real_sfu_worker() -> Result<()> {
     wait_for_server().await?;
-    let room_id = rand::random::<u64>().max(1);
+    let room_id = common::new_room_id();
 
-    let first = join_v2(room_id).await?;
-    let second = join_v2(room_id).await?;
+    let first = join_v2(&room_id).await?;
+    let second = join_v2(&room_id).await?;
     assert_eq!(first["result"], "SUCCESS");
     assert_eq!(first["params"]["mode"], "p2p");
     assert_eq!(first["params"]["epoch"], "0");
@@ -276,9 +276,9 @@ async fn upgrades_a_three_member_v2_room_through_the_real_sfu_worker() -> Result
     assert_eq!(second["params"]["is_initiator"], false);
 
     let (mut first_ws, first_registered) =
-        ws_register_v2(room_id, v2_client_id(&first)?, v2_token(&first)?).await?;
+        ws_register_v2(&room_id, v2_client_id(&first)?, v2_token(&first)?).await?;
     let (mut second_ws, second_registered) =
-        ws_register_v2(room_id, v2_client_id(&second)?, v2_token(&second)?).await?;
+        ws_register_v2(&room_id, v2_client_id(&second)?, v2_token(&second)?).await?;
     assert_eq!(first_registered["control"], "registered");
     assert_eq!(first_registered["mode"], "p2p");
     assert_eq!(second_registered["control"], "registered");
@@ -286,7 +286,7 @@ async fn upgrades_a_three_member_v2_room_through_the_real_sfu_worker() -> Result
 
     // This HTTP response is held until signaling has received MemberJoined for
     // all three clients from the real SFU process and committed epoch 1.
-    let third = join_v2(room_id).await?;
+    let third = join_v2(&room_id).await?;
     assert_eq!(third["result"], "SUCCESS");
     assert_eq!(third["params"]["mode"], "sfu");
     assert_eq!(third["params"]["epoch"], "1");
@@ -297,19 +297,19 @@ async fn upgrades_a_three_member_v2_room_through_the_real_sfu_worker() -> Result
         ws_receive_json(&mut second_ws).await?,
     ] {
         assert_eq!(control["control"], "sfu-upgrade");
-        assert_eq!(control["roomid"], room_id.to_string());
+        assert_eq!(control["roomid"], room_id);
         assert_eq!(control["epoch"], "1");
     }
 
     let (mut third_ws, third_registered) =
-        ws_register_v2(room_id, v2_client_id(&third)?, v2_token(&third)?).await?;
+        ws_register_v2(&room_id, v2_client_id(&third)?, v2_token(&third)?).await?;
     assert_eq!(third_registered["control"], "registered");
     assert_eq!(third_registered["mode"], "sfu");
     assert_eq!(third_registered["epoch"], "1");
     assert!(third_registered.get("is_initiator").is_none());
 
     for member in [&first, &second, &third] {
-        cleanup_v2(room_id, v2_client_id(member)?, v2_token(member)?).await?;
+        cleanup_v2(&room_id, v2_client_id(member)?, v2_token(member)?).await?;
     }
     first_ws.close(None).await?;
     second_ws.close(None).await?;
@@ -482,7 +482,7 @@ async fn cleanup(room_id: &str, client_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn cleanup_v2(room_id: u64, client_id: u64, token: &str) -> Result<()> {
+async fn cleanup_v2(room_id: &str, client_id: u64, token: &str) -> Result<()> {
     let authorization = format!("Bearer {token}");
     let response = http_with_headers(
         "POST",
