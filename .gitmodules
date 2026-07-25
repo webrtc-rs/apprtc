@@ -1,3 +1,6 @@
 [submodule "sfu"]
 	path = sfu
 	url = https://github.com/webrtc-rs/sfu
+[submodule "signaling"]
+	path = signaling
+	url = https://github.com/webrtc-rs/signaling

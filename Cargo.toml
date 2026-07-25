@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "signaling", # signaling hub
-    "signaling-proto", # signaling protobuf
 ]
 exclude = [
     "sfu",
     "sfu/webrtc",
     "sfu/webrtc/rtc",
+    "signaling",
+    "signaling/signaling-proto",
 ]
 resolver = "2"
 
@@ -25,8 +25,7 @@ categories = ["network-programming"]
 
 [workspace.dependencies]
 signaling = { version = "0.3.0", path = "signaling" }
-signaling-proto = { version = "0.3.0", path = "signaling-proto" }
-
+signaling-proto = { version = "0.3.0", path = "signaling/signaling-proto" }
 sfu = { version = "0.20.0-rc.4", path = "sfu" }
 webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
 rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
@@ -53,12 +52,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["logg
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 async-trait = "0.1"
 bytes = "1"
-prost = "0.14.4"
-prost-build = "0.14.4"
-protoc-bin-vendored = "3.2.0"
 tonic = { version = "0.14.6", features = ["tls-ring", "tls-webpki-roots"] }
-tonic-prost = "0.14.6"
-tonic-prost-build = "0.14.6"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [package]
