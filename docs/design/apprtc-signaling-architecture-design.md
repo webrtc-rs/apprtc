@@ -363,9 +363,10 @@ Later joins to an existing SFU room do not run the global selector again and can
 
 The SFU gRPC session, like the apprtc unary API, is the cross-process binding of the internal authority boundary. The current repository ships only separate `signaling` and `sfu` processes; there is no all-in-one production binary.
 
-A single `signaling` hub instance owning all authoritative room state is a first-release deployment assumption. Hub
-replication, partitioning, and failover are out of scope for this document; the room-affine assignment policy above is
-the seam a later multi-hub design would shard along.
+A single `signaling` hub instance owning all authoritative room state is the current deployment assumption, and the only
+one the code implements. §9 proposes the multi-node extension: the same room-affinity principle applied one level up, so
+that a room is affine to one signaling node exactly as it is already affine to one worker. Hub *replication* — two nodes
+holding the same room — remains out of scope; §9 partitions rooms across nodes rather than replicating them.
 
 ## 6. Browser and API work
 
@@ -663,7 +664,7 @@ One tonic `Channel` is shared by all apprtc requests. Concurrent unary calls are
 
 ### 8.5 SFU bidirectional gRPC session
 
-An out-of-process SFU opens exactly one long-lived `OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu)` RPC per process incarnation. The stream has the state `Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 `uint64` room/client IDs cross this boundary; a V1 room never reaches an SFU.
+An out-of-process SFU opens exactly one long-lived `OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu)` RPC per signaling node it registers with. The current worker takes a single `--grpc-url` and therefore holds exactly one stream per process incarnation; a worker pooled across several nodes (§9.1) would hold one stream each, carrying the same `instance_id` on all of them, and each node would keep its own independent registry entry and assignment counters for it. The stream has the state `Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 `uint64` room/client IDs cross this boundary; a V1 room never reaches an SFU.
 
 The first `SfuToSignaling` message must be `RegisterSfu`. Its `RequestContext.app_id` is `APP_ID_SFU`; `instance_id` is the globally unique process-incarnation identity and replaces a separate `sfu_id`; and `request_id` identifies the registration operation. The same running process reuses `instance_id` after transient stream reconnection. A restarted process generates a new `instance_id` and cannot inherit the prior process's media state.
 
@@ -853,3 +854,604 @@ sequenceDiagram
 ```
 
 **Failure branches.** If any worker `joined` acknowledgement fails before the SFU commit, the hub rejects C's join and keeps the original V2 P2P pair unchanged. A V1 third join always returns `FULL`. After SFU commitment, a disconnected process may resume only by reconnecting with the same `instance_id` before grace expires. A restarted worker has a new ID and accepts only new assignments; when the old instance's grace expires, the hub sends `room-failed`, leaves the room in `Failed`, and does not silently move live browser WebRTC transports.
+
+## 9. Horizontal scale: M apprtc edges, N signaling nodes, K SFU workers
+
+This section is a design proposal. Nothing in it is implemented: the current runtime takes one `--grpc-url` and one
+`--ws-url`, which is exactly the M=1, N=1 case.
+
+The three tiers scale for different reasons and are independent of one another. **M apprtc edges** are stateless and
+scale HTTP, TLS and static-asset serving; any edge can serve any room. **N signaling nodes** hold authoritative room
+state in memory and scale the number of concurrent rooms; a room lives on exactly one of them. **K SFU workers** scale
+forwarded media. Only the edge↔node relationship poses a routing problem, and §9.2 resolves it by putting the answer
+inside the room ID.
+
+### 9.1 The problem
+
+A room's authoritative state lives in one `signaling` process's memory (§1). Every participant in a room must therefore
+reach the *same* signaling node, and — because the browser's WebSocket destination is chosen by whichever edge served
+its HTTP request — every apprtc edge must independently agree on which node that is.
+
+DNS load balancing breaks that agreement by construction. With `appr.tc` resolving to M edge addresses, two browsers
+opening the same room link can be served by different edges. If each edge simply forwarded to "its" signaling node, the
+room would exist twice, in two processes, with two membership tables, two initiator elections and two epochs — the
+participants would never see each other.
+
+The asymmetry with the media tier is worth understanding, because it explains why only this one relationship is hard.
+A room's **worker** assignment is decided once, by the single node that owns the room, and kept in that node's memory —
+`Room` carries `assigned_sfu`/`assignment_epoch` and each `Worker` carries its `assigned_rooms` (§1, §5). Nobody else
+ever re-derives it: the owning node already knows which worker holds the room and issues commands on that worker's
+`OpenSfuSession` stream. That stays true however workers are shared. Today each worker points at one node, but a worker
+may equally register to several nodes — or all of them — opening one stream per node and acting as a shared pool; each
+node still decides and stores the assignments for *its own* rooms. What pooling changes is capacity accounting (§9.10),
+not routing.
+
+The room→**node** mapping has no such home. It must be resolved by M stateless edges that share no memory and cannot
+consult each other, *before any authoritative state for the room exists* — there is not yet a room, or an owner, to
+have stored the answer. That chicken-and-egg is the whole difficulty.
+
+Browser media never consults DNS either: it is addressed by the ICE candidates the worker advertises through
+`--media-public-ip`, so a `sfu.rs` name with K addresses load-balances that binary's optional redirect page and nothing
+else.
+
+```mermaid
+flowchart LR
+    B1[Browser room 42] -- HTTPS, DNS RR --> E1[apprtc edge 1]
+    B2[Browser room 42] -- HTTPS, DNS RR --> EM[apprtc edge M]
+    E1 -- gRPC: home 42 --> S1[signaling node 1]
+    EM -- gRPC: home 42 --> S1
+    B1 -- WSS to s1.xxx.xx --> S1
+    B2 -- WSS to s1.xxx.xx --> S1
+    S1 <-- gRPC bi-directional stream --> W1[sfu worker 1]
+    SN[signaling node N] <-- gRPC bi-directional stream --> WK[sfu worker K]
+    SN <-. gRPC .-> W1
+    
+    S1 <-. gRPC .-> WK
+```
+
+Both browsers hold a link for a room whose ID names `s1`, so both edges route there without consulting anything.
+
+### 9.2 The scheme: room IDs carry their home node
+
+The service **mints** the room ID. Because it mints it, it can choose the home node first and write that choice into
+the ID, so every edge afterwards *reads* the answer instead of deriving it:
+
+```text
+POST /v2/room          → an edge picks a live node, mints an ID carrying that node's tag, returns the link
+GET  /v2/r/{room_id}   → any edge reads the tag and routes both HTTP and wss_url to that node
+```
+
+Two surfaces route off the resolved node, and they are the whole of the change as far as the browser is concerned:
+
+| Surface                                                        | Effect                                                                                                    |
+|----------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| `AdmitV2`, `RemoveV2`, `OccupancyV2` gRPC                      | The edge dials that node's private gRPC endpoint instead of a single configured one.                        |
+| `wss_url` in the `/v2/join` response and the room page params  | The edge returns that node's **per-node** public WebSocket URL, so the browser registers on the right node. |
+
+`call.js` already connects to whatever `wss_url` the join response carried and reuses it on reconnect, so **the browser
+needs no change at all**. Two participants served by different edges receive the same `wss_url` because both edges read
+the same tag out of the same ID. `GetStatus` is node-local and stays unrouted.
+
+**Why put the answer in the ID rather than compute it.** The alternative is to derive the home from the ID by hashing
+it (§9.12), which works but makes the mapping a function of the *node set* — so changing the set moves rooms. A tag is
+a function of nothing, so it never does:
+
+- **Topology changes stop being dangerous.** Adding a node disturbs no existing room, because no minted ID's tag
+  changes. Edges do not need to agree on a set at all; they need only to recognise the tags they encounter, and an edge
+  meeting an unknown tag can fail loudly instead of silently homing the room somewhere else.
+- **Placement becomes a decision instead of a coincidence.** Hashing spreads uniformly and cannot avoid a hot or
+  draining node. Minting is a free choice — least-loaded, random, or "any node not draining" — and draining becomes
+  "stop minting that tag" rather than a topology change (§9.5).
+- **Routing is O(1) and self-describing.** A support ticket containing a link says which node to look at.
+
+**The limits, accepted deliberately.**
+
+- Tag width bounds N, and is fixed at design time (§9.3): widening it later would re-read random bits as tag bits and
+  mis-route every ID already minted. The chosen 18-bit tag puts that bound at 262 144, well past any real fleet.
+- Existing rooms are never rebalanced. A node that gets hot stays hot for the links already minted on it.
+- Retiring a node permanently invalidates its links — correct, since their state died with it, provided the failure is
+  explicit rather than a silent re-creation elsewhere (§9.4).
+- Only IDs the service mints carry a tag, so V1 — whose IDs the client chooses — needs its own answer (§9.7).
+
+### 9.3 Room ID format: tagged UUIDv8, rendered base64url
+
+**V2 room IDs become UUIDs; client IDs stay `u64`.**
+
+The structure must live inside the UUID rather than as a prefix bolted onto it, and RFC 9562 reserves **version 8** for
+exactly this — an application-defined layout with only the version and variant bits fixed. Its three custom fields map
+onto what a room ID needs to carry: which node owns the room, when the link stops working, and enough randomness to be
+unguessable.
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   node tag (18)  |        expiry hi (custom_a head)           |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   expiry lo (custom_a tail)   |  ver  |       custom_b        |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|var|                       custom_c                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                           custom_c                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   RFC 9562 Figure 12, with this design's field assignment:
+   node tag 18 | expiry 30 | random 74
+```
+
+Rendered **unpadded** (RFC 4648 §5) a 16-byte UUID is always 22 characters whatever the field widths are — everything
+is carved out of the UUID, not prepended to it, so structure costs nothing in URL length. Because base64url encodes
+exactly 6 bits per character, a tag whose width is a multiple of 6 lands on a whole number of *leading* characters, and
+routing needs no decoding at all in the common path: *the first `T/6` characters of the room ID are the node tag.*
+Placing the tag and the expiry back to back inside `custom_a` makes both fields land on character boundaries — with the
+chosen widths the token reads as **3 characters of tag, 5 of expiry, 14 of randomness** — so either can be inspected
+without decoding, and `custom_b`/`custom_c` stay entirely random.
+
+**Every structured bit is a bit of entropy spent.** Six bits are fixed by the format, leaving 122 to divide between the
+tag, the expiry and randomness. The tag is public by design, and the expiry is *predictable* — an attacker guessing IDs
+knows the node and can guess a timestamp — so only the random remainder resists enumeration, and only it keeps two live
+meetings from colliding. That makes the division a security decision, not a layout preference:
+
+| Tag | Expiry                        | Random | Consequence                                                    |
+|-----|-------------------------------|--------|------------------------------------------------------------------|
+| 48  | 42 (seconds)                  | **32** | Rejected — enumerable and collision-prone (§9.3.2)              |
+| 30  | 32 (seconds)                  | 60     | Safe, but spends 12 bits on node identity nobody needs          |
+| **18** | **30 (minutes since UNIX epoch)** | **74** | **Chosen.** 262 144 tags, `custom_a` exactly filled |
+| 12  | 32 (seconds)                  | 78     | Only if tags are centrally allocated (§9.3.1)                   |
+
+The chosen split lands every field on a natural boundary: the tag and expiry together fill `custom_a` exactly, so
+`custom_b` and `custom_c` are wholly random; 18 and 30 bits are three and five base64url characters; and 74 random bits
+put enumeration and collision risk far beyond anything operational (§9.3.2).
+
+#### 9.3.1 Tag width: the question is really "who assigns tags"
+
+A tag has to be unique per node and must never be recycled onto a different node (§9.4). Narrow tags force someone — an
+operator or a registry — to allocate them and remember which are retired. Wide tags let a node **derive its own** by
+truncating a hash of a stable identity such as its hostname, at which point nobody allocates anything and the rule
+enforces itself:
+
+| `T` | Chars | Values | Self-assignment by hashing? |
+|-----|-------|--------|------------------------------|
+| 12  | 2     | 4 096   | 50 self-assigning nodes collide with ~31% probability — allocate centrally.  |
+| **18** | **3** | **262 144** | **Chosen.** 25 nodes collide with ~0.1% probability, 50 with ~0.5%, 100 with ~1.9%. |
+| 30  | 5     | 1.07 billion | ~10⁻⁶ at 50 nodes, but 12 more bits than a signaling fleet needs.           |
+
+Eighteen bits addresses 262 144 nodes, which no signaling fleet will approach — the bound that matters is not the
+address space but the collision rate when nodes pick their own tags, and that grows with the *square* of N:
+
+**A tag collision is not a silent hazard, which is what makes self-assignment viable here.** Unlike room IDs, node tags
+are drawn from a small, known, enumerable set: every edge and node can compute all configured hostnames' tags at
+startup and refuse to run if two collide. The percentages above are therefore *a deployment-time check that
+occasionally fails*, not lurking corruption.
+
+That gives the practical rule: **the tag is configured, defaulting to `SHA-256(hostname)` truncated to 18 bits.** A
+small fleet never sets it and never thinks about it. If the startup check reports a collision — around a 2% risk at 100
+nodes, and effectively certain past a few hundred — the operator pins an explicit tag for one of the two nodes and the
+problem is over. Fleets large enough to hit that routinely should allocate tags centrally, or use a registry that does
+it for them (§9.6.1).
+
+```text
+s1.xxx.xx  →  tag 50 715  →  https://appr.tc/v2/r/MYbBxhZAi1Ojzlk3wf_Zpw
+s2.xxx.xx  →  tag 260 271 →  https://appr.tc/v2/r/_ivBxhZAh0iTHaFj5GqZiA
+                                                  ^^^^^^^^ tag ‖ expiry, then 14 random characters
+```
+
+**Chosen: `T = 18`, defaulting to `SHA-256(hostname)` truncated to 18 bits.** At the usual fleet size nobody allocates
+tags, which removes a correctness rule from the operator's plate — the one §9.6.1 offers a registry to enforce — and
+makes DNS-derived discovery fully general, since any hostname works and no numbering convention is needed (§9.6.2).
+"Never reuse a tag" degrades into "do not recycle a hostname onto a different machine", a unit operators already think
+in.
+
+Three characters is also the smallest shared prefix of any option considered, so two links on the same node still look
+plainly different — the cosmetic objection to wide tags disappears.
+
+**Whichever is chosen, the width is fixed at design time.** The tag is read from fixed bit positions, so widening it
+after links exist re-reads random bits as tag bits and mis-routes every ID already minted. There is no "widen it later"
+escape hatch without a layout version to switch on. The same applies to every other field below.
+
+#### 9.3.2 Expiry: what it buys, and what it costs
+
+Carrying an expiry in the tail of `custom_a`, immediately after the tag, makes a link **self-describing about its own
+validity**. An
+edge can reject a dead link by decoding 16 bytes, with no gRPC call, no signaling node involved and no room lookup —
+which is both a fast failure for the user and a cheap filter in front of the authority. Signaling parses the same field
+and enforces it again on `AdmitV2`, since it is the authority and the edge check is only a shortcut.
+
+**At 30 bits the unit is forced, and the obvious choice is wrong.** Thirty bits of *seconds* since the UNIX epoch spans
+34 years and therefore ran out on **2004-01-10** — it cannot express any future timestamp at all. Two encodings do fit:
+
+| Encoding                        | Bits | Runs out    | Cost                                                         |
+|---------------------------------|------|-------------|----------------------------------------------------------------|
+| Seconds since a project epoch   | 30   | 2060        | A constant every implementation must agree on, exactly         |
+| **Minutes since the UNIX epoch** | **30** | **year 4011** | A divide by 60; granularity drops to a minute            |
+
+**Minutes since the UNIX epoch is the recommendation.** A project epoch introduces a shared constant that lives in the
+edge, in signaling, and in every log-reading tool, and getting it wrong shifts every expiry by the delta — a silent,
+systematic error that looks like a clock bug. Minutes have no such constant: the only rule is a division, the span is
+absurd rather than merely sufficient, and minute granularity is finer than any meeting-link policy needs. It also
+pairs well with the skew tolerance described below, which is measured in minutes anyway.
+
+**Why the width was not simply maximised.** An earlier draft of this section gave the expiry 42 bits, which spans
+139 000 years — and, paired with a 48-bit tag, left only **32 random bits**. Since the tag is public by design and a
+timestamp is guessable, those 32 bits would have been the entire secret:
+
+- **Enumeration.** Finding *some* live room on a node holding 10 000 of them would take about 2³²/10 000 ≈ 430 000
+  guesses — roughly seven minutes at 1 000 requests per second. Room existence would stop being a secret.
+- **Collisions.** Two rooms collide only if they share a tag *and* an expiry second *and* the random bits, so the
+  expiry field does partition the space. Even so, at 1 000 mints per second on one node the birthday bound gives
+  ≈ 3 700 colliding IDs per year — two live meetings sharing an ID, and their participants landing in each other's
+  calls.
+
+The chosen 18/30/74 split removes both concerns by a wide margin. Enumerating any of 10 000 live rooms would take
+≈ 1.9 × 10¹⁸ guesses, and a node minting 1 000 rooms per minute expects well under 10⁻⁹ collisions per year. The lesson
+worth keeping is the one that produced the change: **structured bits are subtracted from the security budget**, so each
+field should be sized to what it needs rather than to the space available.
+
+**Semantics to pin down, because they are easy to assume wrongly.**
+
+- **Expiry bounds the link, not the room.** Room state still dies when the room empties or its node restarts (§9.9);
+  expiry only says when the *identifier* stops being accepted. A link may well be dead long before it expires.
+- **It cannot be extended.** The value is immutable inside the ID, so a meeting that needs to outlive its window needs a
+  newly minted link. Long-lived or recurring meetings must therefore be minted with a long TTL up front, bounded by the
+  field's span, and the mint API should take the TTL as a parameter with a sane default rather than hard-coding one.
+- **Clock skew is a real failure mode.** Edges compare the expiry against their own clocks, so a link near its boundary
+  can be valid on one edge and expired on another. Require NTP and apply a tolerance of a few minutes past expiry, so
+  disagreement shows up as a slightly generous window rather than as a link that works only on some edges.
+- **It leaks approximate mint time.** Expiry minus the TTL is roughly when the link was created. This is minor, but it
+  is a property the numeric IDs did not have.
+- Rejection reuses `ROOM_EXPIRED` (§9.4), which already means "this link is no longer valid" — an expired timestamp and
+  a retired node tag are the same thing from the user's point of view.
+
+**Canonical encoding is mandatory, and this is the sharp edge.** 128 bits is not a multiple of 6, so the 22nd character
+carries only 2 significant bits and 4 must-be-zero bits. Sixteen different final characters therefore decode to the same
+UUID. Left unchecked, one room acquires sixteen spellings — and since `signaling` keys rooms by the value it is handed,
+those spellings would become *different rooms*. Two rules close it:
+
+- A canonical token's final character is one of `A`, `Q`, `g`, `w`. Anything else is `INVALID_ROOM_ID`.
+- Edges decode to 16 bytes, validate version 8 and variant `0b10`, and re-encode canonically before the value crosses
+  any boundary. Everything downstream — gRPC, room tables, logs, admission tokens — sees exactly one spelling.
+
+**Case sensitivity is the accepted cost.** base64url distinguishes `TSiE…` from `tsie…`, so a client that lowercases a
+link produces a valid-looking token for a room that does not exist. Rooms are therefore *copied*, not retyped or
+dictated, and the join-by-paste field (§9.11) must reject a mis-cased token rather than case-fold it, since folding
+would silently resolve to a different UUID. A case-insensitive alphabet such as Crockford base32 would avoid this, at
+26 characters instead of 22.
+
+**`ClientId` stays `u64`.** It never appears in a URL and never needs a tag, being scoped to a room that already has a
+home. It is also load-bearing somewhere easy to miss: the SFU stamps forwarded tracks `peer-{client_id}-{stream_id}`
+and the browser recovers the publisher with `/peer-(\d+)/` (`web/js/appcontroller.js`). A hyphenated UUID there would
+break that regex and make the msid ambiguous to split. Keeping it numeric also preserves `Copy` on the hottest type in
+the SFU engine.
+
+**Cost of the room-ID change**, recorded because it is not small: `RoomId` becomes a string type in three repositories —
+`sfu/src/room.rs`, `signaling/src/v2.rs`, and 20 Protobuf fields — and roughly 65 use sites in the SFU engine lose
+`Copy`. Because V2 takes the change outright rather than accepting both shapes (§9.7), the normative V2 room-ID rules
+are *replaced* rather than extended: `RoomIdV2 = U64Decimal` in §8.1 becomes the token grammar above, and the
+canonical-decimal validation in §3.1 and §8.3 applies to `ClientIdV2` only. One format on the wire, one in the URL, one
+in the logs.
+
+### 9.4 Resolving a room to its node
+
+Resolution is a pure function of the path segment and a tag table, evaluated identically on every edge:
+
+```text
+resolve(version, segment) -> Node | Error
+  V1 route  -> §9.7
+  V2 route  -> canonical tagged token -> tag_table[tag(segment)]
+               anything else          -> INVALID_ROOM_ID
+```
+
+V2 accepts **only** minted tokens. In full: decode 22 base64url characters to 16 bytes, reject a non-canonical final
+character, reject a wrong version or variant nibble, **reject an expired token** (§9.3.2), take the leading tag bits —
+the first `T/6` characters, three of them at the chosen width — and look the tag up. The
+lookup has three outcomes, and they must stay distinguishable because they mean different things to the user:
+
+| Tag state | Meaning                                          | Response                                                              |
+|-----------|--------------------------------------------------|------------------------------------------------------------------------|
+| Live      | Node is configured and reachable                 | Route HTTP and `wss_url` to it                                        |
+| Retired   | Node was decommissioned; its rooms died with it  | `ROOM_EXPIRED` — "this meeting link is no longer valid"                |
+| Unknown   | This edge has never heard of the tag             | Fail loudly — almost certainly a stale edge, not an expired link       |
+
+Distinguishing *retired* from *unknown* is what stops a configuration mistake from masquerading as an expired link. It
+also forces one rule: **tags are assigned once and never reused.** Reusing a retired tag would make every old link
+resolve to the new node and silently create a fresh, empty room instead of reporting that the meeting is gone.
+
+A tag names a *deployment slot*, not a process incarnation. A node that crashes and restarts reclaims its tag, so its
+links keep working and simply find an empty room — the same behaviour as today's single-node restart, scoped to 1/N of
+rooms (§9.9).
+
+### 9.5 Minting: where a room is born
+
+Minting is the only moment where the choice of node is **written down permanently**. Routing merely reads that choice;
+minting makes it, and the tag can never be changed afterwards, so a link outlives every opinion that produced it.
+
+That permanence invites an obvious precaution — verify the node is alive before committing — and it is worth seeing why
+that precaution buys almost nothing. A link is dead on arrival in exactly two situations, and they are not equally
+likely to matter:
+
+| The node was… | Effect | Would a mint-time check help? |
+|---------------|--------|-------------------------------|
+| already dead when the link was minted | The creator's own first join fails, seconds later | Yes — but this is the case that fails immediately and visibly |
+| alive at mint, dead later | A link already pasted into a calendar invite stops working | **No.** Nothing at mint time can predict this |
+
+The second row is the one that actually hurts, and no amount of verification prevents it: it is ordinary node failure
+(§9.9), unavoidable in any scheme that puts a home in the ID. Verification only defends the first row — the case whose
+blast radius is one user, one click, and no distributed links. Spending a round trip on every mint to shrink that is a
+poor trade.
+
+**So the mint path does not verify anything synchronously.** A node confirmed healthy one millisecond ago can
+still be gone when the link is opened, so the check narrows a window it can never close — while making the slowest node
+in the fleet the latency of [Generate]. Minting instead reads the health view maintained continuously by §9.6 and
+commits:
+
+```text
+POST /v2/room
+  candidates ← nodes believed live and not draining, ordered by placement policy
+  if none: return 503                      # never mint blind
+  node ← first candidate
+  return base64url(uuid_v8(tag = node.tag, expiry, 74 CSPRNG bits))
+```
+
+**What makes the residual race tolerable is that its failure is loud, immediate and one click from recovery.** A link
+born on a node that has just died fails at its very first use, which in practice is the creator opening it seconds
+later: `AdmitV2` cannot reach the node, the edge reports that the room could not be created, and the user generates
+another link. Nothing is silently corrupted, nothing splits, and no participant is left in a half-working room — the
+worst case is a wasted click, and the browser can retry the mint automatically to spend even that on the user's behalf.
+
+Two rules still hold, because they cost nothing:
+
+- **Never mint blind.** An edge with no node it believes healthy returns 503 rather than picking one at random. This is
+  what makes a cold-started edge wait for its first health result before serving `POST /v2/room` — a startup ordering
+  concern, not a per-request one.
+- **A candidate is disposable until it is returned.** Nothing is created in `signaling` at mint time — the room comes
+  into existence on the first `AdmitV2` (§4.1) — so if the edge learns mid-request that its chosen node is unhealthy,
+  it discards the candidate and takes the next one at zero cost.
+
+The health view is fresher than a bare probe interval suggests, which is the other half of why no synchronous check is
+needed: every `AdmitV2`, `RemoveV2` and `OccupancyV2` an edge sends is itself a liveness signal on that channel
+(§9.6.2), so a node carrying traffic is continuously observed. The periodic probe exists mainly for idle nodes.
+
+**Choosing among the healthy nodes.** Load figures are available (§9.6), so placement can be load-aware. The obvious
+policy is the wrong one:
+
+| Policy                       | Behaviour                                                                                                           |
+|------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| Round-robin / uniform random | No coordination needed and uniform in expectation across M edges. Ignores that rooms differ enormously in size.        |
+| Strict least-loaded          | **Herds.** All M edges read near-identical snapshots, all pick the same "least loaded" node, and pile onto it until the next refresh. |
+| **Power of two choices**     | **Recommended.** Pick two healthy nodes at random, mint on the less loaded. Near-optimal balance with no coordination, no herding, degrading to uniform random when load data is missing or equal. |
+
+One limitation is worth being honest about: **placement balances rooms, not load.** An edge decides where a room is
+born, but its eventual cost is driven by how many people join and whether it upgrades to SFU — decisions taken later,
+by other people, that no policy can influence because the tag is already fixed. A node can go hot because one of its
+rooms grew to fifty participants while its neighbours host fifty empty ones. Using client counts rather than room
+counts as the load signal at least lets later mints steer away from a node that has already grown hot; nothing can move
+the room that made it hot.
+
+### 9.6 Node discovery: two options
+
+An edge needs two different things, and they have **different consistency requirements** — separating them is what
+makes this tractable:
+
+| Question                                            | Requirement                                                                  | Consumed by      |
+|------------------------------------------------------|------------------------------------------------------------------------------|------------------|
+| **Identity** — which tags exist, and at which endpoints | Must be *consistent*. A tag has to mean the same node on every edge, or rooms split. | Resolution (§9.4) |
+| **Liveness and load** — which are serving, how busy    | Must be *fresh*. It does not have to be agreed.                              | Minting (§9.5)   |
+
+Liveness disagreement is harmless here, and that is a direct consequence of §9.2. Health cannot change where an
+existing room goes: it routes by the tag baked into its ID, and there is no alternative destination, since the state
+lives in that node's memory and nowhere else. "Failing over" would not recover the room, it would fabricate a second
+empty one. So health only influences where a *new* room is minted, and two edges holding different opinions are both
+correct.
+
+> **Health gates minting. It never gates routing.**
+
+#### 9.6.1 Option A — a dedicated registry service
+
+A ZooKeeper-style coordination service (ZooKeeper, etcd, or Consul — the mechanism matters more than the product) makes
+the roster self-maintaining:
+
+- Each signaling node registers itself on startup under a well-known prefix, publishing its tag, gRPC and WebSocket
+  endpoints, capacity and drain flag, held by a **session with a TTL**: ZooKeeper ephemeral znodes, etcd leases, Consul
+  service registrations with health checks.
+- If a node dies, its session lapses and the entry disappears **automatically**, with no operator action and no M-way
+  config edit.
+- Edges **watch** the prefix and keep a live roster in memory, so a node added or drained anywhere is reflected
+  everywhere within a watch round trip.
+
+What it buys, concretely:
+
+- **Adding or removing a node stops touching the edges.** This is the main prize, and it grows with M.
+- **Death detection becomes shared and fast** — one authoritative session expiry instead of M independent opinions
+  converging at their own rates.
+- **Drain becomes a flag**, flipped in one place, honoured by every edge's mint pool immediately.
+- **Tag uniqueness can be enforced mechanically** rather than by operator discipline — though this benefit disappears
+  entirely if tags are self-assigned by hashing (§9.3), which is one more reason to prefer the wide tag.
+
+What it costs:
+
+- **Another distributed system to run.** A quorum to size, upgrade, monitor and back up, with its own split-brain
+  behaviour — for a fleet that may be three nodes.
+- **An availability coupling that must be engineered away.** If the registry is down and edges block, a registry outage
+  becomes a service outage. The mitigation is a firm rule: **the registry is never on the request path.** Edges cache
+  the roster, keep serving from the last known good copy indefinitely, and degrade to "cannot add or drain nodes"
+  rather than "cannot serve calls". Routing does not consult it at all, since the tag is in the ID.
+- **It does not make minting exact.** A watch can go stale silently, and a session TTL still lags a real death, so a
+  link can be minted on a node that has just gone. The registry shortens that window; §9.5 explains why the window is
+  tolerable rather than trying to close it.
+
+The decisive observation: under §9.2 the registry buys **operational agility, not correctness**. Routing needs only a
+tag→endpoint table, which is static data; nothing about correctness depends on the roster being globally agreed. (Under
+a hashing scheme the calculus differs sharply — there, node-set agreement *is* a correctness requirement, and a
+registry is worth much more.)
+
+#### 9.6.2 Option B — no external service
+
+Identity comes from configuration, liveness from probing, and both mechanisms already exist in the codebase.
+
+**Identity: static configuration, optionally derived from DNS.** The tag table is a repeatable flag, with today's
+single `--grpc-url`/`--ws-url` remaining valid as the degenerate one-node form:
+
+```text
+--signaling-node C=s3.xxx.xx,https://s3.xxx.xx:50051,wss://s3.xxx.xx:8443/ws
+```
+
+When editing M edges to add a node becomes tiresome, the table can be **derived from DNS** instead: one address record
+per node, re-resolved periodically, with each node's tag computed from its hostname (§9.3). Adding a node becomes
+adding a record, with no redeploy and no numbering convention to maintain — most of Option A's headline benefit, using
+a dependency that §9.8 already requires. TTL skew is safe for the same reason liveness disagreement is: it only grows
+or shrinks a mint pool, while the tag→host mapping is a hash of the hostname and therefore never ambiguous.
+
+**Liveness and load: probe `GetStatus`.** It already exists on the same channel (§8.4) and already returns per-node
+room, client and WebSocket counters, so one periodic call answers "is it up" and "how loaded" together — exactly what
+§9.5 needs. Passive signal comes free alongside it: `src/grpc_client.rs` already builds each channel with
+`connect_lazy()` plus HTTP/2 keepalive, so an edge starts cleanly while nodes are down and observes transport failure
+on its own traffic. A node enters the mint pool when its last probe succeeded, and leaves it when the probe fails, the
+node reports draining, or it was never probed at all.
+
+**Deployment ordering carries the weight that the registry would otherwise carry**, and it is the price of this option:
+
+```text
+adding    node up and serving  →  add its tag to every edge  →  it enters the mint pool
+removing  drop from mint pool  →  drain (wait for its rooms to empty)  →  retire the tag, never reuse
+```
+
+Adding the tag before the node serves would mint links onto a node that does not exist — links that stay broken even
+after it comes up.
+
+#### 9.6.3 Choosing
+
+| | Option A — registry | Option B — no external service |
+|---|---|---|
+| Add/remove a node | Self-announcing | Config edit on M edges, or a DNS record |
+| Death detection | Shared, one session expiry | Per-edge, converges at probe rate |
+| Tag-reuse safety | Enforceable by the registry | Operator discipline |
+| New failure domain | Yes — must be kept off the request path | None |
+| Operational burden | A quorum to run | A config file, or a DNS zone |
+| Correctness dependence | None — agility only | None |
+
+**Start with Option B, and adopt Option A when node churn or M makes config rollout the bottleneck.** Neither is a
+correctness question under §9.2, which is precisely why the cheap option is viable: the room ID already carries the
+answer that a registry would otherwise have to distribute. If Option A is adopted later, the rules that must survive
+are the ones that keep it off the critical path — cache and serve stale, never block a join, and keep the mint-time
+probe.
+
+### 9.7 V1 backward compatibility
+
+V1 is unchanged and stays unchanged: opaque string room IDs, `/r/{roomid}`, `/join/{roomid}`, free-form typed names,
+`messages[]`, `wss_post_url`, and everything else §8.2 specifies. Its IDs are chosen by the client, so they can never
+carry a tag and §9.2 cannot apply to them. Two options cover it, and V1's shape makes the simpler one attractive:
+
+- **Pin V1 to one designated node** (`--v1-node <tag>`). V1 rooms hold at most two members, never reach an SFU (§8.5),
+  and are signaling-light — one node absorbs a large number of them. This removes room→node derivation from the design
+  entirely: no hash function to version, no node-set agreement, no split-room hazard anywhere. The cost is that V1
+  capacity stops scaling with N and V1 gains a single point of failure.
+- **Hash V1 across the node set** with rendezvous hashing (§9.12) if V1 volume justifies scaling it. This reintroduces
+  set agreement — and with it the requirement that every edge hold the same set and a versioned, seed-free hash — but
+  only for V1, where a mis-derived home splits a two-party P2P call that the browser reports immediately as a peer who
+  never arrives, rather than an SFU conference.
+
+Either way the namespaces cannot collide: V1 and V2 are separate room tables reached by different routes (§3.1.1), and
+the V1 table in `signaling` is untouched by the V2 type change since it already keys on opaque strings.
+
+**V2 takes the format change outright.** Existing numeric V2 room IDs are not carried forward — a V2 path segment is
+either a canonical tagged token or an error. Accepting both shapes would mean running derivation alongside tags for V2
+forever, keeping it exposed to exactly the hazards tags remove. V2 has no compatibility obligation to discharge: it is
+this project's own protocol, its links are ephemeral meeting links rather than durable names, and a stale one gives a
+clear `INVALID_ROOM_ID`.
+
+### 9.8 DNS and certificates
+
+| Name                      | Records                  | Used for                                                                                                  |
+|---------------------------|--------------------------|--------------------------------------------------------------------------------------------------------------|
+| `appr.tc`                 | M edge addresses         | Browser HTTP(S). Round-robin is correct and desirable — any edge serves any room.                             |
+| `s1.xxx.xx` … `sN.xxx.xx` | one address each         | Browser WSS and edge→node gRPC. These are what `wss_url` and the tag table point at.                          |
+| `xxx.xx`                  | N addresses (optional)   | Humans and health checks only. **Never** usable as `wss_url`: it would land the browser on an arbitrary node.  |
+| `sfu.rs`                  | K worker addresses       | The optional redirect page only; media is addressed by ICE candidates.                                        |
+
+The per-node names need certificates — a wildcard `*.xxx.xx`, or a SAN list covering `s1…sN`. This replaces today's
+single signaling certificate and is the main operational cost of the whole design.
+
+### 9.9 Failure modes
+
+| Situation                                       | Existing rooms with that tag                                                       | New rooms                            | What the user sees                                       |
+|-------------------------------------------------|-------------------------------------------------------------------------------------|--------------------------------------|------------------------------------------------------------|
+| Configured but never started                    | None exist, if the deployment order of §9.6.2 was followed                           | Never minted there                   | Nothing; capacity is just N−1                              |
+| Crashes and restarts                            | State is lost, but the tag returns: old links resolve and re-create the room empty   | Resume once health confirms          | Reconnect, then find each other again in a fresh room      |
+| Crashes and stays down                          | Unreachable and unrecoverable — the state is gone                                    | Minted elsewhere                     | Room fails; a newly generated link works immediately       |
+| Deliberately retired                            | Tag marked retired, never reused (§9.4)                                              | Never minted there                   | `ROOM_EXPIRED`                                             |
+| Up, but unreachable from *one* edge (partition) | Still alive and serving other edges                                                  | Minted on nodes that edge can reach  | That edge fails closed; a retry may land on another edge   |
+| All nodes down                                  | All unreachable                                                                      | Mint returns 503                     | Service unavailable                                        |
+
+Three of these carry the design's weight:
+
+- **Crash-and-restart is not retirement.** A restarted node answers to the same tag with empty state, so links keep
+  working and find an empty room. Only retirement invalidates links, and only because an operator said so.
+- **Partition is the one case that must fail closed.** An edge that cannot reach a live node returns a retryable error
+  rather than placing the room elsewhere, because the room is alive and serving other edges; a second copy would be the
+  split this section exists to prevent. M edges make this recoverable in practice — the browser's retry re-resolves
+  `appr.tc` and may land on an edge with connectivity, a free benefit of round-robin at the edge tier.
+- **A node that is down costs capacity, not correctness.** Nothing is misrouted and no room splits; the mint pool is
+  smaller until it returns.
+
+### 9.10 Capacity consequences
+
+- **A room never spans nodes.** N scales the *number* of concurrent rooms, not the size of any one room; a single hot
+  room is still bounded by one node's capacity. Cross-node rooms would require node-to-node relay (§9.12).
+- **Partitioned workers must be sized per node.** In the current one-node-per-worker shape, node `si` can upgrade rooms
+  only onto workers registered to `si`, so a node with no ready worker returns `NO_SFU_AVAILABLE` even while another
+  node's workers idle. Size for the worst node: at least two workers each, and prefer K ≥ 2N.
+- **Moving a partitioned worker between nodes is a drain, not a reconfigure.** Repointing `--grpc-url` restarts the
+  process, which yields a new `instance_id` and fails its established rooms (§5).
+- **A pooled worker removes the partition but splits the load view.** Registering to several nodes (§9.1) lets every
+  node place rooms on it, so no node is capacity-starved while another idles. The cost is that each node's
+  `assigned_clients`/`assigned_rooms` counters (§5) count only *its own* rooms, so N nodes independently choosing the
+  "least-loaded" worker can converge on one and oversubscribe it. Two adjustments make pooling safe: place on the
+  worker's **reported** load (`SfuHealth.current_rooms`/`current_clients` are already on the wire, §8.5, and are the
+  only fleet-wide view), and expect that figure to lag concurrent placements from other nodes, so `JoinMember` must be
+  allowed to reject and the upgrade barrier must fail that room cleanly (§4.2). A pooled worker also stops being a
+  single-node failure domain.
+- **Edges are stateless and cheap.** M scales HTTP, TLS and static assets independently of room capacity, which is why
+  M and N need not be equal.
+
+### 9.11 Room selection UI
+
+Minting is only reachable if the UI stops inventing room IDs client-side, so the room-selection page moves to the
+Meet/Webex shape:
+
+- **[Generate]** replaces the random-room button, calls `POST /v2/room`, and shows the returned link with a copy
+  control. The 22-character token is meant to be copied, not read aloud (§9.3).
+- **Keep a join-by-paste field.** Removing free-form input entirely would leave a link as the only way in. The
+  difference from today is that the field *validates* rather than creates: it accepts a canonical token with a known
+  tag and rejects everything else, instead of opening whatever name was typed. It must not repair a mis-cased token —
+  folding case yields a different UUID, so the honest answer is a rejection.
+- V1 keeps its free-form input behind the version checkbox (§6), which is where the two ID shapes stay visibly separate.
+- `RoomSelection.matchRandomRoomPattern` and the `BigInt` validation in `web/js/roomselection.js` are replaced by the
+  token validator; the recently-used list stores tokens and their links.
+
+This is a security improvement, not only a UX one. Today any V2 room ID can be typed into the path, so rooms are
+enumerable by anyone who guesses a number, and the admission token (§7) protects the WebSocket rather than the room's
+existence. Minted-only IDs carry 74 random bits (§9.3) which, with rate limiting, makes enumeration impractical — and
+they expire, so a leaked link stops working on its own.
+
+### 9.12 Alternatives considered
+
+| Alternative                                    | Why not                                                                                                                        |
+|------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| **Rendezvous hashing** for V2 — derive `home(room) = argmax over nodes of H(node_id ‖ room_key)` | Works with no external service and no minting, and remains the option for V1 (§9.7). Rejected as the primary scheme because the mapping depends on the node *set*: changing it remaps ~1/N of rooms, every edge must hold an identical set, and a single stale edge splits rooms silently. It also demands a seed-free, version-pinned hash — Rust's default `RandomState` reseeds per process and would give every edge a different answer. Tags remove all of this. |
+| Shared store (Redis/etcd) for a room→node map  | Solves it, but puts an external service in front of every join and adds an availability dependency the tag scheme does not need. Distinct from §9.6.1, which stores only the *node roster* and stays off the request path. |
+| Sticky L7 load balancer or cookie affinity     | Needs an external balancer, and cannot help the WebSocket: the browser resolves the signaling hostname itself.                    |
+| Node-to-node forwarding (owner node relays)    | Removes the routing requirement but doubles the hop count for every frame and adds a full mesh with its own failure semantics. It is the natural extension if one room must ever exceed one node — not before. |
+
+### 9.13 Implementation seams
+
+The current code is close to this, because room identity is already threaded through both surfaces that need to route:
+
+- `RoomAuthority` (`src/grpc_client.rs`) takes the room ID on **every** method. A routing implementation owning N tonic
+  channels and dispatching on the tag slots in behind the trait with no changes at the call sites in `room_server.rs`.
+- `RoomParameters::build_room_parameters` (`src/params.rs`) already receives `room_id` before it builds `wss_url`;
+  today it returns the single configured value, and would return the home node's URL instead.
+- `GrpcAuthority::connect` already uses `connect_lazy()` with keepalive, so N channels cost nothing until used and an
+  edge starts while nodes are down.
+- New: a `POST /v2/room` mint endpoint, the token codec and validator, the tag table and its health view, and
+  `--signaling-node`/`--v1-node` configuration.
+- `/status` should expose the tag table with each node's last probe result, and a debug route resolving a token to its
+  tag makes routing questions answerable with one curl.
