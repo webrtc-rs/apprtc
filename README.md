@@ -29,36 +29,45 @@
  </a>
 </p>
 <p align="center">
- <strong>AppRTC P2P/SFU Signaling Server in Rust</strong>
+ <strong>AppRTC P2P/SFU Server in Rust</strong>
 </p>
 
 AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation
 supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults
-to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the legacy V1 flow. V2 uses numeric `u64` room/client IDs, namespaced HTTP routes,
+to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the legacy V1 flow. V2 uses numeric `u64`
+room/client IDs, namespaced HTTP routes,
 signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
 offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
-The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe offers and republish after an offer collision. When an SFU room shrinks back to at most two members and stays there for a short dwell (`--downgrade-dwell`, default 2s), signaling automatically downgrades it to direct P2P: it commits P2P with a new signal epoch, tears down the members' SFU legs, and tells the browsers to negotiate directly again. Each browser keeps its SFU connection on screen while the direct one negotiates, so the grid gives way to the full-screen stage only once direct media is ready.
+The first two V2 members use a direct P2P connection. When a third member joins, signaling selects a ready SFU worker
+with sufficient advertised capacity, waits for all three worker-side joins, commits a new signal epoch, and tells the
+existing browsers to create fresh SFU peer connections while their P2P connection remains active. The third browser
+joins directly in SFU mode. Browsers use the polite-peer perfect-negotiation path against authoritative SFU subscribe
+offers and republish after an offer collision. When an SFU room shrinks back to at most two members and stays there for
+a short dwell (`--downgrade-dwell`, default 2s), signaling automatically downgrades it to direct P2P: it commits P2P
+with a new signal epoch, tears down the members' SFU legs, and tells the browsers to negotiate directly again. Each
+browser keeps its SFU connection on screen while the direct one negotiates, so the grid gives way to the full-screen
+stage only once direct media is ready.
 
 The Rust implementation replaces the previous unified Go Collider. The legacy implementation is retained only on the
 repository's `go` branch.
 
 ## Architecture
 
-The repository root is both the `apprtc` package and the Cargo workspace root. The workspace has four Rust crates:
+The repository root is both the `apprtc` package and the Cargo workspace root. The workspace has three Rust crates:
 
-| Crate                                | Responsibility                                                                                                                                                                                                                 |
-|--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`apprtc`](.)                        | Root package containing the standalone `appweb`, `signaling`, and `sfu` binaries plus their runtime adapters: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
-| [`appweb`](appweb)                   | AppRTC HTTP room API, configuration parameters, Jinja templates, static web assets, and a reusable gRPC client for the signaling authority.                                                                                    |
-| [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own. |
-| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by AppWeb, signaling, and SFU workers.                                                                                                                                            |
+| Crate                                | Responsibility                                                                                                                                                                                                                                                                                                                                                           |
+|--------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [`apprtc`](.)                        | Root package containing the standalone `apprtc`, `signaling`, and `sfu` binaries. It owns the HTTP room API, configuration parameters, Jinja templates, the gRPC client for the signaling authority, and every runtime adapter: CLI parsing, TLS listeners, logging, graceful shutdown, browser WebSocket I/O, private gRPC, UDP media I/O, and the Sans-I/O SFU driver. |
+| [`signaling`](signaling)             | Authoritative V1 and V2 P2P/SFU room, client, worker, lifecycle, transition, browser-protocol, token/epoch, replay, and reconnect state — a pure Sans-I/O crate with no sockets, threads, clock, or entropy source of its own.                                                                                                                                           |
+| [`signaling-proto`](signaling-proto) | Generated Protobuf and tonic contract shared by the `apprtc` web server, signaling, and SFU workers.                                                                                                                                                                                                                                                                     |
 
-AppWeb, signaling, and SFU are separate processes and may run on different machines. AppWeb serves HTTP(S) and uses
-concurrent unary gRPC calls over one reusable HTTP/2 channel to submit V1 and V2 admission, removal, occupancy, V1
-injection, and status operations to signaling. Browser WebSocket traffic connects directly to signaling and never passes
-through AppWeb. Each SFU process owns one reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser
-media travels directly to the SFU over ICE/DTLS/SRTP and never passes through AppWeb or signaling.
+The three binaries are separate processes and may run on different machines. `apprtc` is the web server: it serves
+HTTP(S) and the browser application from [`web/`](web), and uses concurrent unary gRPC calls over one reusable HTTP/2
+channel to submit V1 and V2 admission, removal, occupancy, V1 injection, and status operations to signaling. Browser
+WebSocket traffic connects directly to signaling and never passes through `apprtc`. Each SFU process owns one
+reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser media travels directly to the SFU over
+ICE/DTLS/SRTP and never passes through `apprtc` or signaling.
 
 The signaling state is composed from Sans-I/O protocols. `Collider` owns two independent tables — the V1
 string-keyed one and the numeric V2 one that also holds SFU worker state:
@@ -81,11 +90,21 @@ The root `apprtc` package keeps each runtime responsibility in a dedicated modul
 ```text
 src/
 ├── lib.rs                shared certificate loading and TLS listener support
+├── bin/                  the apprtc, signaling, and sfu entry points
+├── room_server.rs        HTTP room API, page routes, and static-asset serving
+├── params.rs             AppRTC room/ICE parameter construction
+├── templates.rs          Jinja index/full/grid page templates loaded from the web root
+├── config.rs             web-server configuration
+├── dashboard.rs          /status counters
+├── grpc_client.rs        reusable gRPC client for the signaling authority
 ├── grpc_server.rs        private signaling gRPC service adapter
 ├── sfu_server.rs         signaling stream, UDP media shards, and Sans-I/O SFU adapter
 ├── signaling_server.rs   command channel and single-owner Collider event loop
 └── ws_server.rs          public browser TCP/TLS, HTTP upgrade, and WebSocket sessions
 ```
+
+The first group belongs to the `apprtc` web-server binary; the rest are the signaling and SFU runtime adapters. The
+browser application it serves lives under [`web/`](web) (`html/`, `js/`, `css/`, `images/`).
 
 [`src/ws_server.rs`](src/ws_server.rs) accepts browser `/ws` connections and converts WebSocket lifecycle
 events and text frames into driver commands. [`src/grpc_server.rs`](src/grpc_server.rs) adapts private
@@ -110,7 +129,8 @@ V1 preserves the legacy AppRTC contract:
 - The second `/join` response returns queued messages in `params.messages`.
 - The stock AppRTC asymmetric signaling flow is preserved: the initiator sends early signaling through `/message`, while
   the callee normally sends through WebSocket.
-- A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately (P2P only; SFU members leave immediately on disconnect).
+- A WebSocket disconnect starts a 10-second reconnect grace period instead of removing the client immediately (P2P only;
+  SFU members leave immediately on disconnect).
 - Root-path and `/_internal` POST/DELETE fallback routes are both supported.
 - V1 identifiers are not restricted to numeric values.
 
@@ -128,7 +148,8 @@ P2P V2 adds:
 
 SFU-capable V2 adds:
 
-- Capacity-aware selection of a ready SFU worker when the third member joins. Eligible workers are ordered by assigned clients, then assigned rooms, then `instance_id`; the room remains pinned to the selected worker.
+- Capacity-aware selection of a ready SFU worker when the third member joins. Eligible workers are ordered by assigned
+  clients, then assigned rooms, then `instance_id`; the room remains pinned to the selected worker.
 - An ordered `JoinMember` barrier for all room members before signaling commits `Upgrading` to `SFU` and increments the
   signal epoch.
 - A fresh browser SFU peer connection while the existing P2P connection remains active; the old P2P connection closes
@@ -147,20 +168,30 @@ SFU-capable V2 adds:
   `sfu-downgrade` control so each browser renegotiates directly. The dwell absorbs brief churn so a third participant
   leaving and rejoining does not flap the room between modes.
 - A symmetric browser handoff in both directions: the outgoing peer connection stays on screen while the incoming one
-  negotiates with the same local tracks. Upgrading keeps the P2P stage until SFU ICE connects; downgrading keeps the grid
+  negotiates with the same local tracks. Upgrading keeps the P2P stage until SFU ICE connects; downgrading keeps the
+  grid
   (holding the retired SFU connection's last frames) until direct media is playable, then returns to the full-screen
   stage. Neither transition reloads the page, replaces the WebSocket, or reacquires the camera and microphone.
-- V2 perfect negotiation in the browser: it is polite toward the SFU, rolls back a colliding local offer, answers the SFU offer with its `requestid`, and creates a fresh publish offer afterward.
+- V2 perfect negotiation in the browser: it is polite toward the SFU, rolls back a colliding local offer, answers the
+  SFU offer with its `requestid`, and creates a fresh publish offer afterward.
 
-Cross-worker migration of an established room is intentionally deferred. A disconnected worker may resume its rooms only by reconnecting with the same process-incarnation `instance_id` during the recovery grace period; otherwise signaling fails those rooms with `room-failed` rather than moving live WebRTC transports.
+Cross-worker migration of an established room is intentionally deferred. A disconnected worker may resume its rooms only
+by reconnecting with the same process-incarnation `instance_id` during the recovery grace period; otherwise signaling
+fails those rooms with `room-failed` rather than moving live WebRTC transports.
 
 ## Current limitations
 
-- The JavaScript `SignalingChannel` does not yet automatically reconnect a closed browser WebSocket. The signaling authority preserves P2P membership during its 10-second grace, but exploiting that grace currently requires a new registration attempt by the client.
+- The JavaScript `SignalingChannel` does not yet automatically reconnect a closed browser WebSocket. The signaling
+  authority preserves P2P membership during its 10-second grace, but exploiting that grace currently requires a new
+  registration attempt by the client.
 - An SFU-member WebSocket disconnect intentionally initiates immediate member leave rather than browser reconnect grace.
-- A committed room whose SFU worker is lost becomes `Failed` and emits `room-failed`; automatic failed-room cleanup and transparent browser rejoin are not implemented.
-- Advertised worker capacity is enforced when selecting a worker for the initial three-member upgrade. Later joins remain pinned to that worker and are serialized through `JoinMember`, but the authority does not currently pre-check `max_clients` again.
-- Service gRPC supports server-authenticated TLS but not mTLS/client authentication. Restrict the gRPC listener to trusted hosts.
+- A committed room whose SFU worker is lost becomes `Failed` and emits `room-failed`; automatic failed-room cleanup and
+  transparent browser rejoin are not implemented.
+- Advertised worker capacity is enforced when selecting a worker for the initial three-member upgrade. Later joins
+  remain pinned to that worker and are serialized through `JoinMember`, but the authority does not currently pre-check
+  `max_clients` again.
+- Service gRPC supports server-authenticated TLS but not mTLS/client authentication. Restrict the gRPC listener to
+  trusted hosts.
 
 ## Build and test
 
@@ -174,9 +205,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The root `Cargo.toml` defines both the `apprtc` package and the workspace. Commands for the root package can therefore omit `-p apprtc`; use `--workspace` when a command must cover `appweb`, `signaling`, and `signaling-proto` as well.
+The root `Cargo.toml` defines both the `apprtc` package and the workspace. Commands for the root package can therefore
+omit `-p apprtc`; use `--workspace` when a command must also cover `signaling` and `signaling-proto`.
 
-The integration tests are black-box clients of real standalone AppWeb and signaling TLS servers:
+The integration tests are black-box clients of real standalone `apprtc` and signaling TLS servers:
 
 ```bash
 # 1. Start signaling.
@@ -188,8 +220,8 @@ cargo run --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls &
 
-# 3. Start AppWeb.
-cargo run --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+# 3. Start the apprtc web server.
+cargo run --bin apprtc -- --host-ip 127.0.0.1 --port 8080 --web-root web \
   --public-url https://127.0.0.1:8080 --ws-url wss://127.0.0.1:8081/ws \
   --grpc-url https://127.0.0.1:50051 --insecure-tls --tls &
 
@@ -197,22 +229,24 @@ cargo run --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
 cargo test --test '*' -- --nocapture
 
 # 5. Stop all three services.
-kill $(pgrep -f "target/debug/(appweb|signaling|sfu)") || true
+kill $(pgrep -f "target/debug/(apprtc|signaling|sfu)") || true
 ```
 
 [`scripts/start.sh`](scripts/start.sh) and [`scripts/stop.sh`](scripts/stop.sh) run that sequence locally over TLS,
 rotating and writing per-process logs into `/tmp/logs/`.
 
-CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when the job finishes. The black-box suite covers V1 compatibility, V2 P2P relay, the real AppWeb→signaling→SFU third-member join barrier, the P2P→SFU→P2P mode round trip, three-client SFU data channels, and RTP/RTCP media forwarding.
+CI performs the same sequence with a release build in `.github/workflows/tests.yml` and uploads the service logs when
+the job finishes. The black-box suite covers V1 compatibility, V2 P2P relay, the real apprtc→signaling→SFU third-member
+join barrier, the P2P→SFU→P2P mode round trip, three-client SFU data channels, and RTP/RTCP media forwarding.
 
 ### Reading the logs as a sequence diagram
 
 [`scripts/log2seq.py`](scripts/log2seq.py) merges the three (or more) INFO logs by timestamp and renders one sequence
-diagram whose lanes are each browser client, AppWeb, signaling, and each SFU worker:
+diagram whose lanes are each browser client, `apprtc`, signaling, and each SFU worker:
 
 ```bash
 scripts/log2seq.py \
-  --appweb /tmp/logs/appweb.log \
+  --apprtc /tmp/logs/apprtc.log \
   --signaling /tmp/logs/signaling.log \
   --sfu /tmp/logs/sfu.log \
   -f html -o seq.html
@@ -224,7 +258,7 @@ offer/answer has a clickable `[+]` that expands its full SDP inline. `--room` li
 
 ## Run over HTTP and WebSocket
 
-Run signaling, one SFU worker, and AppWeb separately from the repository root:
+Run signaling, one SFU worker, and apprtc separately from the repository root:
 
 ```bash
 cargo run --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
@@ -232,21 +266,21 @@ cargo run --bin signaling -- --host-ip 127.0.0.1 --port 8081 \
 cargo run --bin sfu -- --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url http://127.0.0.1:50051
-cargo run --bin appweb -- --host-ip 127.0.0.1 --port 8080 --web-root appweb \
+cargo run --bin apprtc -- --host-ip 127.0.0.1 --port 8080 --web-root web \
   --public-url http://127.0.0.1:8080 --ws-url ws://127.0.0.1:8081/ws \
   --grpc-url http://127.0.0.1:50051
 ```
 
-AppWeb prints:
+`apprtc` prints:
 
 ```text
-AppWeb listening on http://127.0.0.1:8080/
+AppRTC listening on http://127.0.0.1:8080/
 ```
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in a browser.
 
 `--host-ip` controls the bind address for each process. In the signaling process it applies to both the browser
-WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. AppWeb's
+WebSocket listener and the private gRPC listener; `--port` and `--grpc-port` select their respective ports. `apprtc`'s
 `--public-url` controls the browser-facing HTTP origin, `--ws-url` controls the browser-facing WebSocket URL and must
 include `/ws`, and `--grpc-url` independently selects the private signaling gRPC origin.
 
@@ -262,10 +296,10 @@ cargo run --bin sfu -- \
   --host-ip 127.0.0.1 \
   --media-port-min 35000 --media-port-max 35000 \
   --grpc-url https://127.0.0.1:50051 --insecure-tls
-cargo run --bin appweb -- \
+cargo run --bin apprtc -- \
   --host-ip 127.0.0.1 \
   --port 8080 \
-  --web-root appweb \
+  --web-root web \
   --public-url https://127.0.0.1:8080 \
   --ws-url wss://127.0.0.1:8081/ws \
   --grpc-url https://127.0.0.1:50051 \
@@ -295,35 +329,36 @@ cargo run --bin sfu -- \
   --media-port-min 3478 --media-port-max 3497 \
   --grpc-url https://sfu.example.com:50051
 
-cargo run --bin appweb -- \
-  --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root appweb \
+cargo run --bin apprtc -- \
+  --host-ip 0.0.0.0 --public-url https://apprtc.example.com --port 443 --web-root web \
   --ws-url wss://sfu.example.com/ws --grpc-url https://sfu.example.com:50051 --tls \
   --certificate /path/to/fullchain.pem --private-key /path/to/privkey.pem
 ```
 
 ## Command-line options
 
-Run `cargo run --bin appweb -- --help`, `cargo run --bin signaling -- --help`, or `cargo run --bin sfu -- --help` for the authoritative lists.
+Run `cargo run --bin apprtc -- --help`, `cargo run --bin signaling -- --help`, or `cargo run --bin sfu -- --help` for
+the authoritative lists.
 
 | Option                         |                  Default | Description                                                                                      |
 |--------------------------------|-------------------------:|--------------------------------------------------------------------------------------------------|
 | `--host-ip <HOST-IP>`          |              `127.0.0.1` | Local TCP or UDP bind address (all binaries).                                                    |
-| `--public-url <URL>`           |                     none | Required browser-facing HTTP(S) origin (`appweb`).                                               |
-| `-p, --port <PORT>`            |            `8080`/`8081` | AppWeb HTTP(S), signaling WS(S), or SFU redirect (`--redirect-url`) port.                        |
-| `--web-root <PATH>`            |                 `appweb` | Static asset directory (`appweb`).                                                               |
-| `--tls`                        |                      off | Serve AppWeb HTTPS, both signaling TLS listeners, or the optional SFU HTTPS redirect.             |
+| `--public-url <URL>`           |                     none | Required browser-facing HTTP(S) origin (`apprtc`).                                               |
+| `-p, --port <PORT>`            |            `8080`/`8081` | `apprtc` HTTP(S), signaling WS(S), or SFU redirect (`--redirect-url`) port.                      |
+| `--web-root <PATH>`            |                    `web` | Static asset directory served by `apprtc`.                                                       |
+| `--tls`                        |                      off | Serve `apprtc` HTTPS, both signaling TLS listeners, or the optional SFU HTTPS redirect.          |
 | `--certificate <PATH>`         |      bundled certificate | PEM certificate chain used with `--tls` by the relevant listener.                                |
 | `--private-key <PATH>`         |              bundled key | PEM private key used with `--tls` by the relevant listener.                                      |
-| `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`appweb`).                               |
-| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`appweb` and `sfu`).                                              |
-| `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`appweb`, `sfu`).                           |
+| `--ws-url <URL>`               |                     none | Public browser signaling WebSocket URL ending in `/ws` (`apprtc`).                               |
+| `--grpc-url <URL>`             | `http://127.0.0.1:50051` | Private signaling gRPC origin (`apprtc` and `sfu`).                                              |
+| `--insecure-tls`               |                      off | Disable gRPC verification for local self-signed TLS (`apprtc`, `sfu`).                           |
 | `--grpc-port <PORT>`           |                  `50051` | Private gRPC listener port (`signaling`).                                                        |
-| `--downgrade-dwell <SECONDS>`  |                      `2` | Seconds an SFU room dwells at two members before downgrading to direct P2P (`signaling`).         |
-| `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`appweb`).                                                                      |
-| `--ice-server-base-url <URL>`  |            AppWeb origin | External ICE credential service origin (`appweb`).                                               |
-| `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`appweb`).                                               |
-| `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`appweb`).                                              |
-| `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`appweb`).                                                |
+| `--downgrade-dwell <SECONDS>`  |                      `2` | Seconds an SFU room dwells at two members before downgrading to direct P2P (`signaling`).        |
+| `--ice-server-url <URLS>`      |                    empty | ICE server URLs (`apprtc`).                                                                      |
+| `--ice-server-base-url <URL>`  |            apprtc origin | External ICE credential service origin (`apprtc`).                                               |
+| `--ice-server-api-key <KEY>`   |                    empty | API key for the ICE credential service (`apprtc`).                                               |
+| `--header-message <TEXT>`      |                    empty | Banner displayed by the web application (`apprtc`).                                              |
+| `--bypass-join-confirmation`   |                      off | Skip the browser ready-to-join prompt (`apprtc`).                                                |
 | `--media-public-ip <IP>`       |              `--host-ip` | ICE candidate address advertised by `sfu`; set only when it differs from the bind address (NAT). |
 | `--redirect-url <URL>`         |                    empty | When set, `sfu` runs a server on `--host-ip:--port` that redirects every request here.           |
 | `--media-port-min <PORT>`      |                   `3478` | First UDP media port owned by `sfu`.                                                             |
@@ -338,7 +373,7 @@ Run `cargo run --bin appweb -- --help`, `cargo run --bin signaling -- --help`, o
 Example ICE configuration:
 
 ```bash
-cargo run --bin appweb -- \
+cargo run --bin apprtc -- \
   --ice-server-url stun:stun.l.google.com:19302 \
   --ice-server-url turn:turn.example.com:3478
 ```
@@ -358,16 +393,16 @@ cargo run --bin appweb -- \
 | `POST /{roomid}/{clientid}`                       | V1 `wss_post_url` fallback: inject a raw signaling message.                            |
 | `DELETE /{roomid}/{clientid}`                     | V1 `wss_post_url` fallback: remove the client.                                         |
 | `POST` or `DELETE /_internal/{roomid}/{clientid}` | Compatibility alias for the fallback bridge.                                           |
-| `GET /v2/r/{roomid}`                              | Render the V2 P2P/SFU call page; `roomid` must be canonical decimal `u64`.              |
-| `POST /v2/join/{roomid}`                           | Admit a V2 member; a third member initiates the SFU join barrier.                       |
-| `POST /v2/leave/{roomid}/{clientid}`               | Remove a V2 member using its bearer admission token.                                   |
-| `GET /v2/params`                                   | Return room-independent V2 parameters and ICE configuration.                           |
+| `GET /v2/r/{roomid}`                              | Render the V2 P2P/SFU call page; `roomid` must be canonical decimal `u64`.             |
+| `POST /v2/join/{roomid}`                          | Admit a V2 member; a third member initiates the SFU join barrier.                      |
+| `POST /v2/leave/{roomid}/{clientid}`              | Remove a V2 member using its bearer admission token.                                   |
+| `GET /v2/params`                                  | Return room-independent V2 parameters and ICE configuration.                           |
 
-Static files under `appweb/js`, `appweb/css`, `appweb/images`, and `appweb/html` are served by the same process.
+Static files under `web/js`, `web/css`, `web/images`, and `web/html` are served by the same process.
 
 ### Join response
 
-A successful join returns the legacy shape consumed by `appweb/js/call.js`:
+A successful join returns the legacy shape consumed by `web/js/call.js`:
 
 ```json
 {
@@ -453,7 +488,8 @@ Successful registration returns an authoritative snapshot before any queued sign
 }
 ```
 
-Every V2 signaling message carries the current epoch. The inner `msg` remains an opaque JSON string and fully supports SDP, trickle ICE, and end-of-candidates:
+Every V2 signaling message carries the current epoch. The inner `msg` remains an opaque JSON string and fully supports
+SDP, trickle ICE, and end-of-candidates:
 
 ```json
 {
@@ -464,7 +500,8 @@ Every V2 signaling message carries the current epoch. The inner `msg` remains an
 ```
 
 The server may send `p2p-promote`, `sfu-upgrade`, `sfu-downgrade`, and `room-failed` controls. `sfu-upgrade` and
-`sfu-downgrade` carry the room's new epoch; `sfu-downgrade` and `p2p-promote` also carry `is_initiator`, which elects the
+`sfu-downgrade` carry the room's new epoch; `sfu-downgrade` and `p2p-promote` also carry `is_initiator`, which elects
+the
 single direct offerer:
 
 ```json
@@ -480,9 +517,14 @@ In SFU mode, subscribe offers contain a decimal-string `requestid`; the browser 
 
 ## Multiple SFU workers
 
-Each SFU process opens one `OpenSfuSession` stream and must have a unique process-incarnation `instance_id` (the binary generates one when `--instance-id` is omitted). Signaling considers only connected workers whose latest health state is `Ready` and whose advertised room/client capacity can accept the initial three-member assignment.
+Each SFU process opens one `OpenSfuSession` stream and must have a unique process-incarnation `instance_id` (the binary
+generates one when `--instance-id` is omitted). Signaling considers only connected workers whose latest health state is
+`Ready` and whose advertised room/client capacity can accept the initial three-member assignment.
 
-Among eligible workers, signaling chooses the lowest tuple `(assigned_clients, assigned_rooms, instance_id)`. This is least-loaded placement, not round-robin. Once selected, every member and all signaling/media state for that room remain affine to that worker. Later rooms can be placed on other workers, but an established room is not split or automatically migrated.
+Among eligible workers, signaling chooses the lowest tuple `(assigned_clients, assigned_rooms, instance_id)`. This is
+least-loaded placement, not round-robin. Once selected, every member and all signaling/media state for that room remain
+affine to that worker. Later rooms can be placed on other workers, but an established room is not split or automatically
+migrated.
 
 ## Status endpoint
 

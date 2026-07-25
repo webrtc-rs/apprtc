@@ -2,31 +2,31 @@
 
 ## Background and motivation
 
-This architecture supports two browser protocols. V1 provides two-party P2P compatibility with HTTP join/leave, initiator election, queued messages, reconnect grace, and opaque string room/client IDs. V2 adds numeric `u64` IDs, token-bound browser registration, P2P→SFU mode transition, and multi-party SFU media. The Rust `sfu` crate is a signaling-agnostic `sansio::Protocol` media engine whose `RoomId` and `ClientId` are `u64` and whose `SFUEvent` API accepts joins, SDP, ICE candidates, and leaves.
+This architecture supports two browser protocols. V1 provides two-party P2P compatibility with HTTP join/leave, initiator election, queued messages, reconnect grace, and opaque string room/client IDs. V2 adds numeric `u64` IDs, token-bound browser registration, P2P↔SFU mode transitions, and multi-party SFU media. The Rust `sfu` crate is a signaling-agnostic `sansio::Protocol` media engine whose `RoomId` and `ClientId` are `u64` and whose `SFUEvent` API accepts joins, SDP, ICE candidates, and leaves.
 
 The current implementation preserves the V1 contract for existing AppRTC-compatible clients while adding a V2 protocol that starts as two-party P2P, upgrades to multi-party SFU media, and downgrades back to direct P2P once the room has shrunk to two members again. One signaling authority owns room state and routes browser SDP/ICE either to the P2P peer or to the assigned SFU worker.
 
-Browsers use long-lived, full-duplex WebSocket signaling channels, AppWeb uses unary gRPC calls multiplexed over a reusable HTTP/2 channel, and SFU workers use long-lived bidirectional gRPC streams. The media plane remains WebRTC between browser and SFU.
+Browsers use long-lived, full-duplex WebSocket signaling channels, `apprtc` uses unary gRPC calls multiplexed over a reusable HTTP/2 channel, and SFU workers use long-lived bidirectional gRPC streams. The media plane remains WebRTC between browser and SFU.
 
-The implementation is organized as four core Rust crates plus the SFU crate:
+The implementation is organized as three core Rust crates plus the SFU crate, and deployed as three processes:
 
 | Component         | Network role                                              | Owns                                                                                                                 |
 |-------------------|-----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
-| `apprtc`          | HTTP, WebSocket, gRPC, and UDP runtime adapters            | root Cargo package with standalone `appweb`, `signaling`, and `sfu` binaries, TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
-| `appweb`          | HTTP server; gRPC **client** of `signaling`               | app/web server, static assets, HTTP room API, ICE config, templates, client-id minting                               |
+| `apprtc`          | root Cargo package; also the web-server binary            | the HTTP room API, static assets, ICE config, templates, and client-id minting, plus the standalone `apprtc`, `signaling`, and `sfu` binaries and every runtime adapter: TLS listeners, browser WebSocket sessions, gRPC adapters, Collider/SFU drivers, logging, and graceful shutdown |
 | `signaling`       | no network role; Sans-I/O signaling authority             | authoritative V1/V2 room model, queue/reconnect grace, P2P relay, SFU worker registry, room assignment, upgrade barrier, and recovery state |
-| `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated AppWeb/signaling/SFU gRPC request, response, command, result, and event types                              |
-| `sfu`             | no network role; Sans-I/O WebRTC media engine             | per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding; the `apprtc` `sfu` binary supplies UDP and gRPC I/O |
+| `signaling-proto` | no network role; shared Protobuf/tonic schema             | generated web-server/signaling/SFU gRPC request, response, command, result, and event types                          |
+| `sfu`             | no network role; Sans-I/O WebRTC media engine             | per-client WebRTC state, SDP/ICE application, RTP/RTCP forwarding; the `sfu` binary in the root package supplies UDP and gRPC I/O |
 
-`appweb` and `signaling` are separate crates; the standalone `appweb` and `signaling` processes communicate through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while AppWeb and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
+Throughout this document `apprtc` names the web-server process — the gRPC **client** of `signaling` — as distinct from
+AppRTC the project. It and `signaling` are separate processes communicating through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol, even though the web server now lives in the root package rather than a crate of its own. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while `apprtc` and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
-The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. The crate root `src/lib.rs` provides the shared certificate loading and TLS listener support used by the binaries.
+The repository root is both the Cargo workspace and the `apprtc` runtime package. Within its root `src/` directory, `room_server.rs`, `params.rs`, `templates.rs`, `config.rs`, and `grpc_client.rs` are the web server; `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The browser application it serves lives under `web/`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. The crate root `src/lib.rs` provides the shared certificate loading and TLS listener support used by the binaries.
 
 ## 1. Topology and authority
 
 ```mermaid
 flowchart LR
-    B[Browser] <-- HTTP --> A[appweb - HTTP server]
+    B[Browser] <-- HTTP --> A[apprtc - HTTP server]
     B <-- WebSocket register/send --> S[signaling - WS server]
     A <-- unary gRPC --> S
     F1[SFU - worker 1] <-- bidirectional gRPC session --> S
@@ -35,7 +35,7 @@ flowchart LR
     B <-- WebRTC --> F1
 ```
 
-`appweb` serves the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns separate V1 and V2 room tables, so the same visible text (for example `"42"`) can independently identify a V1 string-keyed room and V2 numeric room:
+`apprtc` serves the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns separate V1 and V2 room tables, so the same visible text (for example `"42"`) can independently identify a V1 string-keyed room and V2 numeric room:
 
 ```text
 V1RoomTable: Map<String, V1Room<String>>
@@ -92,13 +92,13 @@ It must not require a browser, hub, or wire-protocol revision.
 
 ## 3. Signaling endpoints and authenticated roles
 
-Browsers reach the public `wss://signaling/ws` endpoint. AppWeb and SFU processes reach a separate private HTTP/2 listener implementing `signaling.v2.SignalingService`. V2 browser credentials are cryptographically random admission tokens created by `signaling` during `AdmitV2` and returned to the browser through AppWeb; the V1 browser path deliberately retains its current tokenless framing. The current gRPC transport supports server-authenticated TLS but not client authentication. `RequestContext.app_id` validates protocol role, not caller identity, so deployments must restrict the gRPC listener to trusted AppWeb/SFU hosts with host and provider firewalls. mTLS remains future hardening.
+Browsers reach the public `wss://signaling/ws` endpoint. `apprtc` and SFU processes reach a separate private HTTP/2 listener implementing `signaling.v2.SignalingService`. V2 browser credentials are cryptographically random admission tokens created by `signaling` during `AdmitV2` and returned to the browser through `apprtc`; the V1 browser path deliberately retains its current tokenless framing. The current gRPC transport supports server-authenticated TLS but not client authentication. `RequestContext.app_id` validates protocol role, not caller identity, so deployments must restrict the gRPC listener to trusted `apprtc`/SFU hosts with host and provider firewalls. mTLS remains future hardening.
 
 | Role              | Transport/API                                      | Session or request identity                                      | Traffic after admission or registration                                               |
 |-------------------|----------------------------------------------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------|
 | Browser V1        | JSON WebSocket `/ws`                               | `{cmd:"register", roomid, clientid}`                            | Existing `{cmd:"send", msg}` and `{msg}` framing, with no new required field          |
 | Browser V2        | JSON WebSocket `/ws`                               | `{cmd:"register", roomid, clientid, ver:2, token}`              | Same `send`/`msg` framing plus required `epoch` and V2-only controls                   |
-| AppWeb            | Unary `SignalingService` RPCs                      | `RequestContext{APP_ID_APPWEB, instance_id, request_id}`         | `AdmitV1/V2`, `RemoveV1/V2`, `OccupancyV1/V2`, `InjectV1`, and `GetStatus`             |
+| apprtc            | Unary `SignalingService` RPCs                      | `RequestContext{APP_ID_APPWEB, instance_id, request_id}`         | `AdmitV1/V2`, `RemoveV1/V2`, `OccupancyV1/V2`, `InjectV1`, and `GetStatus`             |
 | SFU worker        | Bidirectional `OpenSfuSession` RPC                 | First stream message is `RegisterSfu` with `APP_ID_SFU` context  | Ordered commands/results and reliable worker events/acknowledgements                   |
 
 The hub validates a service role before processing any other command. A V2 browser may register only after an `admit`
@@ -165,7 +165,7 @@ Protocol version is selected by the HTTP route and WebSocket registration frame,
 | Room and client ID wire form | Existing strings, unchanged                                                                                           | Canonical decimal strings representing `u64`                                                                                                                                                                               |
 | SFU routing                  | Never                                                                                                                 | Only after an explicit P2P→SFU transition                                                                                                                                                                                  |
 
-The Rust `appweb` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`, `/v1alpha/iceconfig`, `/r/{room}`, and
+The Rust `apprtc` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`, `/v1alpha/iceconfig`, `/r/{room}`, and
 `wss_post_url` behavior. They translate V1 HTTP injection/fallback calls into an internal app→hub `inject` control frame
 while preserving the V1 HTTP response and WebSocket payloads. The Rust `signaling` hub preserves the V1 queue and
 reconnect-grace behavior.
@@ -243,8 +243,8 @@ corresponding `SFUEvent::SessionDescription`.
 
 ### 4.1 P2P, one or two members
 
-1. Browser calls `POST /join/{room}` on `appweb`.
-2. `appweb` calls the appropriate `AdmitV1` or `AdmitV2` unary gRPC method with its process `instance_id` and a nonzero `request_id`.
+1. Browser calls `POST /join/{room}` on `apprtc`.
+2. `apprtc` calls the appropriate `AdmitV1` or `AdmitV2` unary gRPC method with its process `instance_id` and a nonzero `request_id`.
 3. `signaling` creates the member, elects the first member as initiator, and replies.
 4. Browser registers its own WebSocket with `signaling`.
 5. Every browser `{cmd:"send"}` is relayed to the other member; early messages queue and flush when that member
@@ -263,7 +263,7 @@ client.
 ```mermaid
 sequenceDiagram
     participant C as Third browser C
-    participant AR as appweb
+    participant AR as apprtc
     participant S as signaling
     participant F as assigned SFU worker
     C->>AR: POST join(room)
@@ -359,7 +359,7 @@ Later joins to an existing SFU room do not run the global selector again and can
 - Bound every queue: browser outbound queue, worker outbound queue, per-room command backlog, and SDP/ICE frame size.
   Backpressure is a room/client failure, never a reason to block the media UDP loop.
 
-The SFU gRPC session, like the AppWeb unary API, is the cross-process binding of the internal authority boundary. The current repository ships only separate `signaling` and `sfu` processes; there is no all-in-one production binary.
+The SFU gRPC session, like the apprtc unary API, is the cross-process binding of the internal authority boundary. The current repository ships only separate `signaling` and `sfu` processes; there is no all-in-one production binary.
 
 A single `signaling` hub instance owning all authoritative room state is a first-release deployment assumption. Hub
 replication, partitioning, and failover are out of scope for this document; the room-affine assignment policy above is
@@ -371,7 +371,7 @@ The implemented room-selection page exposes a checked **V2 P2P/SFU** checkbox, s
 
 ### 6.1 One browser application, two layouts
 
-`appweb/html/full_template.html` is the P2P layout baseline: one remote participant occupies the full-screen stage and the existing self-view, device controls, mute-video, mute-audio, hangup, status, and error UI retain their behavior. `appweb/html/grid_template.html` is included by the shared page and supplies the SFU grid container. JavaScript/CSS switches between the existing full-screen remote video and responsive per-publisher grid without loading a second application or page.
+`web/html/full_template.html` is the P2P layout baseline: one remote participant occupies the full-screen stage and the existing self-view, device controls, mute-video, mute-audio, hangup, status, and error UI retain their behavior. `web/html/grid_template.html` is included by the shared page and supplies the SFU grid container. JavaScript/CSS switches between the existing full-screen remote video and responsive per-publisher grid without loading a second application or page.
 
 These are layouts of one call session, not separate applications. A P2P→SFU or SFU→P2P transition must not reload the
 page, replace the signaling socket, reacquire camera/microphone, or reset the selected devices/mute state. Common
@@ -456,7 +456,7 @@ The server's `registered` snapshot is suitable for P2P re-registration during gr
 - Remaining reliability work: bound browser SDP/ICE queues and explicitly ignore callbacks from retired transport generations.
 - Current `room-failed` behavior surfaces the failure through the call error callback. Desired follow-up behavior is to tear down transports, clean up failed authority state, and support a fresh admission without reacquiring devices.
 
-`appweb` continues to expose `/join`, `/leave`, `/params`, `/v1alpha/iceconfig`, room pages, and static assets. It
+`apprtc` continues to expose `/join`, `/leave`, `/params`, `/v1alpha/iceconfig`, room pages, and static assets. It
 becomes a thin HTTP/gRPC adapter: all room mutations round-trip to `signaling`; it has no second occupancy or
 initiator model.
 
@@ -464,7 +464,7 @@ initiator model.
 
 - Current browser authorization binds each random V2 admission token to `(roomid, clientid)`, validates it during WebSocket registration and authenticated HTTP leave, and invalidates it when membership is removed. P2P members can re-register during reconnect grace; an SFU-member WebSocket disconnect initiates immediate worker leave/removal instead. Failed-room cleanup/token invalidation is not yet implemented.
 - Current service-channel protection uses server-authenticated TLS plus network firewalls. `app_id` is a typed role assertion but is not cryptographic authentication.
-- Required production hardening is mTLS identities for AppWeb/SFU roles and browser `Origin` validation. These are not implemented by the current runtime.
+- Required production hardening is mTLS identities for apprtc/SFU roles and browser `Origin` validation. These are not implemented by the current runtime.
 - Validate V2 `u64` room/client IDs, request ownership, room assignment, command order, bounded queues, and lifecycle/assignment epochs before forwarding; leave V1 ID strings opaque.
 - Run a V1 wire-compatibility suite covering `call.js`, `/join` params/messages, initiator `/message`, `wss_post_url`
   POST/DELETE fallback, queued-offer flush, reconnect grace, and `FULL` at the third join.
@@ -577,9 +577,9 @@ V2 uses a separate route namespace and numeric room table so that a V1 client ca
 | `POST /v2/leave/{roomid}/{clientid}`   | empty; both IDs must be `U64Decimal`; `Authorization: Bearer <admission_token>`     | `{result:"SUCCESS"}` or an ID/authorization/worker error. |
 | `GET /v2/params`, `GET /v2/r/{roomid}` | V2 validation                                                                      | V2 configuration and room-page response; `/v2/params` carries ICE/TURN configuration. |
 
-There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `appweb` as a random `u64`, returned
-as `ClientIdV2`, and is not supplied by the browser at join time. `appweb` holds no room state, so uniqueness is
-enforced by the hub: an `admit` that collides with a live member returns `DUPLICATE_CLIENT` and `appweb` retries with a fresh ID up to eight times. A third join with no eligible worker returns `NO_SFU_AVAILABLE`. Later joins remain affine to the assigned worker and wait for `MemberJoined`. `is_initiator` in the join params is present only when `mode` is `"p2p"` and omitted otherwise, mirroring the `registered` rule.
+There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `apprtc` as a random `u64`, returned
+as `ClientIdV2`, and is not supplied by the browser at join time. `apprtc` holds no room state, so uniqueness is
+enforced by the hub: an `admit` that collides with a live member returns `DUPLICATE_CLIENT` and `apprtc` retries with a fresh ID up to eight times. A third join with no eligible worker returns `NO_SFU_AVAILABLE`. Later joins remain affine to the assigned worker and wait for `MemberJoined`. `is_initiator` in the join params is present only when `mode` is `"p2p"` and omitted otherwise, mirroring the `registered` rule.
 
 #### WebSocket
 
@@ -624,9 +624,9 @@ send `{type:"bye"}` to the worker path. The hub then owns the ordered worker `le
 subscribe re-offers. After an `sfu-downgrade` control the envelope is unchanged again — only the destination reverts from
 the worker to the remaining browser — and the member whose control carried `is_initiator:true` is the sole offerer.
 
-### 8.4 AppWeb unary gRPC API
+### 8.4 apprtc unary gRPC API
 
-`appweb` keeps HTTP request/response compatibility but delegates every room query and mutation to `signaling.v2.SignalingService` through concurrent unary RPCs over one reusable tonic HTTP/2 channel. Browser `send`/`msg` relay traffic still terminates at signaling's public `/ws` endpoint and never routes through AppWeb. The normative schema is `signaling-proto/proto/signaling.v2.proto`; both processes compile against its generated tonic types.
+`apprtc` keeps HTTP request/response compatibility but delegates every room query and mutation to `signaling.v2.SignalingService` through concurrent unary RPCs over one reusable tonic HTTP/2 channel. Browser `send`/`msg` relay traffic still terminates at signaling's public `/ws` endpoint and never routes through apprtc. The normative schema is `signaling-proto/proto/signaling.v2.proto`; both processes compile against its generated tonic types.
 
 ```proto
 service SignalingService {
@@ -642,7 +642,7 @@ service SignalingService {
 }
 ```
 
-Every AppWeb request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id, request_id}`. `instance_id` is generated once per process incarnation. `request_id` is a nonzero `uint64`, allocated monotonically within that instance and retained if a caller retries the same logical operation. Signaling caches the most recent 4096 completed AppWeb operations: an identical `(instance_id, request_id)` retry returns the cached domain result without repeating the room mutation, while reuse of that key for different operation content returns gRPC `ALREADY_EXISTS`. Every application response carries `ResponseContext.request_id` copied from its request and selects exactly one typed `result` arm. Expected room-domain failures use the response `Error` message; malformed requests, authorization failure, deadline expiry, and unavailable transport use native gRPC status codes.
+Every apprtc request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id, request_id}`. `instance_id` is generated once per process incarnation. `request_id` is a nonzero `uint64`, allocated monotonically within that instance and retained if a caller retries the same logical operation. Signaling caches the most recent 4096 completed apprtc operations: an identical `(instance_id, request_id)` retry returns the cached domain result without repeating the room mutation, while reuse of that key for different operation content returns gRPC `ALREADY_EXISTS`. Every application response carries `ResponseContext.request_id` copied from its request and selects exactly one typed `result` arm. Expected room-domain failures use the response `Error` message; malformed requests, authorization failure, deadline expiry, and unavailable transport use native gRPC status codes.
 
 | RPC           | Required operation fields                           | Successful result             | Current semantics                                                       |
 |---------------|-----------------------------------------------------|-------------------------------|-------------------------------------------------------------------------|
@@ -657,7 +657,7 @@ Every AppWeb request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id,
 
 V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages in P2P, preserves browser reconnect grace, and emits `registered` and `p2p-promote` controls. It also implements `OpenSfuSession`, worker selection, the P2P→SFU join barrier, SFU signal routing, later SFU joins and leaves, the dwell-based SFU→P2P downgrade, same-instance worker reconnection/synchronization, command replay, event acknowledgement/deduplication, and worker-loss room failure.
 
-One tonic `Channel` is shared by all AppWeb requests. Concurrent unary calls are multiplexed as independent HTTP/2 streams, so no application pending-response map or registration handshake is required. The channel uses a 10-second connection timeout, a 15-second RPC timeout, HTTP/2 keepalive every 30 seconds with a 10-second acknowledgement timeout, and lazy connection establishment so AppWeb can start while signaling is unavailable. Tonic reconnects the underlying channel for later RPCs after a transport failure. Both sides log the operation, `instance_id` where available, `request_id`, result, safe reason metadata, and elapsed time without logging signaling payloads or credentials.
+One tonic `Channel` is shared by all apprtc requests. Concurrent unary calls are multiplexed as independent HTTP/2 streams, so no application pending-response map or registration handshake is required. The channel uses a 10-second connection timeout, a 15-second RPC timeout, HTTP/2 keepalive every 30 seconds with a 10-second acknowledgement timeout, and lazy connection establishment so apprtc can start while signaling is unavailable. Tonic reconnects the underlying channel for later RPCs after a transport failure. Both sides log the operation, `instance_id` where available, `request_id`, result, safe reason metadata, and elapsed time without logging signaling payloads or credentials.
 
 ### 8.5 SFU bidirectional gRPC session
 
@@ -716,13 +716,13 @@ sequenceDiagram
     participant A as Browser A
     participant B as Browser B
     participant C as Browser C
-    participant AR as appweb HTTP
+    participant AR as apprtc HTTP
     participant S as signaling hub
     participant F as SFU worker
 
     rect rgb(238,238,238)
     Note over AR,F: Service startup and SFU registration
-    Note over AR,S: AppWeb creates one lazy reusable gRPC channel with no registration RPC
+    Note over AR,S: apprtc creates one lazy reusable gRPC channel with no registration RPC
     F->>S: OpenSfuSession - RegisterSfu with instance ID and capacity
     S-->>F: RegisterSfuResponse with request ID and resumed state
     F->>S: SfuEvent health Ready with capacity and current load

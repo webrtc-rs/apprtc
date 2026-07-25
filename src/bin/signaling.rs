@@ -3,7 +3,7 @@
 //! All I/O lives here (async Tokio tasks + `tokio-tungstenite`, keeping the SFU `chat`
 //! example's architecture); the `signaling` crate is a pure Sans-I/O state machine.
 
-use apprtc::{grpc_server, signaling_server, tls_config, ws_server};
+use apprtc::{grpc_server, signaling_server, tls::tls_config, ws_server};
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;

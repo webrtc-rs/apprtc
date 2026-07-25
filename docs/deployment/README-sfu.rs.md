@@ -1,12 +1,13 @@
 # AppRTC Deployment - sfu.rs
 
-This guide deploys Rust AppRTC's dedicated SFU worker run on `sfu.rs`. The SFU owns the UDP media ports and maintains
-one bidirectional gRPC session to signaling.
+This guide deploys Rust AppRTC's dedicated SFU worker running on `sfu.rs`. The SFU owns the UDP media ports and
+maintains one bidirectional gRPC session to signaling, which runs with the `apprtc` web server on the `appr.tc` host
+(see [README-appr.tc.md](README-appr.tc.md)).
 
 ```text
-Browser ── HTTPS ──> AppWeb (https://appr.tc:443)
+Browser ── HTTPS ──> AppRTC (https://appr.tc:443)
 Browser ── WSS ────> Signaling (wss://appr.tc:8443/ws)
-AppWeb  ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
+apprtc  ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
 SFU 2   ── gRPC/HTTP2/TLS ──> Signaling (https://appr.tc:50051)
 Browser <── ICE/DTLS/SRTP over UDP ──> SFU (sfu.rs:3478-3497)
 ```
@@ -17,7 +18,10 @@ upgrade, and a room that falls back to two participants and stays there for sign
 
 ## DNS and firewall
 
-Point `sfu.rs` at the host. Allow TCP `443` for the optional redirect and UDP `3478-3497` for media on the SFU host. Port `80` is only needed for Certbot standalone validation. The SFU host also needs outbound TCP access to signaling at `appr.tc:50051`; the signaling host/provider firewall must allow inbound TCP `50051` only from this SFU host's public IP (and any other trusted AppWeb/SFU hosts).
+Point `sfu.rs` at the host. Allow TCP `443` for the optional redirect and UDP `3478-3497` for media on the SFU host.
+Port `80` is only needed for Certbot standalone validation. The SFU host also needs outbound TCP access to signaling at
+`appr.tc:50051`; the signaling host/provider firewall must allow inbound TCP `50051` only from this SFU host's public
+IP (and any other trusted AppRTC/SFU hosts).
 
 * **A Record** pointing `@` to the server IP (e.g., `173.249.204.140`)
 * **A Record** pointing `www` to the same server if required
@@ -71,7 +75,7 @@ chmod +x /opt/apprtc/target/release/sfu
 For an upgrade after the systemd unit below has already been installed, restart the service with:
 
 ```bash
-sudo systemctl restart apprtc-sfu
+sudo systemctl restart sfu
 ```
 
 ## Production services
@@ -79,7 +83,7 @@ sudo systemctl restart apprtc-sfu
 Run the SFU on the same host. Replace the example public IP with the address resolved by `sfu.rs`:
 
 ```bash
-nano /etc/systemd/system/apprtc-sfu.service
+nano /etc/systemd/system/sfu.service
 ```
 
 ```ini
@@ -102,21 +106,28 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 ```
 
-`--tls`, `--certificate`, and `--private-key` protect only the optional redirect endpoint; the `https://` scheme in `--grpc-url` independently enables server-authenticated TLS for the outbound gRPC session. Do not use `--insecure-tls` in production. Enable the SFU service on the host:
+`--tls`, `--certificate`, and `--private-key` protect only the optional redirect endpoint; the `https://` scheme in
+`--grpc-url` independently enables server-authenticated TLS for the outbound gRPC session. Do not use `--insecure-tls`
+in production. Enable the SFU service on the host:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now apprtc-sfu
-sudo systemctl status apprtc-sfu
+sudo systemctl enable --now sfu
+sudo systemctl status sfu
 ```
 
 The service handles SIGINT gracefully by closing the SFU session and peer connections and releasing media state.
 
 ## Worker registration and load balancing
 
-The process opens one reconnecting `OpenSfuSession` stream to signaling and reports `Ready` health plus its `--max-rooms` and `--max-clients` capacity. Signaling selects among eligible workers by the lowest tuple `(assigned_clients, assigned_rooms, instance_id)` and pins each upgraded room to one worker.
+The process opens one reconnecting `OpenSfuSession` stream to signaling and reports `Ready` health plus its
+`--max-rooms` and `--max-clients` capacity. Signaling selects among eligible workers by the lowest tuple
+`(assigned_clients, assigned_rooms, instance_id)` and pins each upgraded room to one worker.
 
-Normally omit `--instance-id`. The process generates a unique incarnation ID once at startup and reuses it if its gRPC stream reconnects. A process restart generates a new ID by design: an empty replacement process must not claim WebRTC state owned by the previous process. If the old process does not reconnect during signaling's grace period, its established rooms fail with `room-failed`; they are not migrated automatically to another worker.
+Normally omit `--instance-id`. The process generates a unique incarnation ID once at startup and reuses it if its gRPC
+stream reconnects. A process restart generates a new ID by design: an empty replacement process must not claim WebRTC
+state owned by the previous process. If the old process does not reconnect during signaling's grace period, its
+established rooms fail with `room-failed`; they are not migrated automatically to another worker.
 
 ## Verify production
 
@@ -127,7 +138,7 @@ curl -fsS https://appr.tc/params
 
 The `/params` response should advertise `wss://appr.tc:8443/ws` as `wss_url`.
 
-AppWeb receives the public browser WebSocket URL through `--ws-url`. Its private room-authority traffic independently
+`apprtc` receives the public browser WebSocket URL through `--ws-url`. Its private room-authority traffic independently
 uses `--grpc-url https://appr.tc:50051`; no `/app` WebSocket endpoint is exposed.
 
 ## Certificate renewal
@@ -136,14 +147,19 @@ Restart the corresponding service after renewal:
 
 ```bash
 sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh >/dev/null <<'EOF'
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/restart-sfu.sh >/dev/null <<'EOF'
 #!/bin/sh
-systemctl restart apprtc-sfu
+systemctl restart sfu
 EOF
-sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-apprtc.sh
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-sfu.sh
 sudo certbot renew --dry-run
 ```
 
 ## CLI reference
 
-Run `sfu --help` for the authoritative options. The SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`, `--media-port-max`, `--grpc-url`, `--insecure-tls`, `--max-rooms`, `--max-clients`, and an optional process-incarnation `--instance-id`. Its `--port`, `--redirect-url`, `--tls`, `--certificate`, and `--private-key` options configure only the optional landing-page redirect server. `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`) configure logging. On the signaling host, keep port `50051` inaccessible from all sources except the trusted AppWeb and SFU hosts until mTLS client authentication is implemented.
+Run `sfu --help` for the authoritative options. The SFU supports `--host-ip`, `--media-public-ip`, `--media-port-min`,
+`--media-port-max`, `--grpc-url`, `--insecure-tls`, `--max-rooms`, `--max-clients`, and an optional process-incarnation
+`--instance-id`. Its `--port`, `--redirect-url`, `--tls`, `--certificate`, and `--private-key` options configure only
+the optional landing-page redirect server. `--debug` (`-d`), `--level` (`-l`), and `--output-log-file` (`-o`) configure
+logging. On the signaling host, keep port `50051` inaccessible from all sources except the trusted `apprtc` and SFU
+hosts until mTLS client authentication is implemented.

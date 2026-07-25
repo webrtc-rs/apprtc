@@ -3,7 +3,7 @@ use anyhow::{Result, bail};
 use apprtc::config::Config;
 use apprtc::grpc_client::GrpcAuthority;
 use apprtc::room_server::RoomServer;
-use apprtc::{TlsListener, tls_config};
+use apprtc::tls::{TlsListener, tls_config};
 use clap::Parser;
 use env_logger::Target;
 use log::LevelFilter;

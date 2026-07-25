@@ -1,7 +1,7 @@
 //! Private gRPC adapter for AppRTC and SFU workers.
 
 use crate::signaling_server::{COMMAND_CAPACITY, DriverCommand};
-use crate::tls_pem;
+use crate::tls::tls_pem;
 use rand::RngExt;
 use signaling::collider::{
     AuthorityCommand, AuthorityOperation, AuthorityResponse, AuthorityResult,

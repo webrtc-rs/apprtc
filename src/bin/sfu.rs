@@ -1,7 +1,7 @@
 //! Standalone SFU media worker using the V2 signaling gRPC session.
 
 use apprtc::sfu_server::{self, Config};
-use apprtc::{TlsListener, tls_config};
+use apprtc::tls::{TlsListener, tls_config};
 use axum::Router;
 use axum::response::Redirect;
 use clap::Parser;
