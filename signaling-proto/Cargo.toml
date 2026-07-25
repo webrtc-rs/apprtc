@@ -1,6 +1,6 @@
 [package]
 name = "signaling-proto"
-description = "Signaling Protobuf of AppRTC"
+description = "AppRTC Signaling Protobuf in Rust"
 documentation = "https://docs.rs/signaling-proto"
 version.workspace = true
 authors.workspace = true

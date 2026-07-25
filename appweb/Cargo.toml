@@ -1,6 +1,6 @@
 [package]
 name = "appweb"
-description = "AppWeb in Rust"
+description = "AppRTC Web in Rust"
 documentation = "https://docs.rs/appweb"
 version.workspace = true
 authors.workspace = true

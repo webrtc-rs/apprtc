@@ -1,6 +1,6 @@
 [package]
 name = "signaling"
-description = "Signaling in Rust"
+description = "AppRTC Signaling in Rust"
 documentation = "https://docs.rs/signaling"
 version.workspace = true
 authors.workspace = true
