@@ -769,7 +769,7 @@ sequenceDiagram
     Note over A,B: V2 P2P offer answer flows through WS send and msg
     C->>AR: POST v2 join numeric room
     AR->>S: gRPC AdmitV2 C
-    S->>S: Select min assigned clients, rooms, instance ID; enter Upgrading
+    S->>S: Select min assigned clients, rooms, instance ID, then enter Upgrading
     S->>F: SfuCommand JoinMember A with lifecycle ID
     F-->>S: SfuCommandResult MemberJoined A
     S->>F: SfuCommand JoinMember B with lifecycle ID
@@ -848,7 +848,7 @@ sequenceDiagram
     S-->>B: WS msg direct P2P offer
     B->>S: WS send direct P2P answer at epoch 2
     S-->>A: WS msg direct P2P answer
-    Note over A,B: Direct media arrives; each browser closes its SFU PC and returns to the P2P stage
+    Note over A,B: Direct media arrives, so each browser closes its SFU PC and returns to the P2P stage
     end
 ```
 
