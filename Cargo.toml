@@ -6,6 +6,7 @@ license = "MIT/Apache-2.0"
 authors = ["Rain Liu <y@liu.mx>"]
 repository = "https://github.com/webrtc-rs/apprtc"
 homepage = "https://appr.tc"
+description = "AppRTC P2P/SFU Server in Rust"
 keywords = ["signaling", "networking", "protocols", "sans-io"]
 categories = ["network-programming", "asynchronous", "multimedia"]
 
