@@ -999,156 +999,170 @@ a function of nothing, so it never does:
 
 **The limits, accepted deliberately.**
 
-- Tag width bounds N, and is fixed at design time (§9.3): widening it later would re-read random bits as tag bits and
-  mis-route every ID already minted. The chosen 18-bit tag puts that bound at 262 144, well past any real fleet.
+- Tag width bounds N, and is fixed at mint time (§9.3): widening it later would re-read random bits as tag bits and
+  mis-route every ID already minted, which is why the layout field exists (§9.3.3). The chosen 30-bit tag puts that
+  bound at 1 073 741 824, and keeps *self-assigned* tags safe to roughly 10 000 nodes (§9.3.1).
 - Existing rooms are never rebalanced. A node that gets hot stays hot for the links already minted on it.
 - Retiring a node permanently invalidates its links — correct, since their state died with it, provided the failure is
   explicit rather than a silent re-creation elsewhere (§9.4).
 - Only IDs the service mints carry a tag, so V1 — whose IDs the client chooses — needs its own answer (§9.8).
-
 ### 9.3 Room ID format: tagged UUIDv8, rendered base64url
 
 **V2 room IDs become UUIDs; client IDs stay `u64`.**
 
 > **Status.** The type change is *implemented*: V2 room ids are UUIDv8 values minted by the service, rendered
 > base64url-unpadded in links and browser JSON, carried as 16 bytes over gRPC, and validated on the way in (§3.1, §8.1).
-> What is **not** implemented is the interior layout below — the node tag and the expiry. Today all 122 free bits are
-> random, which is exactly the `T = 0` case of this section: routing has nothing to read out of the id yet, so a
-> multi-node deployment would still need §9.2 hashing. Adopting §9.10 means reserving those bits *before* the first link
-> is minted, since the widths cannot change afterwards.
+> What is **not** implemented is the interior layout below — the node tag, the expiry and the layout field. Today all
+> 122 free bits are random, which is exactly the `T = 0` case of this section: routing has nothing to read out of the id
+> yet, so a multi-node deployment would still need §9.13 hashing. Adopting §9.2 means reserving those bits *before* the
+> first link is minted, since only the layout field can change them afterwards (§9.3.3).
 
 The structure must live inside the UUID rather than as a prefix bolted onto it, and RFC 9562 reserves **version 8** for
 exactly this — an application-defined layout with only the version and variant bits fixed. Its three custom fields map
-onto what a room ID needs to carry: which node owns the room, when the link stops working, and enough randomness to be
-unguessable.
+onto what a room ID needs to carry: which node owns the room, when the link stops working, enough randomness to be
+unguessable, and a way to change its own mind later.
 
 ```text
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   node tag (18)  |        expiry hi (custom_a head)           |
+|                       node tag (30)                       |exp|
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|   expiry lo (custom_a tail)   |  ver  |       custom_b        |
+|         expiry hi (18)        |  ver  |   expiry lo (10)  | ly|
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|var|                       custom_c                            |
+|var|                          custom_c                         |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                           custom_c                            |
+|                            custom_c                           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    RFC 9562 Figure 12, with this design's field assignment:
-   node tag 18 | expiry 30 | random 74
+   node tag 30 | expiry 28 (hi 18 + lo 10, split by the version nibble)
+   | layout 2 | random 62.  Cells are 2 chars per bit; `exp` is where the
+   expiry begins at bit 30, continuing as `expiry hi` on the next row.
 ```
 
+| Field       | Bits            | Width | Chars  |
+|-------------|-----------------|-------|--------|
+| node tag    | 0–29            | 30    | **0–4 exactly** |
+| expiry high | 30–47           | 18    | 5–7    |
+| *version, fixed `1000`* | 48–51 | 4  | 8      |
+| expiry low  | 52–61           | 10    | 8–10   |
+| layout      | 62–63           | 2     | 10     |
+| *variant, fixed `10`*   | 64–65 | 2  | 10     |
+| random (`custom_c`)     | 66–127 | 62 | 11–21 |
+
 Rendered **unpadded** (RFC 4648 §5) a 16-byte UUID is always 22 characters whatever the field widths are — everything
-is carved out of the UUID, not prepended to it, so structure costs nothing in URL length. Because base64url encodes
-exactly 6 bits per character, a tag whose width is a multiple of 6 lands on a whole number of *leading* characters, and
-routing needs no decoding at all in the common path: *the first `T/6` characters of the room ID are the node tag.*
-Placing the tag and the expiry back to back inside `custom_a` makes both fields land on character boundaries — with the
-chosen widths the token reads as **3 characters of tag, 5 of expiry, 14 of randomness** — so either can be inspected
-without decoding, and `custom_b`/`custom_c` stay entirely random.
+is carved out of the UUID, not prepended to it, so structure costs nothing in URL length.
+
+**Only the tag needs to land on character boundaries, and that is what buys its width.** base64url encodes exactly 6
+bits per character, so a tag whose width is a multiple of 6 occupies a whole number of *leading* characters and routing
+needs no decoding at all in the common path: *the first `T/6` characters of the room ID are the node tag* — five of
+them at the chosen width. The expiry has no such requirement: it is read only by code that has already decoded 16 bytes
+to check version, variant and canonical form (§9.4), so a mask-shift-or costs it nothing. Freeing the expiry to
+**straddle the version nibble** is precisely what lets the tag take 30 bits while `custom_a` and `custom_b` are fully
+utilised. `custom_c` stays wholly random.
+
+Three fixed-bit invariants survive the layout and are worth validating, because they are free:
+
+```text
+char 8  ∈ {g,h,i,j}                     — the version nibble occupies its top 4 bits
+char 10 ∈ {-,2,6,C,G,K,O,S,W,a,e,i,m,q,u,y} — the variant occupies its bottom 2 bits
+char 21 ∈ {A,Q,g,w}                     — 4 must-be-zero padding bits (§9.3.4)
+```
 
 **Every structured bit is a bit of entropy spent.** Six bits are fixed by the format, leaving 122 to divide between the
-tag, the expiry and randomness. The tag is public by design, and the expiry is *predictable* — an attacker guessing IDs
-knows the node and can guess a timestamp — so only the random remainder resists enumeration, and only it keeps two live
-meetings from colliding. That makes the division a security decision, not a layout preference:
+tag, the expiry, the layout field and randomness. The tag is public by design, and the expiry is *predictable* — an
+attacker guessing IDs knows the node and can guess a timestamp — so only the random remainder resists enumeration, and
+only it keeps two live meetings from colliding. That makes the division a security decision, not a layout preference:
 
-| Tag | Expiry                        | Random | Consequence                                                    |
-|-----|-------------------------------|--------|------------------------------------------------------------------|
-| 48  | 42 (seconds)                  | **32** | Rejected — enumerable and collision-prone (§9.3.2)              |
-| 30  | 32 (seconds)                  | 60     | Safe, but spends 12 bits on node identity nobody needs          |
-| **18** | **30 (minutes since UNIX epoch)** | **74** | **Chosen.** 262 144 tags, `custom_a` exactly filled |
-| 12  | 32 (seconds)                  | 78     | Only if tags are centrally allocated (§9.3.1)                   |
-
-The chosen split lands every field on a natural boundary: the tag and expiry together fill `custom_a` exactly, so
-`custom_b` and `custom_c` are wholly random; 18 and 30 bits are three and five base64url characters; and 74 random bits
-put enumeration and collision risk far beyond anything operational (§9.3.2).
+| Tag | Expiry             | Layout | Random | Consequence                                                                       |
+|-----|--------------------|--------|--------|-----------------------------------------------------------------------------------|
+| 48  | 42 (seconds)       | —      | **32** | Rejected — enumerable and collision-prone (§9.3.2)                                 |
+| 18  | 28 (minutes)       | 2      | 74     | Safe, but self-assignment breaks past ~200 nodes (§9.3.1)                          |
+| 24  | 28 (minutes)       | 2      | 68     | Self-assigns to ~2 000 nodes                                                       |
+| **30** | **28 (minutes since UNIX epoch)** | **2** | **62** | **Chosen.** `custom_a`+`custom_b` fully utilised; self-assigns to ~10 000 nodes |
+| 30  | 30 (minutes)       | —      | 62     | Same budget, but trades the only migration path for 1 531 unreachable years (§9.3.3) |
 
 #### 9.3.1 Tag width: the question is really "who assigns tags"
 
 A tag has to be unique per node and must never be recycled onto a different node (§9.4). Narrow tags force someone — an
 operator or a registry — to allocate them and remember which are retired. Wide tags let a node **derive its own** by
 truncating a hash of a stable identity such as its hostname, at which point nobody allocates anything and the rule
-enforces itself:
+enforces itself. Since collisions follow the birthday bound, the useful question is not how many nodes a width
+*addresses* but how many can safely pick their own:
 
-| `T` | Chars | Values | Self-assignment by hashing? |
-|-----|-------|--------|------------------------------|
-| 12  | 2     | 4 096   | 50 self-assigning nodes collide with ~31% probability — allocate centrally.  |
-| **18** | **3** | **262 144** | **Chosen.** 25 nodes collide with ~0.1% probability, 50 with ~0.5%, 100 with ~1.9%. |
-| 30  | 5     | 1.07 billion | ~10⁻⁶ at 50 nodes, but 12 more bits than a signaling fleet needs.           |
-
-Eighteen bits addresses 262 144 nodes, which no signaling fleet will approach — the bound that matters is not the
-address space but the collision rate when nodes pick their own tags, and that grows with the *square* of N:
+| `T` | Chars | Values        | Collision if nodes self-assign: 100 / 1 000 / 2 000 / 10 000 nodes |
+|-----|-------|---------------|---------------------------------------------------------------------|
+| 18  | 3     | 262 144       | 1.9% / 85% / **99.95%** / ~100% — allocate centrally past ~200        |
+| 24  | 4     | 16 777 216    | 0.03% / 2.9% / 11.2% / 94.9%                                         |
+| **30** | **5** | **1 073 741 824** | **0.000% / 0.05% / 0.19% / 4.5% — self-assignment holds to ~10 000** |
 
 **A tag collision is not a silent hazard, which is what makes self-assignment viable here.** Unlike room IDs, node tags
 are drawn from a small, known, enumerable set: every edge and node can compute all configured hostnames' tags at
 startup and refuse to run if two collide. The percentages above are therefore *a deployment-time check that
 occasionally fails*, not lurking corruption.
 
-That gives the practical rule: **the tag is configured, defaulting to `SHA-256(hostname)` truncated to 18 bits.** A
-small fleet never sets it and never thinks about it. If the startup check reports a collision — around a 2% risk at 100
-nodes, and effectively certain past a few hundred — the operator pins an explicit tag for one of the two nodes and the
-problem is over. Fleets large enough to hit that routinely should allocate tags centrally, or use a registry that does
-it for them (§9.6.1).
+**Chosen: `T = 30`, defaulting to `SHA-256(hostname)` truncated to 30 bits.** At 2 000 nodes that is a 0.19% chance of
+a single colliding pair, so no realistic fleet ever allocates tags — which removes a correctness rule from the
+operator's plate, the one §9.6.1 offers a registry to enforce, and makes DNS-derived discovery fully general, since any
+hostname works and no numbering convention is needed (§9.6.2). "Never reuse a tag" degrades into "do not recycle a
+hostname onto a different machine", a unit operators already think in. A fleet past ~10 000 nodes has a registry for
+endpoint reasons long before tag reasons, and a registry that hands out endpoints can hand out tags.
 
 ```text
-s1.xxx.xx  →  tag 50 715  →  https://appr.tc/v2/r/MYbBxhZAi1Ojzlk3wf_Zpw
-s2.xxx.xx  →  tag 260 271 →  https://appr.tc/v2/r/_ivBxhZAh0iTHaFj5GqZiA
-                                                  ^^^^^^^^ tag ‖ expiry, then 14 random characters
+s1.xxx.xx  →  tag   207 732 607  →  https://appr.tc/v2/r/MYb9_HGnhQCV-VNdD9GDPQ
+s2.xxx.xx  →  tag 1 066 073 044  →  https://appr.tc/v2/r/_ivvUHGnhQCXri03Gdn9JQ
+                                                        ^^^^^ tag, read without decoding
 ```
 
-**Chosen: `T = 18`, defaulting to `SHA-256(hostname)` truncated to 18 bits.** At the usual fleet size nobody allocates
-tags, which removes a correctness rule from the operator's plate — the one §9.6.1 offers a registry to enforce — and
-makes DNS-derived discovery fully general, since any hostname works and no numbering convention is needed (§9.6.2).
-"Never reuse a tag" degrades into "do not recycle a hostname onto a different machine", a unit operators already think
-in.
+Five characters is a longer shared prefix than a narrower tag would give, but 5 of 22 still leaves two links on the
+same node plainly different, so the cosmetic objection to wide tags does not bite.
 
-Three characters is also the smallest shared prefix of any option considered, so two links on the same node still look
-plainly different — the cosmetic objection to wide tags disappears.
-
-**Whichever is chosen, the width is fixed at design time.** The tag is read from fixed bit positions, so widening it
-after links exist re-reads random bits as tag bits and mis-routes every ID already minted. There is no "widen it later"
-escape hatch without a layout version to switch on. The same applies to every other field below.
+**The width is fixed at mint time, not at read time.** The tag is read from fixed bit positions, so widening it after
+links exist would re-read random bits as tag bits and mis-route every ID already minted. That is what §9.3.3 exists to
+make survivable; without the layout field there would be no escape at all.
 
 #### 9.3.2 Expiry: what it buys, and what it costs
 
-Carrying an expiry in the tail of `custom_a`, immediately after the tag, makes a link **self-describing about its own
-validity**. An
-edge can reject a dead link by decoding 16 bytes, with no gRPC call, no signaling node involved and no room lookup —
-which is both a fast failure for the user and a cheap filter in front of the authority. Signaling parses the same field
-and enforces it again on `AdmitV2`, since it is the authority and the edge check is only a shortcut.
+Carrying an expiry next to the tag makes a link **self-describing about its own validity**. An edge can reject a dead
+link by decoding 16 bytes, with no gRPC call, no signaling node involved and no room lookup — which is both a fast
+failure for the user and a cheap filter in front of the authority. Signaling parses the same field and enforces it
+again on `AdmitV2`, since it is the authority and the edge check is only a shortcut.
 
-**At 30 bits the unit is forced, and the obvious choice is wrong.** Thirty bits of *seconds* since the UNIX epoch spans
-34 years and therefore ran out on **2004-01-10** — it cannot express any future timestamp at all. Two encodings do fit:
+**At 28 bits the unit is forced, and the obvious choice is impossible.** Twenty-eight bits of *seconds* since the UNIX
+epoch spans 8.5 years and therefore ran out in **1978** — it cannot express any future timestamp at all:
 
-| Encoding                        | Bits | Runs out    | Cost                                                         |
-|---------------------------------|------|-------------|----------------------------------------------------------------|
-| Seconds since a project epoch   | 30   | 2060        | A constant every implementation must agree on, exactly         |
-| **Minutes since the UNIX epoch** | **30** | **year 4011** | A divide by 60; granularity drops to a minute            |
+| Encoding                          | Bits   | Runs out      | Cost                                                     |
+|-----------------------------------|--------|---------------|------------------------------------------------------------|
+| Seconds since the UNIX epoch      | 28     | 1978          | Impossible                                                 |
+| Seconds since a project epoch     | 28     | 2034          | A constant every implementation must agree on, exactly     |
+| **Minutes since the UNIX epoch**  | **28** | **year 2480** | A divide by 60; granularity drops to a minute              |
 
 **Minutes since the UNIX epoch is the recommendation.** A project epoch introduces a shared constant that lives in the
 edge, in signaling, and in every log-reading tool, and getting it wrong shifts every expiry by the delta — a silent,
-systematic error that looks like a clock bug. Minutes have no such constant: the only rule is a division, the span is
-absurd rather than merely sufficient, and minute granularity is finer than any meeting-link policy needs. It also
-pairs well with the skew tolerance described below, which is measured in minutes anyway.
+systematic error that looks like a clock bug. Minutes have no such constant: the only rule is a division, the span
+outlives the format, and minute granularity is finer than any meeting-link policy needs. It also pairs well with the
+skew tolerance below, which is measured in minutes anyway.
 
-**Why the width was not simply maximised.** An earlier draft of this section gave the expiry 42 bits, which spans
-139 000 years — and, paired with a 48-bit tag, left only **32 random bits**. Since the tag is public by design and a
-timestamp is guessable, those 32 bits would have been the entire secret:
+**Why the width was not simply maximised.** An earlier draft gave the expiry 42 bits, which spans 139 000 years — and,
+paired with a 48-bit tag, left only **32 random bits**. Since the tag is public by design and a timestamp is guessable,
+those 32 bits would have been the entire secret:
 
 - **Enumeration.** Finding *some* live room on a node holding 10 000 of them would take about 2³²/10 000 ≈ 430 000
   guesses — roughly seven minutes at 1 000 requests per second. Room existence would stop being a secret.
-- **Collisions.** Two rooms collide only if they share a tag *and* an expiry second *and* the random bits, so the
+- **Collisions.** Two rooms collide only if they share a tag *and* an expiry minute *and* the random bits, so the
   expiry field does partition the space. Even so, at 1 000 mints per second on one node the birthday bound gives
   ≈ 3 700 colliding IDs per year — two live meetings sharing an ID, and their participants landing in each other's
   calls.
 
-The chosen 18/30/74 split removes both concerns by a wide margin. Enumerating any of 10 000 live rooms would take
-≈ 1.9 × 10¹⁸ guesses, and a node minting 1 000 rooms per minute expects well under 10⁻⁹ collisions per year. The lesson
-worth keeping is the one that produced the change: **structured bits are subtracted from the security budget**, so each
-field should be sized to what it needs rather than to the space available.
+The chosen split removes both concerns by a wide margin: with 62 random bits, enumerating any of 10 000 live rooms
+takes ≈ 4.6 × 10¹⁴ guesses — about 14 600 years at 1 000 requests per second — and a node minting 1 000 rooms per
+minute expects ≈ 6 × 10⁻⁸ collisions per year. The lesson worth keeping is the one that produced the change:
+**structured bits are subtracted from the security budget**, so each field should be sized to what it needs rather than
+to the space available. That is also why the expiry stops at 28 rather than 30 (§9.3.3).
 
 **Semantics to pin down, because they are easy to assume wrongly.**
 
-- **Expiry bounds the link, not the room.** Room state still dies when the room empties or its node restarts (§9.10);
+- **Expiry bounds the link, not the room.** Room state still dies when the room empties or its node restarts (§9.11);
   expiry only says when the *identifier* stops being accepted. A link may well be dead long before it expires.
 - **It cannot be extended.** The value is immutable inside the ID, so a meeting that needs to outlive its window needs a
   newly minted link. Long-lived or recurring meetings must therefore be minted with a long TTL up front, bounded by the
@@ -1161,6 +1175,35 @@ field should be sized to what it needs rather than to the space available.
 - Rejection reuses `ROOM_EXPIRED` (§9.4), which already means "this link is no longer valid" — an expired timestamp and
   a retired node tag are the same thing from the user's point of view.
 
+#### 9.3.3 The layout field: the one escape hatch
+
+Two bits at positions 62–63 name the interpretation of everything before them. Layout `0` is the assignment above.
+
+Every other decision in this design can be revised at the edges — placement policy, TTL defaults, `d_max`, the tag
+table — but the **bit layout cannot**, because it is baked into links already pasted into calendar invites. Without a
+version field there is no way to change any width without mis-routing every ID ever minted, which is a strong constraint
+to accept in exchange for nothing.
+
+The two bits are cheap in the most literal sense: their alternative use is expiry span. `tag 30 | expiry 30` fills the
+same 60 structured bits and leaves the same 62 random bits, differing only in that the expiry would run to 4012 instead
+of 2480 — **1 531 years no link will ever reach**, bought at the price of the only migration path the format can have.
+
+| Bits | Expiry runs out | Bits | Expiry runs out |
+|------|-----------------|------|-----------------|
+| 26   | 2098            | 29   | 2991            |
+| 27   | 2225            | 30   | 4012            |
+| **28** | **2480**      |      |                 |
+
+Nor could a wider expiry buy *granularity* rather than span, which would be a real benefit: seconds need 32 bits to
+reach 2106, which does not fit beside a 30-bit tag. Past 26 bits the field purchases nothing but calendar years.
+
+What a future layout could do, with old links still resolving: widen the tag beyond 30 for a fleet past ~10 000 nodes,
+add a region field ahead of the node tag for multi-region routing, change the expiry unit, or correct an assignment
+that turns out to be wrong. Four layouts is a small hatch, but one migration is the realistic need, and the field is
+only meaningful if every layout keeps it at 62–63 — that is the single invariant every implementation must honour.
+
+#### 9.3.4 Canonical rendering, case, and what stays numeric
+
 **Canonical encoding is mandatory, and this is the sharp edge.** 128 bits is not a multiple of 6, so the 22nd character
 carries only 2 significant bits and 4 must-be-zero bits. Sixteen different final characters therefore decode to the same
 UUID. Left unchecked, one room acquires sixteen spellings — and since `signaling` keys rooms by the value it is handed,
@@ -1170,7 +1213,7 @@ those spellings would become *different rooms*. Two rules close it:
 - Edges decode to 16 bytes, validate version 8 and variant `0b10`, and re-encode canonically before the value crosses
   any boundary. Everything downstream — gRPC, room tables, logs, admission tokens — sees exactly one spelling.
 
-**Case sensitivity is the accepted cost.** base64url distinguishes `TSiE…` from `tsie…`, so a client that lowercases a
+**Case sensitivity is the accepted cost.** base64url distinguishes `MYb9_…` from `myb9_…`, so a client that lowercases a
 link produces a valid-looking token for a room that does not exist. Rooms are therefore *copied*, not retyped or
 dictated, and the join-by-paste field (§9.12) must reject a mis-cased token rather than case-fold it, since folding
 would silently resolve to a different UUID. A case-insensitive alphabet such as Crockford base32 would avoid this, at
@@ -1191,18 +1234,30 @@ in the logs.
 
 ### 9.4 Resolving a room to its node
 
-Resolution is a pure function of the path segment and a tag table, evaluated identically on every edge:
+Resolution is a pure function of the raw room-ID path component and a tag table, evaluated identically on every edge. It
+serves both V2 edge routes — the room page `GET /v2/r/{roomid}` and the join API `POST /v2/join/{roomid}` (§8.3):
 
 ```text
-resolve(version, segment) -> Node | Error
+resolve(version, raw_room_id) -> Node | Error
+
+  version       the route prefix, not anything read out of the id itself:
+                /r/... and /join/... are V1, /v2/r/... and /v2/join/... are V2.
+  raw_room_id   the {roomid} path component exactly as it arrived -- percent-decoded,
+                but not base64-decoded, trimmed, or case-folded (§9.3.4).  Untrusted:
+                on the V2 route it is a candidate token, not yet a room id.
+
   V1 route  -> §9.8
-  V2 route  -> canonical tagged token -> tag_table[tag(segment)]
+  V2 route  -> canonical tagged token -> tag_table[tag(raw_room_id)]
                anything else          -> INVALID_ROOM_ID
 ```
 
+Taking the version from the route rather than from the value is what keeps V1 and V2 from ever having to be told apart
+by inspection: an opaque V1 room name and a 22-character V2 token can look alike, and the path has already said which
+one this is.
+
 V2 accepts **only** minted tokens. In full: decode 22 base64url characters to 16 bytes, reject a non-canonical final
 character, reject a wrong version or variant nibble, **reject an expired token** (§9.3.2), take the leading tag bits —
-the first `T/6` characters, three of them at the chosen width — and look the tag up. The
+the first `T/6` characters, five of them at the chosen width — and look the tag up. The
 lookup has three outcomes, and they must stay distinguishable because they mean different things to the user:
 
 | Tag state | Meaning                                          | Response                                                              |
@@ -1248,7 +1303,7 @@ POST /v2/room
   candidates ← nodes believed live and not draining, ordered by placement policy
   if none: return 503                      # never mint blind
   node ← first candidate
-  return base64url(uuid_v8(tag = node.tag, expiry, 74 CSPRNG bits))
+  return base64url(uuid_v8(tag = node.tag, expiry, layout = 0, 62 CSPRNG bits))
 ```
 
 **What makes the residual race tolerable is that its failure is loud, immediate and one click from recovery.** A link
@@ -1569,8 +1624,8 @@ Meet/Webex shape:
 
 This is a security improvement, not only a UX one. Today any V2 room ID can be typed into the path, so rooms are
 enumerable by anyone who guesses a number, and the admission token (§7) protects the WebSocket rather than the room's
-existence. Minted-only IDs carry 74 random bits (§9.3) which, with rate limiting, makes enumeration impractical — and
-they expire, so a leaked link stops working on its own.
+existence. Minted-only IDs carry 62 random bits (§9.3) which, with rate limiting, makes enumeration impractical — finding any of
+10 000 live rooms takes on the order of 10¹⁴ guesses — and they expire, so a leaked link stops working on its own.
 
 ### 9.13 Alternatives considered
 
