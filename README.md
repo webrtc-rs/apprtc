@@ -96,6 +96,7 @@ src/
 ├── lib.rs                module declarations only
 ├── bin/                  the apprtc, signaling, and sfu entry points
 ├── tls.rs                shared certificate loading and TLS listener support
+├── room_id.rs            V2 room-id codec: UUIDv8 ↔ the raw 16 `bytes` carried over gRPC
 ├── room_server.rs        HTTP room API, page routes, and static-asset serving
 ├── params.rs             AppRTC room/ICE parameter construction
 ├── templates.rs          Jinja index/full/grid page templates loaded from the web root

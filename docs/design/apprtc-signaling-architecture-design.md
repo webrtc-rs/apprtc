@@ -22,7 +22,7 @@ repositories vendored as git submodules and consumed as path dependencies:
 Throughout this document `apprtc` names the web-server process — the gRPC **client** of `signaling` — as distinct from
 AppRTC the project. It and `signaling` are separate processes communicating through the `RoomAuthority` boundary defined by the §8.4 gRPC protocol, even though the web server now lives in the root package rather than a crate of its own. `signaling-proto` owns that shared contract without depending on either implementation. The standalone `sfu` process uses the §8.5 stream while keeping the Sans-I/O `Sfu` engine independent from its gRPC/UDP driver. Browser protocols (§8.2 and §8.3) remain public JSON WebSocket protocols, while `apprtc` and SFU use the private `signaling.v2.SignalingService` API on a separate HTTP/2 listener.
 
-The repository root is the `apprtc` package. Within its `src/` directory, `room_server.rs`, `params.rs`, `templates.rs`, `config.rs`, and `grpc_client.rs` are the web server; `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The browser application it serves lives under `web/`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. `src/tls.rs` provides the shared certificate loading and TLS listener support used by the binaries, and `src/lib.rs` only declares the modules.
+The repository root is the `apprtc` package. Within its `src/` directory, `room_server.rs`, `params.rs`, `templates.rs`, `config.rs`, `room_id.rs`, and `grpc_client.rs` are the web server (`room_id.rs` converts a V2 room id between its UUIDv8 form and the raw 16 `bytes` carried over gRPC); `ws_server.rs` owns the public TCP/TLS listener, HTTP upgrade, WebSocket framing, and browser-session tasks; `grpc_server.rs` owns the private tonic service adapter; and `signaling_server.rs` owns the command channel and single event loop that drives the Sans-I/O `Collider`. The browser application it serves lives under `web/`. The binary entry points live under `src/bin/`, integration tests under `tests/`, and the bundled development certificate plus the local `start.sh`/`stop.sh` and `log2seq.py` helpers under `scripts/`. Both network adapters submit typed commands to the event loop and never mutate signaling state directly. `src/tls.rs` provides the shared certificate loading and TLS listener support used by the binaries, and `src/lib.rs` only declares the modules.
 
 ## 1. Topology and authority
 
@@ -40,20 +40,28 @@ flowchart LR
 `apprtc` serves the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns separate V1 and V2 room tables keyed by different types — opaque strings for V1, UUIDs for V2 — so the two namespaces cannot collide:
 
 ```text
-V1RoomTable: Map<String, V1Room<String>>
+V1RoomTable: Map<String, V1Room>          // V1Room { id: String, clients: Map<String, Client> }
+
+V2RoomTable: Map<Uuid, V2Room>         // keyed by the UUIDv8 minted at §8.1; the room holds no id of its own
 
 V2Room {
-  id: u64,
+  members: Map<u64, Member>,           // client ids stay numeric
   mode: P2P | Upgrading | SFU | Failed,
-  members: Map<u64, BrowserClient>,
   signal_epoch: u64,                   // increments when P2P→SFU or SFU→P2P commits
-  assigned_sfu: Option<InstanceId>,    // selected SFU process incarnation, cleared at downgrade
   assignment_epoch: u64,               // assignment generation, stable across same-instance reconnect
+  assigned_instance: Option<InstanceId>, // selected SFU process incarnation, cleared at downgrade
+  upgrade: Option<Upgrade>,            // the P2P→SFU MemberJoined barrier, while it is open (§4.3)
+  pending_join: Option<PendingJoin>,   // one in-flight JoinMember against the assigned worker
+  pending_leave: Option<PendingLeave>, // one in-flight LeaveMember against the assigned worker
   downgrade_deadline: Option<Instant>, // armed while an SFU room sits at ≤2 members
 }
 ```
 
-`Downgrading` remains reserved in the Protobuf `RoomMode` enum but is not a signaling-core state. The implemented downgrade needs no intermediate state: unlike an upgrade, which must wait for worker `MemberJoined` barriers, it commits `SFU → P2P` in one step and tears the worker legs down afterwards (§4.4).
+**There are four room modes, and `Downgrading` is deliberately not one of them.** The Protobuf `RoomMode` enum does
+define `ROOM_MODE_DOWNGRADING = 4`, but nothing ever produces or accepts it — the conversion at the gRPC boundary
+maps only the four modes above — so it is a defined-but-unused value rather than a `reserved` one in Protobuf's
+sense. The implemented downgrade needs no intermediate state: unlike an upgrade, which must wait for worker
+`MemberJoined` barriers, it commits `SFU → P2P` in one step and tears the worker legs down afterwards (§4.4).
 
 `BrowserClient` owns the registered WebSocket (if any), its bounded outbound queue, and its reconnect-grace timer. The
 SFU owns only a projection of members assigned to it. It must never decide occupancy, initiate a P2P→SFU upgrade, or
@@ -341,7 +349,7 @@ The commit is deliberately **break-before-make** and permits a brief media gap:
 1. Set `mode = P2P` and increment `signal_epoch`; clear the deadline.
 2. Elect the lowest client id as the direct offerer; every other member answers. Clear each member's queued messages so
    retired-epoch SFU traffic cannot leak into the new P2P session.
-3. Release the worker assignment (`assigned_sfu = None`, decrement its assigned room/client counters) and queue one
+3. Release the worker assignment (`assigned_instance = None`, decrement its assigned room/client counters) and queue one
    `LeaveMember` per member with reason `ROOM_CLOSED`. These are fire-and-forget cleanup commands: the commit does not
    wait for their results, because no browser-visible state depends on them.
 4. Push `{control:"sfu-downgrade", roomid, epoch, is_initiator}` to every registered member.
@@ -380,7 +388,7 @@ holding the same room — remains out of scope; §9 partitions rooms across node
 
 ## 6. Browser and API work
 
-The implemented room-selection page exposes a checked **V2 P2P/SFU** checkbox, so V2 is the web UI default while V1 remains available by unchecking it. V1 navigates through `/r/{roomid}` and `/join/{roomid}`; V2 uses `/v2/r/{roomid}` and `/v2/join/{roomid}`. The V2 namespace is preserved in returned room links and embedded page parameters. The current browser implements the P2P, Upgrading, and SFU modes, the responsive grid, transport handoff in both directions, and polite-peer perfect negotiation.
+The implemented room-selection page exposes a checked **V2 P2P/SFU** checkbox, so V2 is the web UI default while V1 remains available by unchecking it. V1 navigates through `/r/{roomid}` and `/join/{roomid}`; V2 uses `/v2/r/{roomid}` and `/v2/join/{roomid}`. The V2 namespace is preserved in returned room links and embedded page parameters. The current browser implements all four of its local modes — P2P, Upgrading, SFU, and Downgrading — the responsive grid, transport handoff in both directions, and polite-peer perfect negotiation. `Downgrading` is a browser-local state with no authority counterpart: the room mode goes straight back to `P2P` (§4.4), while the browser holds the grid up until direct media can play.
 
 ### 6.1 One browser application, two layouts
 
@@ -698,9 +706,9 @@ Every `SignalingToSfu.command` carries a signaling-allocated nonzero `request_id
 |---------------|------------------------------------------------------------------------|----------------|
 | `SyncRoom`    | `room_id`, `assignment_epoch`, repeated `{client_id,lifecycle_id}`      | Reconcile the local membership projection to the authoritative roster; accept no browser SDP/ICE for the room until synchronization succeeds. |
 | `JoinMember`  | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`             | Apply `SFUEvent::Join` once and return `MemberJoined` with all identity fields echoed. |
-| `LeaveMember` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, `reason`   | Apply `SFUEvent::Leave` once and return `MemberLeft` with all identity fields echoed. The reason is advisory: `USER` for `/v2/leave`, `DISCONNECTED` for a dropped browser socket, and `ROOM_CLOSED` for the leaves issued by an SFU→P2P downgrade. `LEAVE_REASON_DOWNGRADE` is reserved in the Protobuf enum and unused by the current authority. |
+| `LeaveMember` | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, `reason`   | Apply `SFUEvent::Leave` once and return `MemberLeft` with all identity fields echoed. The reason is advisory: `USER` for `/v2/leave`, `DISCONNECTED` for a dropped browser socket, and `ROOM_CLOSED` for the leaves issued by an SFU→P2P downgrade. `LEAVE_REASON_DOWNGRADE` is defined in the Protobuf enum but never sent; the Rust `LeaveReason` has no such variant. |
 | `SfuSignal`   | `room_id`, `client_id`, `lifecycle_id`, `assignment_epoch`, opaque `message_json` | Parse the inner AppRTC SDP/candidate/end-of-candidates JSON and apply it only to the matching current member lifecycle. An inner `bye` is ignored because membership is owned by `LeaveMember`. |
-| `DrainSfu`    | optional `deadline_unix_ms`                                            | Reserved by the Protobuf contract. The current adapter acknowledges it, but signaling does not issue it and the worker does not change readiness. |
+| `DrainSfu`    | optional `deadline_unix_ms`                                            | Defined by the Protobuf contract but unused. The current adapter acknowledges it, but signaling never issues it and the worker does not change readiness. |
 
 `SfuCommandResult.ok` contains `RoomSynced`, `MemberJoined`, `MemberLeft`, or an empty acknowledgement as appropriate. Expected operation failures use its typed `Error` arm. A stale `assignment_epoch` or `lifecycle_id` is rejected without mutating the engine.
 
@@ -906,7 +914,8 @@ The three tiers scale for different reasons and are independent of one another. 
 scale HTTP, TLS and static-asset serving; any edge can serve any room. **N signaling nodes** hold authoritative room
 state in memory and scale the number of concurrent rooms; a room lives on exactly one of them. **K SFU workers** scale
 forwarded media. Only the edge↔node relationship poses a routing problem, and §9.2 resolves it by putting the answer
-inside the room ID.
+inside the room ID. §9.7 then settles the connection topology of all three tiers, which follows from one distinction:
+resolving a room is a *forced* destination, while minting one and assigning a worker are *free* choices.
 
 ### 9.1 The problem
 
@@ -921,12 +930,12 @@ participants would never see each other.
 
 The asymmetry with the media tier is worth understanding, because it explains why only this one relationship is hard.
 A room's **worker** assignment is decided once, by the single node that owns the room, and kept in that node's memory —
-`Room` carries `assigned_sfu`/`assignment_epoch` and each `Worker` carries its `assigned_rooms` (§1, §5). Nobody else
+`Room` carries `assigned_instance`/`assignment_epoch` and each `Worker` carries its `assigned_rooms` (§1, §5). Nobody else
 ever re-derives it: the owning node already knows which worker holds the room and issues commands on that worker's
 `OpenSfuSession` stream. That stays true however workers are shared. Today each worker points at one node, but a worker
-may equally register to several nodes — or all of them — opening one stream per node and acting as a shared pool; each
-node still decides and stores the assignments for *its own* rooms. What pooling changes is capacity accounting (§9.10),
-not routing.
+may equally register to several — `d = min(N, d_max)` of them, chosen by rendezvous hashing (§9.7.1) — opening one
+stream per selected node and acting as a shared pool; each node still decides and stores the assignments for *its own*
+rooms. What pooling changes is capacity accounting (§9.11), not routing.
 
 The room→**node** mapping has no such home. It must be resolved by M stateless edges that share no memory and cannot
 consult each other, *before any authoritative state for the room exists* — there is not yet a room, or an owner, to
@@ -951,7 +960,9 @@ flowchart LR
     S1 <-. gRPC .-> WK
 ```
 
-Both browsers hold a link for a room whose ID names `s1`, so both edges route there without consulting anything.
+Both browsers hold a link for a room whose ID names `s1`, so both edges route there without consulting anything. The
+dotted worker links are the pooled registrations of §9.7.1: each worker holds one stream to each of the `d` nodes it
+selects, not to all N.
 
 ### 9.2 The scheme: room IDs carry their home node
 
@@ -975,7 +986,7 @@ needs no change at all**. Two participants served by different edges receive the
 the same tag out of the same ID. `GetStatus` is node-local and stays unrouted.
 
 **Why put the answer in the ID rather than compute it.** The alternative is to derive the home from the ID by hashing
-it (§9.12), which works but makes the mapping a function of the *node set* — so changing the set moves rooms. A tag is
+it (§9.13), which works but makes the mapping a function of the *node set* — so changing the set moves rooms. A tag is
 a function of nothing, so it never does:
 
 - **Topology changes stop being dangerous.** Adding a node disturbs no existing room, because no minted ID's tag
@@ -993,7 +1004,7 @@ a function of nothing, so it never does:
 - Existing rooms are never rebalanced. A node that gets hot stays hot for the links already minted on it.
 - Retiring a node permanently invalidates its links — correct, since their state died with it, provided the failure is
   explicit rather than a silent re-creation elsewhere (§9.4).
-- Only IDs the service mints carry a tag, so V1 — whose IDs the client chooses — needs its own answer (§9.7).
+- Only IDs the service mints carry a tag, so V1 — whose IDs the client chooses — needs its own answer (§9.8).
 
 ### 9.3 Room ID format: tagged UUIDv8, rendered base64url
 
@@ -1003,7 +1014,7 @@ a function of nothing, so it never does:
 > base64url-unpadded in links and browser JSON, carried as 16 bytes over gRPC, and validated on the way in (§3.1, §8.1).
 > What is **not** implemented is the interior layout below — the node tag and the expiry. Today all 122 free bits are
 > random, which is exactly the `T = 0` case of this section: routing has nothing to read out of the id yet, so a
-> multi-node deployment would still need §9.2 hashing. Adopting §9.9 means reserving those bits *before* the first link
+> multi-node deployment would still need §9.2 hashing. Adopting §9.10 means reserving those bits *before* the first link
 > is minted, since the widths cannot change afterwards.
 
 The structure must live inside the UUID rather than as a prefix bolted onto it, and RFC 9562 reserves **version 8** for
@@ -1137,7 +1148,7 @@ field should be sized to what it needs rather than to the space available.
 
 **Semantics to pin down, because they are easy to assume wrongly.**
 
-- **Expiry bounds the link, not the room.** Room state still dies when the room empties or its node restarts (§9.9);
+- **Expiry bounds the link, not the room.** Room state still dies when the room empties or its node restarts (§9.10);
   expiry only says when the *identifier* stops being accepted. A link may well be dead long before it expires.
 - **It cannot be extended.** The value is immutable inside the ID, so a meeting that needs to outlive its window needs a
   newly minted link. Long-lived or recurring meetings must therefore be minted with a long TTL up front, bounded by the
@@ -1161,7 +1172,7 @@ those spellings would become *different rooms*. Two rules close it:
 
 **Case sensitivity is the accepted cost.** base64url distinguishes `TSiE…` from `tsie…`, so a client that lowercases a
 link produces a valid-looking token for a room that does not exist. Rooms are therefore *copied*, not retyped or
-dictated, and the join-by-paste field (§9.11) must reject a mis-cased token rather than case-fold it, since folding
+dictated, and the join-by-paste field (§9.12) must reject a mis-cased token rather than case-fold it, since folding
 would silently resolve to a different UUID. A case-insensitive alphabet such as Crockford base32 would avoid this, at
 26 characters instead of 22.
 
@@ -1173,7 +1184,7 @@ the SFU engine.
 
 **Cost of the room-ID change**, recorded because it is not small: `RoomId` becomes a string type in three repositories —
 `sfu/src/room.rs`, `signaling/src/v2.rs`, and 20 Protobuf fields — and roughly 65 use sites in the SFU engine lose
-`Copy`. Because V2 takes the change outright rather than accepting both shapes (§9.7), the normative V2 room-ID rules
+`Copy`. Because V2 takes the change outright rather than accepting both shapes (§9.8), the normative V2 room-ID rules
 are *replaced* rather than extended: `RoomIdV2 = U64Decimal` in §8.1 becomes the token grammar above, and the
 canonical-decimal validation in §3.1 and §8.3 applies to `ClientIdV2` only. One format on the wire, one in the URL, one
 in the logs.
@@ -1184,7 +1195,7 @@ Resolution is a pure function of the path segment and a tag table, evaluated ide
 
 ```text
 resolve(version, segment) -> Node | Error
-  V1 route  -> §9.7
+  V1 route  -> §9.8
   V2 route  -> canonical tagged token -> tag_table[tag(segment)]
                anything else          -> INVALID_ROOM_ID
 ```
@@ -1206,7 +1217,7 @@ resolve to the new node and silently create a fresh, empty room instead of repor
 
 A tag names a *deployment slot*, not a process incarnation. A node that crashes and restarts reclaims its tag, so its
 links keep working and simply find an empty room — the same behaviour as today's single-node restart, scoped to 1/N of
-rooms (§9.9).
+rooms (§9.10).
 
 ### 9.5 Minting: where a room is born
 
@@ -1223,7 +1234,7 @@ likely to matter:
 | alive at mint, dead later | A link already pasted into a calendar invite stops working | **No.** Nothing at mint time can predict this |
 
 The second row is the one that actually hurts, and no amount of verification prevents it: it is ordinary node failure
-(§9.9), unavoidable in any scheme that puts a home in the ID. Verification only defends the first row — the case whose
+(§9.10), unavoidable in any scheme that puts a home in the ID. Verification only defends the first row — the case whose
 blast radius is one user, one click, and no distributed links. Spending a round trip on every mint to shrink that is a
 poor trade.
 
@@ -1346,7 +1357,7 @@ single `--grpc-url`/`--ws-url` remaining valid as the degenerate one-node form:
 When editing M edges to add a node becomes tiresome, the table can be **derived from DNS** instead: one address record
 per node, re-resolved periodically, with each node's tag computed from its hostname (§9.3). Adding a node becomes
 adding a record, with no redeploy and no numbering convention to maintain — most of Option A's headline benefit, using
-a dependency that §9.8 already requires. TTL skew is safe for the same reason liveness disagreement is: it only grows
+a dependency that §9.9 already requires. TTL skew is safe for the same reason liveness disagreement is: it only grows
 or shrinks a mint pool, while the tag→host mapping is a hash of the hostname and therefore never ambiguous.
 
 **Liveness and load: probe `GetStatus`.** It already exists on the same channel (§8.4) and already returns per-node
@@ -1383,7 +1394,80 @@ answer that a registry would otherwise have to distribute. If Option A is adopte
 are the ones that keep it off the critical path — cache and serve stale, never block a join, and keep the mint-time
 probe.
 
-### 9.7 V1 backward compatibility
+### 9.7 Control-plane connection topology
+
+Three gRPC relationships carry the control plane, and "who dials whom, and how many" has a different answer for each.
+The deciding property is not connection cost. It is whether the destination is a **free choice** or a **forced** one:
+
+| Relationship                          | Destination                                                                       | Consequence                                    |
+|---------------------------------------|-----------------------------------------------------------------------------------|------------------------------------------------|
+| Edge → node, **resolving** a room     | **Forced** — the tag names exactly one node, and the state exists nowhere else     | Every edge must be able to reach every node    |
+| Edge → node, **minting** a room       | **Free** — any live, non-draining node will do                                     | Sampling a subset is fine; §9.5 samples two    |
+| Node → worker, **assigning** a room   | **Free** — any ready worker with capacity will do                                  | A subset of the fleet suffices                 |
+
+Free choice tolerates a partial view: the worst case is slightly worse placement. A forced destination does not — an
+edge that cannot reach the one node a tag names has no correct fallback, because routing elsewhere would fabricate a
+second empty room (§9.6). That single distinction settles the topology of all three relationships, and it is why the
+two tiers get opposite answers.
+
+#### 9.7.1 Workers and nodes: partial mesh, `d = min(N, d_max)`
+
+Workers dial nodes, and the stream *is* the registration (§5). Connecting declares `instance_id` and `Capacity`;
+`SfuHealth` keeps `current_rooms`/`current_clients` current; `Draining` withdraws the worker from selection; and a
+dropped stream is an unambiguous liveness signal that drives grace, replay after `SyncRoom`, or room failure. None of
+that needs a separate mechanism, and workers need no inbound control-plane reachability or stable name.
+
+Registering every worker with every node preserves all of it but scales badly in the one direction that matters: a
+K×N mesh grows with both fleets, while a node choosing a worker never needs more than a handful of candidates —
+power-of-two-choices needs two. **So a worker registers with `d = min(N, d_max)` nodes, chosen by rendezvous hashing
+over `(instance_id, node_tag)`, with `d_max` around 4–8.**
+
+|                                       | Full mesh                | Partial mesh, `d`                                          |
+|---------------------------------------|--------------------------|------------------------------------------------------------|
+| Total streams                         | K×N                      | K×d — **independent of N**                                  |
+| Per node                              | K                        | K·d/N                                                       |
+| Per worker                            | N                        | d                                                           |
+| Node added or removed                 | every worker re-dials    | ~d/N of workers move; rendezvous hashing is minimally disruptive |
+| Node restart                          | K-way reconnect herd     | K·d/N                                                       |
+| Blast radius of a bad worker build    | all N registries         | d/N of them                                                 |
+
+Rendezvous hashing is the right selector here for precisely the reason §9.13 rejects it for *rooms*: its dependence on
+the node set is a liability when it decides a permanent home and an asset when it decides a re-derivable one. A worker
+recomputes its `d` whenever the roster changes and re-dials the difference; nothing durable is keyed on the result. The
+hash must still be seed-free and version-pinned, since a worker and its operators must agree on the ranking.
+
+Three properties make this one rule rather than two modes:
+
+- **Small deployments are full mesh automatically.** `d = min(N, d_max)` collapses when N ≤ `d_max`.
+- **The choice stays worker-side.** A worker needs only the node roster it must already hold (§9.6). No node ever has
+  to discover workers, so no second discovery surface appears.
+- **Resilience improves in both directions.** `d ≥ 3` keeps a worker registered through node failures, where today's
+  single `--grpc-url` makes each worker a single-node failure domain (§9.11); and a node still sees K·d/N workers, so
+  losing one costs it a small fraction of its pool.
+
+#### 9.7.2 Edges and nodes: full identity, lazy connections, sampling only at mint
+
+An edge must hold the **complete** tag table. Subsetting it is not an optimisation but a correctness bug, because
+§9.4's three outcomes stop being distinguishable: an edge holding d of N tags cannot tell *retired* from *never told
+about*, so it either reports `ROOM_EXPIRED` for a live room or routes it somewhere plausible and silently creates the
+duplicate this section exists to prevent.
+
+Nothing needs subsetting anyway:
+
+- **Connections are already demand-driven.** `GrpcAuthority::connect` uses `connect_lazy()` with keepalive
+  (`src/grpc_client.rs`), so M×N is a ceiling rather than a cost: an edge that has never served a room homed on a node
+  has never opened a socket to it, and the channel establishes itself when it first does.
+- **M is small by construction.** Edges are stateless HTTP, TLS and static-asset servers (§9.11); they scale for a
+  different reason than rooms do, so M×N stays a few hundred lazy channels.
+- **Health, unlike identity, may be partial** — it gates only minting, never routing (§9.6) — but every `AdmitV2`,
+  `RemoveV2` and `OccupancyV2` is already a liveness signal on its own channel (§9.5), so the periodic probe covers
+  idle nodes only and there is little left to trim.
+
+Placement sampling stays **per mint** rather than fixed. §9.5's power-of-two-choices re-draws two candidates every
+time, which is strictly better than a fixed subset: a fixed one would make an edge's mints concentrate permanently on
+the same `d` nodes, which is the herding §9.5 exists to avoid.
+
+### 9.8 V1 backward compatibility
 
 V1 is unchanged and stays unchanged: opaque string room IDs, `/r/{roomid}`, `/join/{roomid}`, free-form typed names,
 `messages[]`, `wss_post_url`, and everything else §8.2 specifies. Its IDs are chosen by the client, so they can never
@@ -1393,7 +1477,7 @@ carry a tag and §9.2 cannot apply to them. Two options cover it, and V1's shape
   and are signaling-light — one node absorbs a large number of them. This removes room→node derivation from the design
   entirely: no hash function to version, no node-set agreement, no split-room hazard anywhere. The cost is that V1
   capacity stops scaling with N and V1 gains a single point of failure.
-- **Hash V1 across the node set** with rendezvous hashing (§9.12) if V1 volume justifies scaling it. This reintroduces
+- **Hash V1 across the node set** with rendezvous hashing (§9.13) if V1 volume justifies scaling it. This reintroduces
   set agreement — and with it the requirement that every edge hold the same set and a versioned, seed-free hash — but
   only for V1, where a mis-derived home splits a two-party P2P call that the browser reports immediately as a peer who
   never arrives, rather than an SFU conference.
@@ -1407,7 +1491,7 @@ forever, keeping it exposed to exactly the hazards tags remove. V2 has no compat
 this project's own protocol, its links are ephemeral meeting links rather than durable names, and a stale one gives a
 clear `INVALID_ROOM_ID`.
 
-### 9.8 DNS and certificates
+### 9.9 DNS and certificates
 
 | Name                      | Records                  | Used for                                                                                                  |
 |---------------------------|--------------------------|--------------------------------------------------------------------------------------------------------------|
@@ -1419,7 +1503,7 @@ clear `INVALID_ROOM_ID`.
 The per-node names need certificates — a wildcard `*.xxx.xx`, or a SAN list covering `s1…sN`. This replaces today's
 single signaling certificate and is the main operational cost of the whole design.
 
-### 9.9 Failure modes
+### 9.10 Failure modes
 
 | Situation                                       | Existing rooms with that tag                                                       | New rooms                            | What the user sees                                       |
 |-------------------------------------------------|-------------------------------------------------------------------------------------|--------------------------------------|------------------------------------------------------------|
@@ -1441,27 +1525,34 @@ Three of these carry the design's weight:
 - **A node that is down costs capacity, not correctness.** Nothing is misrouted and no room splits; the mint pool is
   smaller until it returns.
 
-### 9.10 Capacity consequences
+### 9.11 Capacity consequences
 
 - **A room never spans nodes.** N scales the *number* of concurrent rooms, not the size of any one room; a single hot
-  room is still bounded by one node's capacity. Cross-node rooms would require node-to-node relay (§9.12).
+  room is still bounded by one node's capacity. Cross-node rooms would require node-to-node relay (§9.13).
 - **Partitioned workers must be sized per node.** In the current one-node-per-worker shape, node `si` can upgrade rooms
   only onto workers registered to `si`, so a node with no ready worker returns `NO_SFU_AVAILABLE` even while another
   node's workers idle. Size for the worst node: at least two workers each, and prefer K ≥ 2N.
 - **Moving a partitioned worker between nodes is a drain, not a reconfigure.** Repointing `--grpc-url` restarts the
   process, which yields a new `instance_id` and fails its established rooms (§5).
-- **A pooled worker removes the partition but splits the load view.** Registering to several nodes (§9.1) lets every
-  node place rooms on it, so no node is capacity-starved while another idles. The cost is that each node's
-  `assigned_clients`/`assigned_rooms` counters (§5) count only *its own* rooms, so N nodes independently choosing the
-  "least-loaded" worker can converge on one and oversubscribe it. Two adjustments make pooling safe: place on the
-  worker's **reported** load (`SfuHealth.current_rooms`/`current_clients` are already on the wire, §8.5, and are the
-  only fleet-wide view), and expect that figure to lag concurrent placements from other nodes, so `JoinMember` must be
-  allowed to reject and the upgrade barrier must fail that room cleanly (§4.2). A pooled worker also stops being a
-  single-node failure domain.
+- **A pooled worker removes the partition but splits the load view.** Registering to `d` nodes (§9.7.1) lets every one
+  of them place rooms on it, so no node is capacity-starved while another idles. The cost is that each node's
+  `assigned_clients`/`assigned_rooms` counters (§5) count only *its own* rooms, so `d` nodes independently choosing the
+  "least-loaded" worker can converge on one and oversubscribe it. This is the sharper problem, not the stream count:
+  it worsens with the number of nodes sharing a worker however cheap the connections are. Three adjustments make
+  pooling safe: place on the worker's **reported** load (`SfuHealth.current_rooms`/`current_clients` are already on the
+  wire, §8.5, and are the only fleet-wide view); use power-of-two-choices over the candidate workers rather than strict
+  least-loaded, which bounds convergence for the same reason it does at mint time (§9.5); and expect the reported
+  figure to lag concurrent placements from other nodes anyway, so `JoinMember` must be allowed to reject and the
+  upgrade barrier must fail that room cleanly (§4.2). A pooled worker also stops being a single-node failure domain.
+- **Under partial mesh, "K ≥ 2N" becomes "K·d/N ≥ 2, with margin."** A node's candidate pool is `K·d/N` workers in
+  expectation rather than all K, so the sizing rule scales with `d` instead of with the node count: K=500, N=20, d=4
+  leaves 100 candidates per node. The awkward case is a small worker fleet under many nodes — but there
+  `d = min(N, d_max)` has already collapsed to a full mesh, and the honest reading is that the cluster is
+  under-provisioned for its node count.
 - **Edges are stateless and cheap.** M scales HTTP, TLS and static assets independently of room capacity, which is why
   M and N need not be equal.
 
-### 9.11 Room selection UI
+### 9.12 Room selection UI
 
 Minting is only reachable if the UI stops inventing room IDs client-side, so the room-selection page moves to the
 Meet/Webex shape:
@@ -1481,16 +1572,18 @@ enumerable by anyone who guesses a number, and the admission token (§7) protect
 existence. Minted-only IDs carry 74 random bits (§9.3) which, with rate limiting, makes enumeration impractical — and
 they expire, so a leaked link stops working on its own.
 
-### 9.12 Alternatives considered
+### 9.13 Alternatives considered
 
 | Alternative                                    | Why not                                                                                                                        |
 |------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| **Rendezvous hashing** for V2 — derive `home(room) = argmax over nodes of H(node_id ‖ room_key)` | Works with no external service and no minting, and remains the option for V1 (§9.7). Rejected as the primary scheme because the mapping depends on the node *set*: changing it remaps ~1/N of rooms, every edge must hold an identical set, and a single stale edge splits rooms silently. It also demands a seed-free, version-pinned hash — Rust's default `RandomState` reseeds per process and would give every edge a different answer. Tags remove all of this. |
+| **Rendezvous hashing** for V2 — derive `home(room) = argmax over nodes of H(node_id ‖ room_key)` | Works with no external service and no minting, and remains the option for V1 (§9.8). Rejected as the primary scheme because the mapping depends on the node *set*: changing it remaps ~1/N of rooms, every edge must hold an identical set, and a single stale edge splits rooms silently. It also demands a seed-free, version-pinned hash — Rust's default `RandomState` reseeds per process and would give every edge a different answer. Tags remove all of this. |
 | Shared store (Redis/etcd) for a room→node map  | Solves it, but puts an external service in front of every join and adds an availability dependency the tag scheme does not need. Distinct from §9.6.1, which stores only the *node roster* and stays off the request path. |
 | Sticky L7 load balancer or cookie affinity     | Needs an external balancer, and cannot help the WebSocket: the browser resolves the signaling hostname itself.                    |
 | Node-to-node forwarding (owner node relays)    | Removes the routing requirement but doubles the hop count for every frame and adds a full mesh with its own failure semantics. It is the natural extension if one room must ever exceed one node — not before. |
+| **Inverted gRPC** — workers act as gRPC servers, nodes dial them, and nodes find workers by DNS round-robin over an `sfu.rs` name | Removes the worker's need for a node roster, but trades a small, stable, already-required list (N nodes, which every edge must hold anyway for tags) for a large, volatile one (K autoscaling workers), and then picks the mechanism carrying the least information about it. Worker selection is stateful, capacity-aware **assignment**, not load balancing: a room stays on its worker for life, so the node needs `current_clients`, `Draining` and a live view — none of which DNS provides. Placement degrades to uniform random, the policy §9.5 ranks lowest; a draining worker keeps receiving rooms until the TTL expires; and a crashed worker's address is handed out until it does. Inversion also dissolves what the registration stream gives for free (§5): one `instance_id` per incarnation becomes K discoveries to correlate, and a worker that restarted empty stops being distinguishable from one still holding its rooms. The one real gain — per-room isolation, so a single stream drop does not resync every room on that worker — is available without any of this, as per-room *streams* on the pooled connection. §9.7.1 addresses the fan-out concern that motivates the whole idea. |
+| Per-room gRPC **connection** (edge→node, or node→worker) | The routing granularity is right and is already the design (§9.4); the *connection* granularity is not. Edge→node calls are unary over one multiplexed HTTP/2 channel, so a connection per room replaces a few hundred warm channels with one per active room per edge — tens of thousands of handshakes, descriptors and buffer pairs — or, if torn down after each call, puts a TLS handshake on every join. HTTP/2 streams already isolate concurrent RPCs; where per-room isolation is genuinely wanted it is a stream, not a connection. |
 
-### 9.13 Implementation seams
+### 9.14 Implementation seams
 
 The current code is close to this, because room identity is already threaded through both surfaces that need to route:
 
@@ -1502,5 +1595,14 @@ The current code is close to this, because room identity is already threaded thr
   edge starts while nodes are down.
 - New: a `POST /v2/room` mint endpoint, the token codec and validator, the tag table and its health view, and
   `--signaling-node`/`--v1-node` configuration.
+- The SFU worker takes the same node roster instead of one `--grpc-url`, computes its `d` by rendezvous hash, and opens
+  one `OpenSfuSession` per selected node carrying the *same* `instance_id` on all of them (§9.7.1); `--sfu-mesh-degree`
+  configures `d_max`. Re-running the hash on a roster change and dialing only the difference is the whole of the
+  reconfiguration path.
+- `signaling`'s worker registry already keys on `instance_id` and holds per-node counters (§5), so partial mesh needs
+  no structural change there — only that worker selection prefer the reported `SfuHealth` figures over the local
+  counters, and sample two candidates rather than scanning for the minimum (§9.11).
 - `/status` should expose the tag table with each node's last probe result, and a debug route resolving a token to its
-  tag makes routing questions answerable with one curl.
+  tag makes routing questions answerable with one curl. It should also expose the worker mesh from both ends — which
+  nodes a worker selected, and how many workers each node sees — since an under-provisioned `K·d/N` is otherwise
+  invisible until an upgrade returns `NO_SFU_AVAILABLE`.
