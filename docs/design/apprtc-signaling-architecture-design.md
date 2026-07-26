@@ -907,8 +907,10 @@ sequenceDiagram
 
 ## 9. Horizontal scale: M apprtc edges, N signaling nodes, K SFU workers
 
-This section is a design proposal. Nothing in it is implemented: the current runtime takes one `--grpc-url` and one
-`--ws-url`, which is exactly the M=1, N=1 case.
+This section is a design proposal. The routing scheme is unimplemented — the current runtime takes one `--grpc-url`
+and one `--ws-url`, which is exactly the M=1, N=1 case. One piece has already landed ahead of the rest: the V2 room-ID
+type change this section called for is done (§9.3), so what remains unbuilt is the *interior layout* of that ID and
+everything that routes off it.
 
 The three tiers scale for different reasons and are independent of one another. **M apprtc edges** are stateless and
 scale HTTP, TLS and static-asset serving; any edge can serve any room. **N signaling nodes** hold authoritative room
@@ -1202,6 +1204,11 @@ add a region field ahead of the node tag for multi-region routing, change the ex
 that turns out to be wrong. Four layouts is a small hatch, but one migration is the realistic need, and the field is
 only meaningful if every layout keeps it at 62–63 — that is the single invariant every implementation must honour.
 
+The corresponding rule at the reader: **an implementation must reject a layout it does not know, never parse it as
+layout 0.** A layout-1 token parsed under layout-0 rules yields a plausible tag from the wrong bits and routes the room
+to an arbitrary node — the silent mis-routing this field exists to prevent. Unknown layouts join the §9.4 lookup as a
+fourth outcome, reported like an unknown tag: fail loudly, because it means a stale edge.
+
 #### 9.3.4 Canonical rendering, case, and what stays numeric
 
 **Canonical encoding is mandatory, and this is the sharp edge.** 128 bits is not a multiple of 6, so the 22nd character
@@ -1225,12 +1232,15 @@ and the browser recovers the publisher with `/peer-(\d+)/` (`web/js/appcontrolle
 break that regex and make the msid ambiguous to split. Keeping it numeric also preserves `Copy` on the hottest type in
 the SFU engine.
 
-**Cost of the room-ID change**, recorded because it is not small: `RoomId` becomes a string type in three repositories —
-`sfu/src/room.rs`, `signaling/src/v2.rs`, and 20 Protobuf fields — and roughly 65 use sites in the SFU engine lose
-`Copy`. Because V2 takes the change outright rather than accepting both shapes (§9.8), the normative V2 room-ID rules
-are *replaced* rather than extended: `RoomIdV2 = U64Decimal` in §8.1 becomes the token grammar above, and the
-canonical-decimal validation in §3.1 and §8.3 applies to `ClientIdV2` only. One format on the wire, one in the URL, one
-in the logs.
+**Cost of the room-ID change, in hindsight.** This part is done, and it came in cheaper than the estimate it replaces.
+`RoomId` is `Uuid` in both `sfu/src/room.rs` and `signaling/src/v2.rs`, and the 20 Protobuf fields carry `bytes
+room_id`. The predicted expense was that ~65 use sites in the SFU engine would lose `Copy`; they did not, because
+`Uuid` is itself `Copy` — the demuxer still dereferences a cached `(RoomId, ClientId)` straight out of its affinity
+map. The real work was elsewhere: the third rendering (§3.1), since the ICE ufrag cannot use base64url, and the
+canonical-spelling rules of this subsection. Because V2 took the change outright rather than accepting both shapes
+(§9.8), the normative V2 room-ID rules were *replaced* rather than extended: `RoomIdV2` in §8.1 is the token grammar,
+and canonical-decimal validation in §3.1 and §8.3 now applies to `ClientIdV2` only. One format on the wire, one in the
+URL, one in the logs.
 
 ### 9.4 Resolving a room to its node
 
@@ -1378,8 +1388,9 @@ What it buys, concretely:
 - **Death detection becomes shared and fast** — one authoritative session expiry instead of M independent opinions
   converging at their own rates.
 - **Drain becomes a flag**, flipped in one place, honoured by every edge's mint pool immediately.
-- **Tag uniqueness can be enforced mechanically** rather than by operator discipline — though this benefit disappears
-  entirely if tags are self-assigned by hashing (§9.3), which is one more reason to prefer the wide tag.
+- **Tag uniqueness can be enforced mechanically** rather than by operator discipline — though at the chosen 30-bit
+  width tags are self-assigned by hashing and collide only past ~10 000 nodes (§9.3.1), so this benefit is largely
+  already banked.
 
 What it costs:
 
@@ -1409,10 +1420,18 @@ single `--grpc-url`/`--ws-url` remaining valid as the degenerate one-node form:
 --signaling-node C=s3.xxx.xx,https://s3.xxx.xx:50051,wss://s3.xxx.xx:8443/ws
 ```
 
-When editing M edges to add a node becomes tiresome, the table can be **derived from DNS** instead: one address record
-per node, re-resolved periodically, with each node's tag computed from its hostname (§9.3). Adding a node becomes
-adding a record, with no redeploy and no numbering convention to maintain — most of Option A's headline benefit, using
-a dependency that §9.9 already requires. TTL skew is safe for the same reason liveness disagreement is: it only grows
+When editing M edges to add a node becomes tiresome, the table can be **derived from DNS** instead — but it must come
+from a record type that enumerates *hostnames*, not addresses, because a tag is a hash of the hostname (§9.3.1) and an
+address set cannot be turned back into the names that produced it. `SRV` does exactly that, and carries the port:
+
+```text
+_signaling._tcp.xxx.xx.  SRV  0 0 50051 s1.xxx.xx.
+_signaling._tcp.xxx.xx.  SRV  0 0 50051 s2.xxx.xx.
+```
+
+Edges re-resolve periodically and compute each tag from the target name. Adding a node becomes adding a record, with no
+redeploy and no numbering convention to maintain — most of Option A's headline benefit, using a dependency that §9.9
+already requires. TTL skew is safe for the same reason liveness disagreement is: it only grows
 or shrinks a mint pool, while the tag→host mapping is a hash of the hostname and therefore never ambiguous.
 
 **Liveness and load: probe `GetStatus`.** It already exists on the same channel (§8.4) and already returns per-node
@@ -1446,8 +1465,8 @@ after it comes up.
 **Start with Option B, and adopt Option A when node churn or M makes config rollout the bottleneck.** Neither is a
 correctness question under §9.2, which is precisely why the cheap option is viable: the room ID already carries the
 answer that a registry would otherwise have to distribute. If Option A is adopted later, the rules that must survive
-are the ones that keep it off the critical path — cache and serve stale, never block a join, and keep the mint-time
-probe.
+are the ones that keep it off the critical path — cache and serve stale, never block a join, and keep minting reading a
+locally held health view rather than consulting the registry synchronously (§9.5).
 
 ### 9.7 Control-plane connection topology
 
@@ -1553,7 +1572,8 @@ clear `INVALID_ROOM_ID`.
 | `appr.tc`                 | M edge addresses         | Browser HTTP(S). Round-robin is correct and desirable — any edge serves any room.                             |
 | `s1.xxx.xx` … `sN.xxx.xx` | one address each         | Browser WSS and edge→node gRPC. These are what `wss_url` and the tag table point at.                          |
 | `xxx.xx`                  | N addresses (optional)   | Humans and health checks only. **Never** usable as `wss_url`: it would land the browser on an arbitrary node.  |
-| `sfu.rs`                  | K worker addresses       | The optional redirect page only; media is addressed by ICE candidates.                                        |
+| `_signaling._tcp.xxx.xx`  | SRV, one per node        | Optional roster derivation (§9.6.2). Enumerates node *hostnames*, which is what tags are computed from.        |
+| `sfu.rs`                  | K worker addresses       | The optional redirect page only. Media is addressed by ICE candidates, and worker selection is deliberately not a DNS decision (§9.13). |
 
 The per-node names need certificates — a wildcard `*.xxx.xx`, or a SAN list covering `s1…sN`. This replaces today's
 single signaling certificate and is the main operational cost of the whole design.
@@ -1638,26 +1658,149 @@ existence. Minted-only IDs carry 62 random bits (§9.3) which, with rate limitin
 | **Inverted gRPC** — workers act as gRPC servers, nodes dial them, and nodes find workers by DNS round-robin over an `sfu.rs` name | Removes the worker's need for a node roster, but trades a small, stable, already-required list (N nodes, which every edge must hold anyway for tags) for a large, volatile one (K autoscaling workers), and then picks the mechanism carrying the least information about it. Worker selection is stateful, capacity-aware **assignment**, not load balancing: a room stays on its worker for life, so the node needs `current_clients`, `Draining` and a live view — none of which DNS provides. Placement degrades to uniform random, the policy §9.5 ranks lowest; a draining worker keeps receiving rooms until the TTL expires; and a crashed worker's address is handed out until it does. Inversion also dissolves what the registration stream gives for free (§5): one `instance_id` per incarnation becomes K discoveries to correlate, and a worker that restarted empty stops being distinguishable from one still holding its rooms. The one real gain — per-room isolation, so a single stream drop does not resync every room on that worker — is available without any of this, as per-room *streams* on the pooled connection. §9.7.1 addresses the fan-out concern that motivates the whole idea. |
 | Per-room gRPC **connection** (edge→node, or node→worker) | The routing granularity is right and is already the design (§9.4); the *connection* granularity is not. Edge→node calls are unary over one multiplexed HTTP/2 channel, so a connection per room replaces a few hundred warm channels with one per active room per edge — tens of thousands of handshakes, descriptors and buffer pairs — or, if torn down after each call, puts a TLS handshake on every join. HTTP/2 streams already isolate concurrent RPCs; where per-room isolation is genuinely wanted it is a stream, not a connection. |
 
-### 9.14 Implementation seams
+### 9.14 Implementation plan
 
-The current code is close to this, because room identity is already threaded through both surfaces that need to route:
+**The ordering principle is irreversibility, not difficulty.** Exactly one step here cannot be undone — reserving the
+ID layout — because it is baked into every link minted afterwards. It is also the smallest. Everything else is
+ordinary refactoring that can be reverted, so it goes second and can be resequenced freely.
 
-- `RoomAuthority` (`src/grpc_client.rs`) takes the room ID on **every** method. A routing implementation owning N tonic
-  channels and dispatching on the tag slots in behind the trait with no changes at the call sites in `room_server.rs`.
-- `RoomParameters::build_room_parameters` (`src/params.rs`) already receives `room_id` before it builds `wss_url`;
-  today it returns the single configured value, and would return the home node's URL instead.
-- `GrpcAuthority::connect` already uses `connect_lazy()` with keepalive, so N channels cost nothing until used and an
-  edge starts while nodes are down.
-- New: a `POST /v2/room` mint endpoint, the token codec and validator, the tag table and its health view, and
-  `--signaling-node`/`--v1-node` configuration.
-- The SFU worker takes the same node roster instead of one `--grpc-url`, computes its `d` by rendezvous hash, and opens
-  one `OpenSfuSession` per selected node carrying the *same* `instance_id` on all of them (§9.7.1); `--sfu-mesh-degree`
-  configures `d_max`. Re-running the hash on a roster change and dialing only the difference is the whole of the
-  reconfiguration path.
-- `signaling`'s worker registry already keys on `instance_id` and holds per-node counters (§5), so partial mesh needs
-  no structural change there — only that worker selection prefer the reported `SfuHealth` figures over the local
-  counters, and sample two candidates rather than scanning for the minimum (§9.11).
-- `/status` should expose the tag table with each node's last probe result, and a debug route resolving a token to its
-  tag makes routing questions answerable with one curl. It should also expose the worker mesh from both ends — which
-  nodes a worker selected, and how many workers each node sees — since an under-provisioned `K·d/N` is otherwise
-  invisible until an upgrade returns `NO_SFU_AVAILABLE`.
+| # | Stage | Reversible? | Needs N>1? | Blocked by |
+|---|-------|-------------|------------|------------|
+| 1 | Reserve the ID layout | **No** — links outlive it | No | — |
+| 2 | Service-side minting (`POST /v2/room`) | Yes | No | 1 |
+| 3 | Tag table and routing — **Option B identity** (§9.6.2) | Yes | No | 1 |
+| 4 | Health view, mint pool, placement — **Option B liveness** (§9.6.2) | Yes | **Yes** | 2, 3 |
+| 5 | Worker partial mesh | Yes | No | **independent of 1–4** |
+| 6 | Roster automation: SRV, then Option A if needed | Yes | Yes | 4 |
+
+**Option B is not a stage — it is stages 3 and 4.** §9.6.3 says to start there, so the plan builds it by default and
+never asks the question at deploy time: stage 3 is its identity half (a configured tag table), stage 4 its liveness
+half (`GetStatus` probing). Stage 6 is the escalation ladder off it, taken only when config rollout becomes the
+constraint, and Option A is its last rung rather than its first.
+
+Stage 5 shares no code with stages 1–4 and can proceed in parallel by a second pair of hands.
+
+#### 9.14.1 Seams the current code already provides
+
+- **`RoomAuthority` (`src/grpc_client.rs:25`) takes the room ID on every routed method** — `admit_v2`, `remove_v2`,
+  `occupancy_v2` and their V1 counterparts. A routing implementation owning a tag→channel map slots in behind the
+  trait with no change at the call sites in `room_server.rs`. `status()` is the one method with no room ID, and it
+  stays node-local and unrouted (§9.2).
+- **`RoomParameters::build_room_parameters` (`src/params.rs:99`) already receives `room_id` before it builds `wss_url`**
+  — today it returns the single configured `signaling_ws_url` (`src/config.rs:35`); it would return the home node's.
+- **`GrpcAuthority::connect` already uses `connect_lazy()` with keepalive**, so a tag table of N channels costs nothing
+  until used, and an edge starts cleanly while nodes are down (§9.7.2).
+- **The token codec already exists on both sides** — `signaling/src/v2.rs` (`new_room_id`, `format_room_token`,
+  `parse_room_token`, `is_room_uuid`) and `src/room_id.rs` for the gRPC boundary — so stage 1 extends validators
+  rather than introducing them.
+
+#### 9.14.2 Stage 1 — Reserve the ID layout
+
+Do this before any link that must outlive the change, **even while N = 1**, where the tag is a constant and nothing
+routes. It is what makes stages 3–4 possible later instead of never (§9.3).
+
+- `src/room_id.rs` grows the layout codec: `mint(tag, expiry_minutes, layout) -> RoomId`, plus `tag_of`, `expiry_of`
+  and `layout_of` accessors, and a prefix-only `tag_from_token(&str) -> Option<u32>` that reads the first five
+  characters without base64-decoding — the fast path §9.4 routes on.
+- `signaling/src/v2.rs:36 new_room_id()` stops being 122 random bits and takes the fields.
+- `parse_room_token` (`signaling/src/v2.rs:60`) gains two rejections on top of length, canonical final character,
+  version and variant: **layout ≠ 0 is rejected, never parsed as layout 0** (§9.3.3), and an expired timestamp is
+  rejected with the skew tolerance of §9.3.2.
+- Tests: round-trip each field at its boundary values (tag 0 and 2³⁰−1, expiry 0 and 2²⁸−1, layout 0–3); assert
+  `tag_from_token` agrees with a full decode over random input; assert layout 1–3 and expired tokens are refused.
+
+> **Cutover.** Existing V2 links stop working the moment this ships: their bits are all random, so the layout field is
+> non-zero with probability 3/4 and the tag is meaningless in any case. This is acceptable under §9.8 — V2 links are
+> ephemeral meeting links, not durable names — but it is a user-visible break, not a silent one, and it should ship at
+> a chosen moment rather than incidentally.
+
+#### 9.14.3 Stage 2 — Service-side minting
+
+Minting is unreachable while the browser invents IDs (§9.12), so this stage moves that authority to the service.
+
+- **New `POST /v2/room`** in `src/room_server.rs` beside the existing `/v2/join`, `/v2/leave`, `/v2/r` and `/v2/params`
+  routes (lines 90–97). It returns `{room_id, room_link, expires_at}` and takes the TTL as an optional parameter with
+  a sane default — never a hard-coded constant, since an expiry cannot be extended afterwards (§9.3.2).
+- **`web/js/roomselection.js` stops minting.** Delete `generateRoomToken` (line 104) and its two call sites (lines 255,
+  322); `[RANDOM]` becomes `[Generate]` and calls the endpoint. `isRoomToken` (line 115) survives as a *validator* for
+  the join-by-paste field, and gains the layout and expiry checks — it can reject an expired link client-side without a
+  round trip, because the expiry is in the ID. It cannot check the tag; that is the edge's job.
+- Test: no code path in the browser produces a room ID; a mis-cased token is rejected rather than case-folded (§9.3.4).
+
+#### 9.14.4 Stage 3 — Tag table and routing
+
+This is **the identity half of Option B** (§9.6.2): the tag table comes from configuration, and nothing external is
+introduced. Still exercisable at N = 1, which is the point — the routing code path is live and tested before a second
+node exists.
+
+- **`--signaling-node <tag>,<grpc-url>,<wss-url>`, repeatable**, with today's `--grpc-url`/`--ws-url` retained as the
+  degenerate one-node form. Plus `--v1-node <tag>` for §9.8.
+- **`resolve(version, raw_room_id)` per §9.4**, returning Live / Retired / Unknown / unknown-layout as distinguishable
+  outcomes — collapsing them is the failure mode that turns a config mistake into a fabricated room.
+- **A routing `RoomAuthority`** owning a `tag -> GrpcAuthority` map, dispatching on `tag_from_token`. Call sites unchanged.
+- **`build_room_parameters` takes the resolved node's `wss_url`** so the browser registers on the right node — the
+  second of the two surfaces §9.2 identifies.
+- Test: configure two nodes where the second is a stub; assert a token tagged for node B never produces a call to node
+  A, and that an unknown tag fails loudly instead of defaulting.
+
+#### 9.14.5 Stage 4 — Health view, mint pool, placement
+
+This is **the liveness half of Option B** (§9.6.2), and the first stage that requires a real second node — also the
+first where placement quality matters.
+
+- **Probe `GetStatus` per node on a timer** (§9.6.2); it already returns room, client and WebSocket counters, so one
+  call answers liveness and load together. A node joins the mint pool when its last probe succeeded and it is not
+  draining.
+- **Placement is power-of-two-choices** over the pool (§9.5), not strict least-loaded, which herds across M edges.
+- **Never mint blind**: an edge with no healthy node returns 503 rather than choosing at random. A cold-started edge
+  therefore waits for its first probe result before serving `POST /v2/room`.
+- **Write the deployment runbook** from §9.6.2 — add the node before its tag, drain before retiring the tag, never
+  reuse a tag — because at this stage ordering mistakes become user-visible.
+- Test: with one node down, mints avoid it, and a link already tagged for it fails closed with a retryable error rather
+  than rehoming (§9.10).
+
+#### 9.14.6 Stage 5 — Worker partial mesh
+
+Independent of everything above; it changes only the worker↔node control plane (§9.7.1).
+
+- **The SFU worker takes the node roster instead of one `--grpc-url`** (`src/bin/sfu.rs:59`), computes its
+  `d = min(N, d_max)` by rendezvous hash over `(instance_id, node_tag)`, and opens one `OpenSfuSession` per selected
+  node carrying the *same* `instance_id` on all of them. `--sfu-mesh-degree` configures `d_max`. Re-running the hash on
+  a roster change and dialing only the difference is the whole reconfiguration path. The hash must be seed-free and
+  version-pinned — Rust's default `RandomState` reseeds per process and would give every worker a different ranking.
+- **`signaling`'s worker registry needs no structural change**: it already keys on `instance_id` with per-node counters
+  (§5). What changes is selection — prefer the reported `SfuHealth.current_rooms`/`current_clients` over local counters,
+  since only the worker sees its own fleet-wide load, and sample two candidates rather than scanning for the minimum
+  (§9.11).
+- Test: a roster change relocates roughly `d/N` of workers and no more; a worker survives the loss of one of its `d`
+  nodes; two nodes placing concurrently on the same worker are rejected cleanly by `JoinMember` rather than
+  oversubscribing it.
+
+#### 9.14.7 Stage 6 — Roster automation, only when config rollout becomes the bottleneck
+
+Stages 3–4 leave one operational cost: adding a node means editing M edges. There are two rungs off that, and the
+cheaper one is usually enough — take them in order rather than jumping to a registry.
+
+**Rung 1 — derive the roster from DNS `SRV` (§9.6.2).** Still Option B, still no external service, and it reuses a
+dependency §9.9 already requires. Edges resolve `_signaling._tcp.<zone>` periodically and compute each tag from the
+target *hostname* — which is why it must be `SRV` and not an address record: a tag is a hash of the name, and an
+address set cannot be turned back into the names that produced it. Adding a node becomes adding a record, with no
+redeploy. This captures most of a registry's headline benefit for a fraction of the cost, and it is the rung the plan
+expects to stop at.
+
+**Rung 2 — a registry (Option A, §9.6.1).** Adopt when node churn or M makes even DNS edits the constraint, and not
+before: it is a new failure domain bought for a benefit that is operational rather than correctness-bearing (§9.2 is
+what makes it optional at all). The rules that must survive adoption: cache and serve stale, never block a join, keep
+the registry off the request path, and keep minting reading a locally held health view rather than consulting it
+synchronously (§9.5).
+
+#### 9.14.8 Observability, throughout
+
+Each stage is close to unobservable without this, so it is not a final step:
+
+- **`/status` exposes the tag table** with each node's last probe result and mint-pool membership.
+- **A debug route resolves a token to its tag, expiry and layout**, making "why did this link go there?" answerable
+  with one curl.
+- **`/status` exposes the worker mesh from both ends** — which nodes a worker selected, and how many workers each node
+  sees — since an under-provisioned `K·d/N` (§9.11) is otherwise invisible until an upgrade returns
+  `NO_SFU_AVAILABLE`.
