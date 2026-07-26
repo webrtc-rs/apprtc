@@ -54,6 +54,8 @@ var RoomSelection = function(roomSelectionDiv,
       uiConstants.roomSelectionInput);
   this.roomIdInputLabel_ = this.roomSelectionDiv_.querySelector(
       uiConstants.roomSelectionInputLabel);
+  this.roomSelectionLink_ = this.roomSelectionDiv_.querySelector(
+      uiConstants.roomSelectionLink);
   this.roomJoinButton_ = this.roomSelectionDiv_.querySelector(
       uiConstants.roomSelectionJoinButton);
   this.roomRandomButton_ = this.roomSelectionDiv_.querySelector(
@@ -84,6 +86,12 @@ var RoomSelection = function(roomSelectionDiv,
   this.roomJoinButtonListener_ = this.onJoinButton_.bind(this);
   this.roomJoinButton_.addEventListener(
       'click', this.roomJoinButtonListener_, false);
+
+  this.roomLinkClickListener_ = this.onRoomLinkClick_.bind(this);
+  if (this.roomSelectionLink_) {
+    this.roomSelectionLink_.addEventListener(
+        'click', this.roomLinkClickListener_, false);
+  }
 
   // Public callbacks. Keep it sorted.
   this.onRoomSelected = null;
@@ -144,6 +152,10 @@ RoomSelection.prototype.removeEventListeners = function() {
       'change', this.signalingVersionListener_);
   this.roomRandomButton_.removeEventListener(
       'click', this.roomRandomButtonListener_);
+  if (this.roomSelectionLink_) {
+    this.roomSelectionLink_.removeEventListener(
+        'click', this.roomLinkClickListener_);
+  }
   this.roomJoinButton_.removeEventListener(
       'click', this.roomJoinButtonListener_);
 };
@@ -242,6 +254,10 @@ RoomSelection.prototype.applySignalingVersionUi_ = function() {
     if (RoomSelection.roomTokenFrom(this.roomIdInput_.value) === null) {
       this.roomIdInput_.value = this.roomLink_(RoomSelection.generateRoomToken());
     }
+    // A V2 room is a link, so show a real anchor rather than a read-only text box: it can
+    // be clicked, hovered to reveal the target, opened in a new tab, and copied with
+    // "Copy link address". The input stays in the DOM as the value the buttons read.
+    this.showRoomLink_(true);
   } else {
     if (this.instructions_) {
       this.instructions_.textContent = 'Please enter a room id:';
@@ -253,8 +269,47 @@ RoomSelection.prototype.applySignalingVersionUi_ = function() {
     if (!/^\d+$/.test(this.roomIdInput_.value)) {
       this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
     }
+    this.showRoomLink_(false);
   }
   this.onRoomIdInput_();
+};
+
+/// Swap between the V1 text field and the V2 clickable room link.
+RoomSelection.prototype.showRoomLink_ = function(show) {
+  if (!this.roomSelectionLink_) {
+    return;
+  }
+  this.roomSelectionLink_.classList.toggle('hidden', !show);
+  this.roomIdInput_.classList.toggle('hidden', show);
+  if (show) {
+    this.updateRoomLink_();
+  }
+};
+
+/// Mirror the current room into the anchor, so its href always matches what JOIN would do.
+RoomSelection.prototype.updateRoomLink_ = function() {
+  if (!this.roomSelectionLink_) {
+    return;
+  }
+  var link = this.roomIdInput_.value;
+  this.roomSelectionLink_.href = link;
+  this.roomSelectionLink_.textContent = link;
+  this.roomSelectionLink_.title = 'Click to join this room';
+};
+
+/// Join through the app rather than reloading the page, matching the recent-room links.
+/// Modified clicks (new tab, new window, middle click) are left to the browser.
+RoomSelection.prototype.onRoomLinkClick_ = function(event) {
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey ||
+      (typeof event.button === 'number' && event.button !== 0)) {
+    return;
+  }
+  var token = RoomSelection.roomTokenFrom(this.roomSelectionLink_.href);
+  if (token === null) {
+    return;
+  }
+  event.preventDefault();
+  this.loadRoom_(token);
 };
 
 /// The absolute link a room token is shared as.
@@ -265,6 +320,7 @@ RoomSelection.prototype.roomLink_ = function(token) {
 RoomSelection.prototype.onRandomButton_ = function() {
   if (this.signalingV2Checkbox_.checked) {
     this.roomIdInput_.value = this.roomLink_(RoomSelection.generateRoomToken());
+    this.updateRoomLink_();
   } else {
     this.roomIdInput_.value = Math.floor(Math.random() * 1000000000).toString();
   }

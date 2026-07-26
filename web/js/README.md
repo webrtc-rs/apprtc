@@ -12,8 +12,10 @@
 
 `RoomSelection`: Owns room selection and chooses the V1 or V2 route. The checkbox defaults to V2. The two protocols
 present different controls: V2 room ids are UUIDv8 values the browser mints (`generateRoomToken`, 122 random bits with
-the version and variant stamped in) and renders as 22 base64url characters, so the field shows a read-only room link and
-the button reads GENERATE; V1 keeps its free-form numeric room id and RANDOM. `isRoomToken` mirrors the Rust validator
+the version and variant stamped in) and renders as 22 base64url characters, so V2 shows the room link as a real anchor —
+clickable, hoverable, openable in a new tab — in place of the text field, and the button reads
+GENERATE; V1 keeps its free-form numeric room id and RANDOM. A plain click joins in-app via
+`loadRoom_`; modified clicks are left to the browser. `isRoomToken` mirrors the Rust validator
 in `signaling/src/v2.rs` exactly — 22 characters, canonical trailing bits, version 8, RFC 9562 variant — because the two
 must agree on which links exist.
 

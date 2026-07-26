@@ -413,6 +413,34 @@ input[type="text"].invalid {
   border-color: var(--accent-red);
 }
 
+/* The V2 room link stands in for the room-id field: same box, but a real anchor so it can
+   be clicked, hovered to reveal the URL, and opened in a new tab. */
+.room-selection-link {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.95rem;
+  color: var(--accent-blue);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-color);
+  border-radius: 0.6rem;
+  padding: 0.6rem 0.9rem;
+  width: 100%;
+  box-sizing: border-box;
+  display: block;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.room-selection-link:hover,
+.room-selection-link:focus {
+  text-decoration: underline;
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  outline: none;
+}
+
 label.error-label {
   color: var(--accent-red);
   font-size: 0.85rem;
@@ -513,7 +541,13 @@ h1 {
 div#room-selection {
   margin: 6vh auto 0 auto;
   width: 100%;
-  max-width: 500px;
+  /* Wide enough for a V2 room link to fit on one line. The longest realistic form,
+     https://host:port/v2/r/ plus the 22-character token, is ~50 monospace characters
+     (~537px including the field and card padding); 45rem leaves room for longer hosts,
+     and 92vw keeps the card inside narrow viewports. The link still ellipsizes rather
+     than overflowing if a host is longer still.
+     min(92vw, 45rem)*/
+  max-width: 540px;
   z-index: 1;
 }
 
