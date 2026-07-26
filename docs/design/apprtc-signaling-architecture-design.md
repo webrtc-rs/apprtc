@@ -2,7 +2,7 @@
 
 ## Background and motivation
 
-This architecture supports two browser protocols. V1 provides two-party P2P compatibility with HTTP join/leave, initiator election, queued messages, reconnect grace, and opaque string room/client IDs. V2 adds numeric `u64` IDs, token-bound browser registration, P2P↔SFU mode transitions, and multi-party SFU media. The Rust `sfu` crate is a signaling-agnostic `sansio::Protocol` media engine whose `RoomId` and `ClientId` are `u64` and whose `SFUEvent` API accepts joins, SDP, ICE candidates, and leaves.
+This architecture supports two browser protocols. V1 provides two-party P2P compatibility with HTTP join/leave, initiator election, queued messages, reconnect grace, and opaque string room/client IDs. V2 adds service-minted UUID room ids with numeric `u64` client ids, token-bound browser registration, P2P↔SFU mode transitions, and multi-party SFU media. The Rust `sfu` crate is a signaling-agnostic `sansio::Protocol` media engine whose `RoomId` is a `Uuid` and whose `ClientId` is a `u64`, and whose `SFUEvent` API accepts joins, SDP, ICE candidates, and leaves.
 
 The current implementation preserves the V1 contract for existing AppRTC-compatible clients while adding a V2 protocol that starts as two-party P2P, upgrades to multi-party SFU media, and downgrades back to direct P2P once the room has shrunk to two members again. One signaling authority owns room state and routes browser SDP/ICE either to the P2P peer or to the assigned SFU worker.
 
@@ -37,7 +37,7 @@ flowchart LR
     B <-- WebRTC --> F1
 ```
 
-`apprtc` serves the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns separate V1 and V2 room tables, so the same visible text (for example `"42"`) can independently identify a V1 string-keyed room and V2 numeric room:
+`apprtc` serves the browser HTTP routes, but it does not hold room membership or live browser socket state. `signaling` owns separate V1 and V2 room tables keyed by different types — opaque strings for V1, UUIDs for V2 — so the two namespaces cannot collide:
 
 ```text
 V1RoomTable: Map<String, V1Room<String>>
@@ -59,10 +59,19 @@ V2Room {
 SFU owns only a projection of members assigned to it. It must never decide occupancy, initiate a P2P→SFU upgrade, or
 route a browser frame to another browser.
 
-For **v2**, room and client IDs are `u64` end-to-end. Browser JSON represents them as canonical decimal strings and
-validates with `BigInt`, avoiding JavaScript `Number` precision loss. V2 client IDs are random `u64` values. A v2 value
-must be canonical unsigned decimal (`0` or a non-zero digit followed by digits) and parse without overflow as `u64`;
-invalid room/client IDs return an error to the browser and create no room/member state. **V1 remains wire-compatible:**
+For **v2**, a room is identified by a UUIDv8 the service mints (never a value a client chooses) and a client by a random
+`u64`. The room id has three renderings, one per boundary, and they must not be confused — a room is keyed by the value
+received, so a second spelling would become a second room:
+
+| Boundary                                     | Rendering                                               |
+|----------------------------------------------|---------------------------------------------------------|
+| Room links, browser JSON (`roomid`)          | base64url, unpadded — 22 characters                      |
+| gRPC to signaling and to workers             | the raw 16 bytes (`bytes room_id`)                       |
+| ICE ufrag inside the SFU                     | standard base64, unpadded (§8.5)                         |
+
+Client ids stay canonical decimal strings in browser JSON, validated with `BigInt` to avoid JavaScript `Number`
+precision loss. An invalid room token or client id returns an error to the browser and creates no room/member state.
+**V1 remains wire-compatible:**
 its `roomid` and `clientid` remain arbitrary opaque JSON strings because compatible clients may use non-numeric values.
 A V1 room is never assigned to an SFU, so those strings never cross the SFU boundary.
 
@@ -122,11 +131,11 @@ browser-visible text is the same.
 
 // signaling -> browser
 { "msg": "{...same application signaling JSON...}" }
-{ "control": "registered",    "roomid": "42", "epoch": "0", "mode": "p2p", "is_initiator": true }  // v2 register acknowledgement
-{ "control": "p2p-promote",   "roomid": "42", "epoch": "0", "is_initiator": true }
-{ "control": "sfu-upgrade",   "roomid": "42", "epoch": "1" }
+{ "control": "registered",    "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "0", "mode": "p2p", "is_initiator": true }  // v2 register acknowledgement
+{ "control": "p2p-promote",   "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "0", "is_initiator": true }
+{ "control": "sfu-upgrade",   "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "1" }
 { "control": "sfu-downgrade", "roomid": "grYp2g1QjrKVXUZLph46kA", "epoch": "2", "is_initiator": true }
-{ "control": "room-failed",   "roomid": "42", "reason": "WORKER_UNAVAILABLE" }
+{ "control": "room-failed",   "roomid": "grYp2g1QjrKVXUZLph46kA", "reason": "WORKER_UNAVAILABLE" }
 ```
 
 `msg` is opaque to `signaling`: it never parses the inner object — not SDP, not ICE, not `bye`. It selects the
@@ -164,7 +173,7 @@ Protocol version is selected by the HTTP route and WebSocket registration frame,
 | P2P signaling                | Stock initiator posts to `POST /message/{room}/{client}`; callee uses WS; `wss_post_url` POST/DELETE fallback remains | Both peers send all offer/answer/candidate/bye payloads through their own WS                                                                                                                                               |
 | `/join` response             | Existing `result`/`params`, including `messages[]`, `wss_url`, and `wss_post_url`                                     | Adds `mode` and `epoch`, omits `messages[]` and `wss_post_url`                                                                                                                                                             |
 | Capacity                     | Hard cap of two; return `FULL` for a third join                                                                       | P2P through two; third join may upgrade only when an SFU worker is ready                                                                                                                                                   |
-| Room and client ID wire form | Existing strings, unchanged                                                                                           | Canonical decimal strings representing `u64`                                                                                                                                                                               |
+| Room and client ID wire form | Existing strings, unchanged                                                                                           | Room: a service-minted UUIDv8 as 22 base64url characters. Client: a canonical decimal string representing `u64`.                                                                                                            |
 | SFU routing                  | Never                                                                                                                 | Only after an explicit P2P→SFU transition                                                                                                                                                                                  |
 
 The Rust `apprtc` V1 handlers preserve `/join`, `/leave`, `/message`, `/params`, `/v1alpha/iceconfig`, `/r/{room}`, and
@@ -175,9 +184,10 @@ reconnect-grace behavior.
 `sfu-upgrade`, `sfu-downgrade`, worker frames, `Upgrading`, and all SFU assignment are V2-only. A stock V1 browser never receives a control it cannot process.
 
 For v2 validation, `POST /v2/join/{roomid}` returns `{result:"INVALID_ROOM_ID"}` when the path segment is not a
-canonical `u64`. The v2 browser WebSocket returns `{error:"INVALID_ROOM_ID"}` or `{error:"INVALID_CLIENT_ID"}` and
-closes when its `register` frame contains a non-canonical/out-of-range value. The same values on v1 routes and frames
-are forwarded as strings without numeric parsing.
+canonical room token (§8.1): 22 base64url characters decoding to the 16 bytes of a UUIDv8, with zero trailing bits.
+The v2 browser WebSocket returns `{error:"INVALID_ROOM_ID"}` or `{error:"INVALID_CLIENT_ID"}` and closes when its
+`register` frame carries a token that fails those checks or a client id that is not a canonical `u64`. The same values
+on v1 routes and frames are forwarded as opaque strings without any parsing.
 
 ### 3.1.2 Signal epochs
 
@@ -468,7 +478,7 @@ initiator model.
 - Current browser authorization binds each random V2 admission token to `(roomid, clientid)`, validates it during WebSocket registration and authenticated HTTP leave, and invalidates it when membership is removed. P2P members can re-register during reconnect grace; an SFU-member WebSocket disconnect initiates immediate worker leave/removal instead. Failed-room cleanup/token invalidation is not yet implemented.
 - Current service-channel protection uses server-authenticated TLS plus network firewalls. `app_id` is a typed role assertion but is not cryptographic authentication.
 - Required production hardening is mTLS identities for apprtc/SFU roles and browser `Origin` validation. These are not implemented by the current runtime.
-- Validate V2 `u64` room/client IDs, request ownership, room assignment, command order, bounded queues, and lifecycle/assignment epochs before forwarding; leave V1 ID strings opaque.
+- Validate V2 room tokens (length, canonical trailing bits, UUID version and variant) and `u64` client ids, request ownership, room assignment, command order, bounded queues, and lifecycle/assignment epochs before forwarding; leave V1 ID strings opaque.
 - Run a V1 wire-compatibility suite covering `call.js`, `/join` params/messages, initiator `/message`, `wss_post_url`
   POST/DELETE fallback, queued-offer flush, reconnect grace, and `FULL` at the third join.
 - The current suite covers V2 P2P relay, third-join upgrade ordering, stale-epoch drops, same-instance worker reconnect/sync, old-instance grace-expiry room failure, three-client data channels, and three-publisher RTP forwarding. Downgrade coverage is a signaling-crate unit test for the dwell/commit rules plus the black-box `tests/sfu_v2_downgrade_signaling_test.rs`, which drives a full P2P→SFU→P2P round trip over real WebSocket signaling and SDP exchange.
@@ -575,7 +585,7 @@ SFU worker.
 
 ### 8.3 V2 browser protocol — SFU-capable mode
 
-V2 uses a separate route namespace and numeric room table so that a V1 client cannot accidentally opt into SFU semantics.
+V2 uses a separate route namespace and its own room table, keyed by UUID rather than by an opaque string, so that a V1 client cannot accidentally opt into SFU semantics.
 
 #### HTTP
 
@@ -585,8 +595,9 @@ V2 uses a separate route namespace and numeric room table so that a V1 client ca
 | `POST /v2/leave/{roomid}/{clientid}`   | empty; `roomid` must be a `RoomIdV2` token and `clientid` a `U64Decimal`; `Authorization: Bearer <admission_token>`     | `{result:"SUCCESS"}` or an ID/authorization/worker error. |
 | `GET /v2/params`, `GET /v2/r/{roomid}` | V2 validation                                                                      | V2 configuration and room-page response; `/v2/params` carries ICE/TURN configuration. |
 
-There is no v2 `/message` endpoint and no `wss_post_url`. `client_id` is minted by `apprtc` as a random `u64`, returned
-as `ClientIdV2`, and is not supplied by the browser at join time. `apprtc` holds no room state, so uniqueness is
+There is no v2 `/message` endpoint and no `wss_post_url`. `room_id` is a UUIDv8 minted before the join — the browser
+carries it in the room link and echoes it on `/v2/join` — and `client_id` is minted by `apprtc` as a random `u64`,
+returned as `ClientIdV2`, and is not supplied by the browser at join time. `apprtc` holds no room state, so uniqueness is
 enforced by the hub: an `admit` that collides with a live member returns `DUPLICATE_CLIENT` and `apprtc` retries with a fresh ID up to eight times. A third join with no eligible worker returns `NO_SFU_AVAILABLE`. Later joins remain affine to the assigned worker and wait for `MemberJoined`. `is_initiator` in the join params is present only when `mode` is `"p2p"` and omitted otherwise, mirroring the `registered` rule.
 
 #### WebSocket
@@ -658,9 +669,9 @@ Every apprtc request carries `RequestContext{app_id: APP_ID_APPWEB, instance_id,
 | `RemoveV1`    | opaque non-empty `room_id`, `client_id`              | `Empty`                       | Remove a member and close its live browser WebSocket.                   |
 | `OccupancyV1` | opaque non-empty `room_id`                           | `Occupancy{member_count,P2P}` | Return current room occupancy.                                          |
 | `InjectV1`    | opaque non-empty `room_id`, `client_id`, `message_json` | `Empty`                     | Implement legacy `/message` queue-or-relay behavior without parsing payload. |
-| `AdmitV2`     | numeric `room_id`, `client_id`                       | `V2Admission{mode,signal_epoch,admission_token,is_initiator?}` | Admit the first two members in P2P. A third member selects a ready worker, waits for all `MemberJoined` barriers, and returns committed SFU mode; later SFU joins also wait for their worker barrier. `NO_SFU_AVAILABLE` is returned when no eligible worker has capacity. |
-| `RemoveV2`    | numeric `room_id`, `client_id`; `admission_token`    | `Empty`                       | Validate and invalidate the admission, close its browser socket, and promote the sole survivor. |
-| `OccupancyV2` | numeric `room_id`                                   | `Occupancy{member_count,mode}` | Return V2 occupancy and the authority's current P2P, Upgrading, SFU, or Failed mode. |
+| `AdmitV2`     | 16-byte `room_id`, numeric `client_id`                     | `V2Admission{mode,signal_epoch,admission_token,is_initiator?}` | Admit the first two members in P2P. A third member selects a ready worker, waits for all `MemberJoined` barriers, and returns committed SFU mode; later SFU joins also wait for their worker barrier. `NO_SFU_AVAILABLE` is returned when no eligible worker has capacity. |
+| `RemoveV2`    | 16-byte `room_id`, numeric `client_id`; `admission_token`    | `Empty`                       | Validate and invalidate the admission, close its browser socket, and promote the sole survivor. |
+| `OccupancyV2` | 16-byte `room_id`                                   | `Occupancy{member_count,mode}` | Return V2 occupancy and the authority's current P2P, Upgrading, SFU, or Failed mode. |
 | `GetStatus`   | context only                                        | `Status`                      | Return V1 and V2 room/client/browser WebSocket counters plus connected and ready SFU worker counts. |
 
 V1 `room_id` and `client_id` remain opaque strings and retain legacy failures such as `FULL` and `DUPLICATE_CLIENT`. The implemented V2 authority validates token-bound WebSocket registration, requires the current epoch on every send, relays opaque SDP and trickle-ICE messages in P2P, preserves browser reconnect grace, and emits `registered` and `p2p-promote` controls. It also implements `OpenSfuSession`, worker selection, the P2P→SFU join barrier, SFU signal routing, later SFU joins and leaves, the dwell-based SFU→P2P downgrade, same-instance worker reconnection/synchronization, command replay, event acknowledgement/deduplication, and worker-loss room failure.
@@ -669,7 +680,7 @@ One tonic `Channel` is shared by all apprtc requests. Concurrent unary calls are
 
 ### 8.5 SFU bidirectional gRPC session
 
-An out-of-process SFU opens exactly one long-lived `OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu)` RPC per signaling node it registers with. The current worker takes a single `--grpc-url` and therefore holds exactly one stream per process incarnation; a worker pooled across several nodes (§9.1) would hold one stream each, carrying the same `instance_id` on all of them, and each node would keep its own independent registry entry and assignment counters for it. The stream has the state `Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 `uint64` room/client IDs cross this boundary; a V1 room never reaches an SFU.
+An out-of-process SFU opens exactly one long-lived `OpenSfuSession(stream SfuToSignaling) returns (stream SignalingToSfu)` RPC per signaling node it registers with. The current worker takes a single `--grpc-url` and therefore holds exactly one stream per process incarnation; a worker pooled across several nodes (§9.1) would hold one stream each, carrying the same `instance_id` on all of them, and each node would keep its own independent registry entry and assignment counters for it. The stream has the state `Connecting → Registered → Syncing → Ready → Draining/Closed`. Only V2 identifiers cross this boundary — a 16-byte UUID room id and a `uint64` client id; a V1 room never reaches an SFU.
 
 The first `SfuToSignaling` message must be `RegisterSfu`. Its `RequestContext.app_id` is `APP_ID_SFU`; `instance_id` is the globally unique process-incarnation identity and replaces a separate `sfu_id`; and `request_id` identifies the registration operation. The same running process reuses `instance_id` after transient stream reconnection. A restarted process generates a new `instance_id` and cannot inherit the prior process's media state.
 
@@ -704,6 +715,32 @@ Each `SfuEvent` carries an SFU-allocated nonzero `request_id`. Signaling dedupli
 | `SfuFailure`| typed `Error` plus optional room/client/lifecycle/SDP correlation    | If `room_id` is present and valid, mark that room failed and notify its browsers. A failure without `room_id` is acknowledged without a room mutation. |
 
 The adapter, not `Sfu`, owns lifecycle and transport deduplication. It maps emitted `SFUEvent::SessionDescription` values to `SfuSignal` and uses SDP type plus the optional `sdp_request_id` to distinguish a publish answer from a subscribe offer. Inside browser-bound `message_json`, subscribe correlation remains the browser protocol's decimal-string `requestid`. Locally gathered candidates and end-of-candidates use the same `SfuSignal` envelope; signaling forwards the inner JSON without parsing or modifying SDP/ICE content.
+
+#### Media demultiplexing: the room id inside the ICE ufrag
+
+A worker owns one UDP socket per media shard, so an arriving packet must say which room and client it belongs to before
+any WebRTC state exists for it. ICE offers exactly one field able to carry that: the ufrag the browser echoes in every
+STUN binding request. The worker therefore issues each client a local ufrag of the form
+
+```text
+local_ufrag     = base64_room_id "/" digit_client_id "+" alpha_ufrag
+base64_room_id  = ALPHA / DIGIT / "+" / "/"     // standard base64, unpadded — 22 characters
+digit_client_id = DIGIT
+alpha_ufrag     = ALPHA                          // random, so two clients never share credentials
+```
+
+and recovers both ids from the USERNAME attribute of an inbound binding request. Three constraints fix this encoding,
+and all three are easy to violate by accident:
+
+- **RFC 8839 restricts a ufrag to `ALPHA / DIGIT / "+" / "/"`, 4–256 characters.** That rules out the browser-facing
+  base64url token, whose `-` and `_` are not ice-chars, and rules out a hyphenated UUID. Standard base64 is legal, which
+  is why the SFU uses a different rendering here than the URL does.
+- **The room id can therefore contain both separators.** Parsing splits from the right — the last `+` precedes the
+  alphabetic suffix, the last `/` precedes the decimal client id — because splitting from the left would truncate a room
+  id containing `/`.
+- **Encoder and parser must stay inverses.** They live together in the `sfu` crate (`room::encode_local_ufrag` and
+  `room::decode_local_ufrag`) rather than at the two call sites, so a change to one cannot silently desynchronize the
+  other; the demuxer only splits USERNAME at `:` and hands over the local half.
 
 #### Ordering and recovery
 
@@ -760,20 +797,20 @@ sequenceDiagram
 
     rect rgb(255,250,230)
     Note over A,C: V2 third join and SFU upgrade
-    A->>AR: POST v2 join numeric room
+    A->>AR: POST v2 join room token
     AR->>S: gRPC AdmitV2 A
     S-->>AR: admit success mode P2P
     AR-->>A: join success with token
-    A->>S: WS register V2 numeric IDs token and version
+    A->>S: WS register V2 room token, client id and version
     S-->>A: WS registered mode P2P epoch 0 initiator true
-    B->>AR: POST v2 join numeric room
+    B->>AR: POST v2 join room token
     AR->>S: gRPC AdmitV2 B
     S-->>AR: admit success mode P2P
     AR-->>B: join success with token
-    B->>S: WS register V2 numeric IDs token and version
+    B->>S: WS register V2 room token, client id and version
     S-->>B: WS registered mode P2P epoch 0 initiator false
     Note over A,B: V2 P2P offer answer flows through WS send and msg
-    C->>AR: POST v2 join numeric room
+    C->>AR: POST v2 join room token
     AR->>S: gRPC AdmitV2 C
     S->>S: Select min assigned clients, rooms, instance ID, then enter Upgrading
     S->>F: SfuCommand JoinMember A with lifecycle ID
@@ -787,7 +824,7 @@ sequenceDiagram
     S-->>B: WS control sfu-upgrade epoch 1
     S-->>AR: admit success mode SFU
     AR-->>C: v2 join success mode SFU
-    C->>S: WS register V2 numeric IDs token and version
+    C->>S: WS register V2 room token, client id and version
     S-->>C: WS registered mode SFU epoch 1
     Note over A,C: Each browser creates a fresh SFU PC and adds local tracks
     end
@@ -961,6 +998,13 @@ a function of nothing, so it never does:
 ### 9.3 Room ID format: tagged UUIDv8, rendered base64url
 
 **V2 room IDs become UUIDs; client IDs stay `u64`.**
+
+> **Status.** The type change is *implemented*: V2 room ids are UUIDv8 values minted by the service, rendered
+> base64url-unpadded in links and browser JSON, carried as 16 bytes over gRPC, and validated on the way in (§3.1, §8.1).
+> What is **not** implemented is the interior layout below — the node tag and the expiry. Today all 122 free bits are
+> random, which is exactly the `T = 0` case of this section: routing has nothing to read out of the id yet, so a
+> multi-node deployment would still need §9.2 hashing. Adopting §9.9 means reserving those bits *before* the first link
+> is minted, since the widths cannot change afterwards.
 
 The structure must live inside the UUID rather than as a prefix bolted onto it, and RFC 9562 reserves **version 8** for
 exactly this — an application-defined layout with only the version and variant bits fixed. Its three custom fields map

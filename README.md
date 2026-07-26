@@ -34,8 +34,8 @@
 
 AppRTC is a WebRTC reference application and signaling server in the `webrtc-rs` ecosystem. The Rust implementation
 supports the AppRTC-compatible P2P V1 flow and the token-authenticated V2 P2P/SFU flow. The room-selection page defaults
-to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the legacy V1 flow. V2 uses numeric `u64`
-room/client IDs, namespaced HTTP routes,
+to V2 with a checked **V2 P2P/SFU** checkbox; unchecking it falls back to the legacy V1 flow. V2 uses service-minted UUID room
+ids (shared as room links) with numeric `u64` client ids, namespaced HTTP routes,
 signaling-issued admission tokens, explicit WebSocket registration acknowledgement, signal epochs, symmetric WebSocket
 offer/answer/trickle-ICE relay, reconnect grace, and survivor promotion.
 
@@ -74,7 +74,7 @@ reconnecting bidirectional `OpenSfuSession` gRPC stream to signaling; browser me
 ICE/DTLS/SRTP and never passes through `apprtc` or signaling.
 
 The signaling state is composed from Sans-I/O protocols. `Collider` owns two independent tables — the V1
-string-keyed one and the numeric V2 one that also holds SFU worker state:
+string-keyed one and the UUID-keyed V2 one that also holds SFU worker state:
 
 ```text
 Collider
@@ -406,8 +406,8 @@ cargo run --bin apprtc -- \
 | `DELETE /{roomid}/{clientid}`                     | V1 `wss_post_url` fallback: remove the client.                                         |
 | `POST` or `DELETE /_internal/{roomid}/{clientid}` | Compatibility alias for the fallback bridge.                                           |
 | `GET /v2/r/{roomid}`                              | Render the V2 P2P/SFU call page; `roomid` must be a base64url room token (UUIDv8).     |
-| `POST /v2/join/{roomid}`                          | Admit a V2 member; a third member initiates the SFU join barrier.                      |
-| `POST /v2/leave/{roomid}/{clientid}`              | Remove a V2 member using its bearer admission token.                                   |
+| `POST /v2/join/{roomid}`                          | Admit a V2 member; `roomid` is a room token and a third member initiates the SFU join barrier. |
+| `POST /v2/leave/{roomid}/{clientid}`              | Remove a V2 member using its bearer admission token; `roomid` is a room token.          |
 | `GET /v2/params`                                  | Return room-independent V2 parameters and ICE configuration.                           |
 
 Static files under `web/js`, `web/css`, `web/images`, and `web/html` are served by the same process.
@@ -477,7 +477,8 @@ object. V1 signaling treats it as an opaque UTF-8 string.
 ## V2 WebSocket protocol
 
 V2 uses the same `/ws` endpoint but requires a room token, a numeric client id, an admission token, and
-`ver: 2`:
+`ver: 2`. A room token is a UUIDv8 minted by the service, rendered as 22 unpadded base64url characters — the same
+string that appears in the room link — and signaling rejects any other spelling of it with `{"error":"INVALID_ROOM_ID"}`:
 
 ```json
 {
