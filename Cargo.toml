@@ -15,7 +15,7 @@ signaling = { version = "0.4.0", path = "signaling" }
 signaling-proto = { version = "0.4.0", path = "signaling/signaling-proto" }
 sfu = { version = "0.4.0", path = "sfu" }
 
-rtc = { version = "0.20.0-rc.4", path = "sfu/webrtc/rtc" }
+rtc = { version = "0.20.0", path = "sfu/webrtc/rtc" }
 
 sansio = "1.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -43,6 +43,6 @@ tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = "0.1"
 
 [dev-dependencies]
-webrtc = { version = "0.20.0-rc.4", path = "sfu/webrtc" }
+webrtc = { version = "0.20.0", path = "sfu/webrtc" }
 
 tower = { version = "0.5", features = ["util"] }
