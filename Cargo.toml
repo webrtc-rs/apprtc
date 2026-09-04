@@ -1,6 +1,6 @@
 [package]
 name = "apprtc"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT/Apache-2.0"
 authors = ["Rain Liu <y@liu.mx>"]
@@ -11,9 +11,9 @@ keywords = ["signaling", "networking", "protocols", "sans-io"]
 categories = ["network-programming", "asynchronous", "multimedia"]
 
 [dependencies]
-signaling = { version = "0.4.0", path = "signaling" }
-signaling-proto = { version = "0.4.0", path = "signaling/signaling-proto" }
-sfu = { version = "0.4.0", path = "sfu" }
+signaling = { version = "0.5.0", path = "signaling" }
+signaling-proto = { version = "0.5.0", path = "signaling/signaling-proto" }
+sfu = { version = "0.5.0", path = "sfu" }
 
 rtc = "0.21.0-rc.2"
 
