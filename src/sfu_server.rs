@@ -435,10 +435,13 @@ fn apply_command(
                     "conflicting member lifecycle",
                 )),
                 None => engine
-                    .handle_event(sfu::SFUEvent::Join {
-                        request_id,
-                        room_id,
-                        client_id: join.client_id,
+                    .handle_event(sfu::TaggedSFUEvent {
+                        now: Instant::now(),
+                        event: sfu::SFUEvent::Join {
+                            request_id,
+                            room_id,
+                            client_id: join.client_id,
+                        },
                     })
                     .map(|()| {
                         projection.insert(key, (join.lifecycle_id, join.assignment_epoch));
@@ -474,14 +477,17 @@ fn apply_command(
                     Err((v2::ErrorCode::StaleLifecycle, "stale member lifecycle"))
                 }
                 Some(_) => engine
-                    .handle_event(sfu::SFUEvent::Leave {
-                        request_id,
-                        room_id,
-                        client_id: leave.client_id,
-                        reason: format!(
-                            "{:?}",
-                            v2::LeaveReason::try_from(leave.reason).unwrap_or_default()
-                        ),
+                    .handle_event(sfu::TaggedSFUEvent {
+                        now: Instant::now(),
+                        event: sfu::SFUEvent::Leave {
+                            request_id,
+                            room_id,
+                            client_id: leave.client_id,
+                            reason: format!(
+                                "{:?}",
+                                v2::LeaveReason::try_from(leave.reason).unwrap_or_default()
+                            ),
+                        },
                     })
                     .map(|()| {
                         projection.remove(&key);
@@ -552,11 +558,14 @@ fn sync_room(
         .collect::<Vec<_>>();
     for client_id in stale {
         engine
-            .handle_event(sfu::SFUEvent::Leave {
-                request_id,
-                room_id,
-                client_id,
-                reason: "room synchronization".into(),
+            .handle_event(sfu::TaggedSFUEvent {
+                now: Instant::now(),
+                event: sfu::SFUEvent::Leave {
+                    request_id,
+                    room_id,
+                    client_id,
+                    reason: "room synchronization".into(),
+                },
             })
             .map_err(|_| (v2::ErrorCode::Internal, "SFU room sync leave failed"))?;
         projection.remove(&(room_id, client_id));
@@ -565,10 +574,13 @@ fn sync_room(
         let key = (room_id, member.client_id);
         if !projection.contains_key(&key) {
             engine
-                .handle_event(sfu::SFUEvent::Join {
-                    request_id,
-                    room_id,
-                    client_id: member.client_id,
+                .handle_event(sfu::TaggedSFUEvent {
+                    now: Instant::now(),
+                    event: sfu::SFUEvent::Join {
+                        request_id,
+                        room_id,
+                        client_id: member.client_id,
+                    },
                 })
                 .map_err(|_| (v2::ErrorCode::Internal, "SFU room sync join failed"))?;
         }
@@ -619,34 +631,43 @@ fn apply_signal(
                 signal.sdp_request_id.unwrap_or(command_request_id)
             };
             engine
-                .handle_event(sfu::SFUEvent::SessionDescription {
-                    request_id,
-                    room_id,
-                    client_id: signal.client_id,
-                    sdp,
+                .handle_event(sfu::TaggedSFUEvent {
+                    now: Instant::now(),
+                    event: sfu::SFUEvent::SessionDescription {
+                        request_id,
+                        room_id,
+                        client_id: signal.client_id,
+                        sdp,
+                    },
                 })
                 .map_err(|_| (v2::ErrorCode::InvalidSignal, "session description rejected"))
         }
         "candidate" => engine
-            .handle_event(sfu::SFUEvent::IceCandidate {
-                request_id: command_request_id,
-                room_id,
-                client_id: signal.client_id,
-                candidate: RTCIceCandidateInit {
-                    candidate: envelope.candidate,
-                    sdp_mid: envelope.id,
-                    sdp_mline_index: envelope.label,
-                    username_fragment: None,
-                    url: None,
+            .handle_event(sfu::TaggedSFUEvent {
+                now: Instant::now(),
+                event: sfu::SFUEvent::IceCandidate {
+                    request_id: command_request_id,
+                    room_id,
+                    client_id: signal.client_id,
+                    candidate: RTCIceCandidateInit {
+                        candidate: envelope.candidate,
+                        sdp_mid: envelope.id,
+                        sdp_mline_index: envelope.label,
+                        username_fragment: None,
+                        url: None,
+                    },
                 },
             })
             .map_err(|_| (v2::ErrorCode::InvalidSignal, "ICE candidate rejected")),
         "end-of-candidates" => engine
-            .handle_event(sfu::SFUEvent::IceCandidate {
-                request_id: command_request_id,
-                room_id,
-                client_id: signal.client_id,
-                candidate: RTCIceCandidateInit::default(),
+            .handle_event(sfu::TaggedSFUEvent {
+                now: Instant::now(),
+                event: sfu::SFUEvent::IceCandidate {
+                    request_id: command_request_id,
+                    room_id,
+                    client_id: signal.client_id,
+                    candidate: RTCIceCandidateInit::default(),
+                },
             })
             .map_err(|_| (v2::ErrorCode::InvalidSignal, "end of candidates rejected")),
         "bye" => Ok(()),
@@ -682,7 +703,7 @@ async fn drain_engine(
             );
         }
     }
-    while let Some(event) = engine.poll_event() {
+    while let Some(sfu::TaggedSFUEvent { event, .. }) = engine.poll_event() {
         let Some((room_id, client_id)) = event.room_id().zip(event.client_id()) else {
             continue;
         };
